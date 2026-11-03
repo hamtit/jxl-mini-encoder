@@ -1,0 +1,714 @@
+//! Meta-adaptive (MA) context trees: tokenisation of channels with a tree,
+//! tree serialisation and a greedy entropy-driven tree learner.
+
+use super::Channel;
+use super::predict::{
+    MAX_PREV_CHANNELS, NUM_PROPS, Neighbors, Predictor, Weighted, base_props, prev_channel_props,
+};
+use crate::bit_writer::BitWriter;
+use crate::entropy::{CodeOptions, HybridUint, Token, pack_signed, write_stream};
+use crate::parallel::{par_map, par_tasks};
+
+#[derive(Clone, Copy, Debug)]
+pub enum Node {
+    /// `prop > val` goes to `left`, otherwise to `right`.
+    Split {
+        prop: u8,
+        val: i32,
+        left: u32,
+        right: u32,
+    },
+    Leaf {
+        pred: Predictor,
+        ctx: u32,
+    },
+}
+
+/// A tree stored in breadth-first order (the order it is serialised in, which
+/// also numbers the leaf contexts).
+#[derive(Clone, Debug)]
+pub struct Tree {
+    nodes: Vec<Node>,
+    num_leaves: u32,
+    uses_wp: bool,
+    max_prev: usize,
+}
+
+/// Recursive form used while building.
+enum Build {
+    Split {
+        prop: u8,
+        val: i32,
+        /// Predictor of the node if it ends up as a leaf.
+        pred: Predictor,
+        left: Box<Build>,
+        right: Box<Build>,
+    },
+    Leaf(Predictor),
+}
+
+impl Tree {
+    pub fn single(pred: Predictor) -> Self {
+        Tree::from_build(Build::Leaf(pred))
+    }
+
+    fn from_build(root: Build) -> Self {
+        let mut nodes = Vec::new();
+        let mut queue = std::collections::VecDeque::from([root]);
+        let mut next_child = 1u32;
+        let mut num_leaves = 0;
+        let mut uses_wp = false;
+        let mut max_prev = 0;
+        while let Some(b) = queue.pop_front() {
+            match b {
+                Build::Split {
+                    prop,
+                    val,
+                    left,
+                    right,
+                    ..
+                } => {
+                    nodes.push(Node::Split {
+                        prop,
+                        val,
+                        left: next_child,
+                        right: next_child + 1,
+                    });
+                    next_child += 2;
+                    uses_wp |= prop == 15;
+                    if prop as usize >= 16 {
+                        max_prev = max_prev.max((prop as usize - 16) / 4 + 1);
+                    }
+                    queue.push_back(*left);
+                    queue.push_back(*right);
+                }
+                Build::Leaf(pred) => {
+                    uses_wp |= pred == Predictor::Weighted;
+                    nodes.push(Node::Leaf {
+                        pred,
+                        ctx: num_leaves,
+                    });
+                    num_leaves += 1;
+                }
+            }
+        }
+        Tree {
+            nodes,
+            num_leaves,
+            uses_wp,
+            max_prev,
+        }
+    }
+
+    pub fn num_leaves(&self) -> usize {
+        self.num_leaves as usize
+    }
+
+    #[inline(always)]
+    fn leaf(&self, props: &[i32; NUM_PROPS]) -> (Predictor, u32) {
+        let mut i = 0usize;
+        loop {
+            match self.nodes[i] {
+                Node::Split {
+                    prop,
+                    val,
+                    left,
+                    right,
+                } => {
+                    i = if props[prop as usize] > val {
+                        left
+                    } else {
+                        right
+                    } as usize;
+                }
+                Node::Leaf { pred, ctx } => return (pred, ctx),
+            }
+        }
+    }
+
+    /// Serialise the tree with its own entropy code.
+    pub fn write(&self, w: &mut BitWriter) {
+        let mut tokens = Vec::with_capacity(self.nodes.len() * 2);
+        for n in &self.nodes {
+            match *n {
+                Node::Split { prop, val, .. } => {
+                    tokens.push(Token::new(1, u32::from(prop) + 1));
+                    tokens.push(Token::new(0, pack_signed(val)));
+                }
+                Node::Leaf { pred, .. } => {
+                    tokens.push(Token::new(1, 0));
+                    tokens.push(Token::new(2, pred as u32));
+                    tokens.push(Token::new(3, 0)); // offset
+                    tokens.push(Token::new(4, 0)); // multiplier log
+                    tokens.push(Token::new(5, 0)); // multiplier bits
+                }
+            }
+        }
+        write_stream(
+            &tokens,
+            6,
+            CodeOptions {
+                max_clusters: 6,
+                tune_configs: true,
+                threads: 1,
+            },
+            w,
+        );
+    }
+
+    /// Tokenise a list of channels forming one modular stream.
+    /// `tokenize` with the channels of one stream coded concurrently.
+    pub fn tokenize_par(&self, channels: &[&Channel], stream: u32, threads: usize) -> Vec<Token> {
+        let mut out = Vec::new();
+        if threads <= 1 || channels.len() < 2 {
+            self.tokenize(channels, stream, &mut out);
+            return out;
+        }
+        let parts = par_map(channels.len(), threads, |i| {
+            let mut t = Vec::new();
+            self.tokenize_one(channels, i, stream, &mut t);
+            t
+        });
+        for p in parts {
+            out.extend(p);
+        }
+        out
+    }
+
+    pub fn tokenize(&self, channels: &[&Channel], stream: u32, out: &mut Vec<Token>) {
+        for i in 0..channels.len() {
+            self.tokenize_one(channels, i, stream, out);
+        }
+    }
+
+    fn tokenize_one(&self, channels: &[&Channel], i: usize, stream: u32, out: &mut Vec<Token>) {
+        let ch = channels[i];
+        if ch.w == 0 || ch.h == 0 {
+            return;
+        }
+        let prev = previous_same_size(channels, i, self.max_prev);
+        visit(
+            ch,
+            i as i32,
+            stream as i32,
+            &prev,
+            self.uses_wp,
+            |props, nb, wp, v| {
+                let (pred, ctx) = self.leaf(props);
+                let p = pred.predict(nb, wp);
+                out.push(Token::new(ctx, pack_signed(v.wrapping_sub(p))));
+            },
+        );
+    }
+}
+
+/// Earlier channels with the same dimensions, most recent first.
+fn previous_same_size<'a>(channels: &[&'a Channel], i: usize, max_prev: usize) -> Vec<&'a Channel> {
+    let ch = channels[i];
+    channels[..i]
+        .iter()
+        .rev()
+        .filter(|c| c.w == ch.w && c.h == ch.h)
+        .take(max_prev)
+        .copied()
+        .collect()
+}
+
+/// Walk a channel in raster order, computing properties and (optionally) the
+/// weighted prediction for every sample.
+fn visit(
+    ch: &Channel,
+    index: i32,
+    stream: i32,
+    prev: &[&Channel],
+    use_wp: bool,
+    mut f: impl FnMut(&[i32; NUM_PROPS], &Neighbors, i64, i32),
+) {
+    let w = ch.w;
+    let mut wp = use_wp.then(|| Weighted::new(w));
+    let mut props = [0i32; NUM_PROPS];
+    for y in 0..ch.h {
+        let cur = &ch.data[y * w..(y + 1) * w];
+        let above = (y > 0).then(|| &ch.data[(y - 1) * w..y * w]);
+        let above2 = (y > 1).then(|| &ch.data[(y - 2) * w..(y - 1) * w]);
+        let mut prev_grad = 0;
+        for x in 0..w {
+            let nb = Neighbors::at(x, cur, above, above2, w);
+            let wpp = wp.as_ref().map(|wp| wp.predict(&nb));
+            let max_err = wpp.as_ref().map_or(0, |p| p.max_error);
+            prev_grad = base_props(&mut props, index, stream, x, y, &nb, prev_grad, max_err);
+            for (k, p) in prev.iter().enumerate() {
+                prev_channel_props(&mut props, k, &p.data, w, x, y);
+            }
+            let v = cur[x];
+            f(&props, &nb, wpp.as_ref().map_or(0, |p| p.prediction), v);
+            if let (Some(wp), Some(p)) = (wp.as_mut(), wpp.as_ref()) {
+                wp.record(p, v);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tree learning
+
+/// Learning parameters.
+#[derive(Clone, Debug)]
+pub struct LearnOptions {
+    pub predictors: Vec<Predictor>,
+    /// Properties that may be split on.
+    pub props: Vec<u8>,
+    /// Upper bound on the number of samples used for learning.
+    pub max_samples: usize,
+    /// Bits a split must save to be kept.
+    pub split_cost: f64,
+    pub max_leaves: usize,
+    /// Worker threads for sampling and split search.
+    pub threads: usize,
+}
+
+const MAX_TOK: usize = 64;
+const MAX_BUCKETS: usize = 32;
+/// Smallest node whose split search is spread over threads.
+const PAR_SPLIT_MIN: usize = 8192;
+/// Smallest pair of children built concurrently.
+const PAR_SUBTREE_MIN: usize = 16384;
+
+/// One sampled pixel: its properties and, per candidate predictor, the token
+/// and raw-bit count of its residual.
+#[derive(Clone, Copy)]
+struct Sample<const N: usize> {
+    // Only the properties selected by LearnOptions, in the same order.
+    props: [i32; N],
+    tok: [u8; 4],
+    extra: [u8; 4],
+}
+
+impl<const N: usize> Default for Sample<N> {
+    fn default() -> Self {
+        Self {
+            props: [0; N],
+            tok: [0; 4],
+            extra: [0; 4],
+        }
+    }
+}
+
+fn residual_token(r: i32) -> (u8, u8) {
+    let (t, n, _) = HybridUint::DEFAULT.encode(pack_signed(r));
+    ((t as usize).min(MAX_TOK - 1) as u8, n as u8)
+}
+
+/// `c * log2(c)`, tabulated for small counts.
+#[inline]
+fn xlogx(c: u32) -> f64 {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Vec<f32>> = OnceLock::new();
+    const N: usize = 1 << 16;
+    let t = TABLE.get_or_init(|| {
+        (0..N)
+            .map(|c| {
+                if c == 0 {
+                    0.0
+                } else {
+                    (c as f64 * (c as f64).log2()) as f32
+                }
+            })
+            .collect()
+    });
+    match t.get(c as usize) {
+        Some(&v) => f64::from(v),
+        None => f64::from(c) * f64::from(c).log2(),
+    }
+}
+
+#[derive(Clone)]
+struct Hist {
+    counts: [u32; MAX_TOK],
+    total: u32,
+    extra: u64,
+}
+
+impl Hist {
+    fn new() -> Self {
+        Hist {
+            counts: [0; MAX_TOK],
+            total: 0,
+            extra: 0,
+        }
+    }
+    #[inline]
+    fn add(&mut self, tok: u8, extra: u8) {
+        self.counts[tok as usize] += 1;
+        self.total += 1;
+        self.extra += u64::from(extra);
+    }
+    fn merge(&mut self, o: &Hist, ntok: usize) {
+        for (a, b) in self.counts[..ntok].iter_mut().zip(&o.counts[..ntok]) {
+            *a += b;
+        }
+        self.total += o.total;
+        self.extra += o.extra;
+    }
+    fn cost(&self) -> f64 {
+        self.cost_sub(None, MAX_TOK)
+    }
+    /// Cost of `self - other`, looking only at the first `ntok` tokens
+    /// (all later counts are zero and contribute nothing).
+    #[inline]
+    fn cost_sub(&self, other: Option<&Hist>, ntok: usize) -> f64 {
+        let (total, extra) = match other {
+            Some(o) => (self.total - o.total, self.extra - o.extra),
+            None => (self.total, self.extra),
+        };
+        if total == 0 {
+            return 0.0;
+        }
+        let mut bits = extra as f64 + xlogx(total);
+        match other {
+            Some(o) => {
+                for (a, b) in self.counts[..ntok].iter().zip(&o.counts[..ntok]) {
+                    bits -= xlogx(a - b);
+                }
+            }
+            None => {
+                for &c in &self.counts[..ntok] {
+                    bits -= xlogx(c);
+                }
+            }
+        }
+        bits
+    }
+}
+
+/// Learn a tree for the given streams (each a list of channels).
+pub fn learn(streams: &[(u32, Vec<&Channel>)], opts: &LearnOptions) -> Tree {
+    // Bound each sample's stride by the number of properties actually used.
+    // Keep a few size classes rather than specializing for every effort.
+    match opts.props.len() {
+        0..=6 => learn_sized::<6>(streams, opts),
+        7..=9 => learn_sized::<9>(streams, opts),
+        10..=13 => learn_sized::<13>(streams, opts),
+        14..=18 => learn_sized::<18>(streams, opts),
+        _ => learn_sized::<NUM_PROPS>(streams, opts),
+    }
+}
+
+fn learn_sized<const N: usize>(streams: &[(u32, Vec<&Channel>)], opts: &LearnOptions) -> Tree {
+    debug_assert!(opts.props.len() <= N);
+    let npred = opts.predictors.len().min(4);
+    let total_px: usize = streams
+        .iter()
+        .flat_map(|(_, c)| c.iter())
+        .map(|c| c.w * c.h)
+        .sum();
+    if total_px == 0 {
+        return Tree::single(opts.predictors[0]);
+    }
+    let stride = total_px.div_ceil(opts.max_samples.max(1)).max(1);
+    let need_wp = opts.predictors.contains(&Predictor::Weighted) || opts.props.contains(&15);
+    let uses_prev = opts.props.iter().any(|&p| p >= 16);
+    // One unit per (stream, channel); `offset` is the number of pixels
+    // before it, so every unit samples exactly the pixels a sequential walk
+    // would have.
+    let mut units = Vec::new();
+    let mut offset = 0usize;
+    for (si, (_, chans)) in streams.iter().enumerate() {
+        for (i, ch) in chans.iter().enumerate() {
+            if ch.w == 0 || ch.h == 0 {
+                continue;
+            }
+            units.push((si, i, offset));
+            offset += ch.w * ch.h;
+        }
+    }
+    // The number of samples each unit yields is known up front, so units
+    // write straight into their own slice of one buffer.
+    let counts: Vec<usize> = units
+        .iter()
+        .map(|&(si, i, start)| {
+            let n = streams[si].1[i].w * streams[si].1[i].h;
+            (start + n) / stride - start / stride
+        })
+        .collect();
+    let mut samples = vec![Sample::<N>::default(); counts.iter().sum()];
+    let mut rest = samples.as_mut_slice();
+    let mut tasks = Vec::with_capacity(units.len());
+    for (&unit, &c) in units.iter().zip(&counts) {
+        let (head, tail) = rest.split_at_mut(c);
+        tasks.push((unit, head));
+        rest = tail;
+    }
+    par_tasks(tasks, opts.threads, |((si, i, start), out)| {
+        let (stream, chans) = &streams[si];
+        let ch = chans[i];
+        let mut counter = start;
+        let mut k = 0;
+        let prev = previous_same_size(chans, i, if uses_prev { MAX_PREV_CHANNELS } else { 0 });
+        visit(
+            ch,
+            i as i32,
+            *stream as i32,
+            &prev,
+            need_wp,
+            |props, nb, wp, v| {
+                counter += 1;
+                if !counter.is_multiple_of(stride) {
+                    return;
+                }
+                let s = &mut out[k];
+                k += 1;
+                for (dst, &p) in s.props.iter_mut().zip(&opts.props) {
+                    *dst = props[p as usize];
+                }
+                for (kk, p) in opts.predictors.iter().take(npred).enumerate() {
+                    let (t, e) = residual_token(v.wrapping_sub(p.predict(nb, wp)));
+                    s.tok[kk] = t;
+                    s.extra[kk] = e;
+                }
+            },
+        );
+        debug_assert_eq!(k, out.len());
+    });
+    let scale = stride as f64;
+    // Candidate thresholds per property, from quantiles.
+    let thresholds: Vec<Vec<i32>> = (0..NUM_PROPS)
+        .map(|p| {
+            let Some(prop_index) = opts.props.iter().position(|&prop| prop as usize == p) else {
+                return Vec::new();
+            };
+            let step = (samples.len() / 4096).max(1);
+            let mut vals: Vec<i32> = samples
+                .iter()
+                .step_by(step)
+                .map(|s| s.props[prop_index])
+                .collect();
+            vals.sort_unstable();
+            vals.dedup();
+            if vals.len() <= 1 {
+                return Vec::new();
+            }
+            // Split values must leave something on both sides: drop the max.
+            vals.pop();
+            if vals.len() < MAX_BUCKETS {
+                return vals;
+            }
+            let n = vals.len();
+            let mut out: Vec<i32> = (1..MAX_BUCKETS)
+                .map(|k| vals[k * n / MAX_BUCKETS])
+                .collect();
+            out.dedup();
+            out
+        })
+        .collect();
+    let mut idx: Vec<u32> = (0..samples.len() as u32).collect();
+    let leaves = 1usize;
+    let ntok = samples
+        .iter()
+        .flat_map(|s| s.tok[..npred].iter())
+        .map(|&t| t as usize + 1)
+        .max()
+        .unwrap_or(1);
+    // Bucket of every sample for every property, computed once: the same
+    // `partition_point` the split search would otherwise redo at each node.
+    let buckets: Vec<Vec<u8>> = par_map(opts.props.len(), opts.threads, |pi| {
+        let th = &thresholds[opts.props[pi] as usize];
+        samples
+            .iter()
+            .map(|s| th.partition_point(|&t| t < s.props[pi]) as u8)
+            .collect()
+    });
+    let ctx = Learner {
+        samples: &samples,
+        buckets: &buckets,
+        ntok,
+        thresholds: &thresholds,
+        opts,
+        npred,
+        scale,
+    };
+    let (root, _) = ctx.build(&mut idx, leaves, 0, opts.threads.max(1));
+    Tree::from_build(root)
+}
+
+struct Learner<'a, const N: usize> {
+    samples: &'a [Sample<N>],
+    /// `buckets[prop_index][sample]`: threshold bucket of each sample.
+    buckets: &'a [Vec<u8>],
+    /// Number of token values in use (counts beyond are zero).
+    ntok: usize,
+    thresholds: &'a [Vec<i32>],
+    opts: &'a LearnOptions,
+    npred: usize,
+    scale: f64,
+}
+
+impl<const N: usize> Learner<'_, N> {
+    /// Best split of `prop` over the samples in `idx`: (cost, prop, value).
+    fn best_split_for(
+        &self,
+        idx: &[u32],
+        prop_index: usize,
+        prop: u8,
+        hists: &[Hist],
+    ) -> Option<(f64, u8, i32)> {
+        let np = self.npred;
+        let th = &self.thresholds[prop as usize];
+        if th.is_empty() {
+            return None;
+        }
+        let mut best: Option<(f64, u8, i32)> = None;
+        let ntok = self.ntok;
+        let mut buckets = vec![Hist::new(); (th.len() + 1) * np];
+        let col = &self.buckets[prop_index];
+        for &i in idx {
+            let s = &self.samples[i as usize];
+            let b = usize::from(col[i as usize]);
+            for k in 0..np {
+                buckets[b * np + k].add(s.tok[k], s.extra[k]);
+            }
+        }
+        // right = buckets[..=t], left = buckets[t+1..]
+        let mut right = vec![Hist::new(); np];
+        for (t, &val) in th.iter().enumerate() {
+            for k in 0..np {
+                right[k].merge(&buckets[t * np + k], ntok);
+            }
+            if right[0].total == 0 || right[0].total == hists[0].total {
+                continue;
+            }
+            let mut rc = f64::INFINITY;
+            let mut lc = f64::INFINITY;
+            for k in 0..np {
+                rc = rc.min(right[k].cost_sub(None, ntok));
+                lc = lc.min(hists[k].cost_sub(Some(&right[k]), ntok));
+            }
+            let c = lc + rc;
+            if best.is_none_or(|b| c < b.0) {
+                best = Some((c, prop, val));
+            }
+        }
+        best
+    }
+
+    /// Build the subtree for `idx`. `leaves` is the number of leaves so far
+    /// (depth-first), and the number after this subtree is returned.
+    fn build(
+        &self,
+        idx: &mut [u32],
+        leaves: usize,
+        depth: usize,
+        threads: usize,
+    ) -> (Build, usize) {
+        // Best predictor for this node.
+        let mut hists = vec![Hist::new(); self.npred];
+        for &i in idx.iter() {
+            let s = &self.samples[i as usize];
+            for (k, h) in hists.iter_mut().enumerate() {
+                h.add(s.tok[k], s.extra[k]);
+            }
+        }
+        let (best_k, node_cost) = hists
+            .iter()
+            .map(Hist::cost)
+            .enumerate()
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap();
+        let pred = self.opts.predictors[best_k];
+        if idx.len() < 64 || leaves >= self.opts.max_leaves || depth > 40 {
+            return (Build::Leaf(pred), leaves);
+        }
+        // Find the best split; each side picks its own best predictor.
+        let props = &self.opts.props;
+        let cands = par_map(
+            props.len(),
+            if idx.len() >= PAR_SPLIT_MIN {
+                threads
+            } else {
+                1
+            },
+            |k| self.best_split_for(idx, k, props[k], &hists),
+        );
+        let mut best: Option<(f64, u8, i32)> = None;
+        for c in cands.into_iter().flatten() {
+            if best.is_none_or(|b| c.0 < b.0) {
+                best = Some(c);
+            }
+        }
+        let Some((cost, prop, val)) = best else {
+            return (Build::Leaf(pred), leaves);
+        };
+        let gain = (node_cost - cost) * self.scale;
+        if gain < self.opts.split_cost {
+            return (Build::Leaf(pred), leaves);
+        }
+        // Partition: left (prop > val) first.
+        let prop_index = self.opts.props.iter().position(|&p| p == prop).unwrap();
+        let mut k = 0;
+        for j in 0..idx.len() {
+            if self.samples[idx[j] as usize].props[prop_index] > val {
+                idx.swap(j, k);
+                k += 1;
+            }
+        }
+        let leaves = leaves + 1;
+        let (l, r) = idx.split_at_mut(k);
+        let (left, right, after) = if threads > 1 && l.len().min(r.len()) >= PAR_SUBTREE_MIN {
+            // Build both sides at once. The right side is built as if the
+            // left used no leaf budget (so it may be too large) and is then
+            // trimmed to what a depth-first walk would have allowed.
+            let (tl, tr) = (threads.div_ceil(2), threads / 2);
+            let ((left, after_l), (spec, _)) = std::thread::scope(|sc| {
+                let h = sc.spawn(|| self.build(r, leaves, depth + 1, tr));
+                let a = self.build(l, leaves, depth + 1, tl);
+                (a, h.join().expect("worker panicked"))
+            });
+            let mut counter = after_l;
+            let right = self.trim(spec, &mut counter);
+            (left, right, counter)
+        } else {
+            let (left, after_l) = self.build(l, leaves, depth + 1, threads);
+            let (right, after_r) = self.build(r, after_l, depth + 1, threads);
+            (left, right, after_r)
+        };
+        (
+            Build::Split {
+                prop,
+                val,
+                pred,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            after,
+        )
+    }
+
+    /// Re-apply the leaf limit to a subtree that was built with too much
+    /// budget: nodes reached after `counter` hits the limit become leaves.
+    fn trim(&self, b: Build, counter: &mut usize) -> Build {
+        match b {
+            Build::Leaf(p) => Build::Leaf(p),
+            Build::Split {
+                prop,
+                val,
+                pred,
+                left,
+                right,
+            } => {
+                if *counter >= self.opts.max_leaves {
+                    return Build::Leaf(pred);
+                }
+                *counter += 1;
+                let left = self.trim(*left, counter);
+                let right = self.trim(*right, counter);
+                Build::Split {
+                    prop,
+                    val,
+                    pred,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                }
+            }
+        }
+    }
+}
