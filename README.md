@@ -60,3 +60,9 @@ cargo run --release --example eval -- -q 90 -e 7 image.png   # サイズ・PSNR�
 ```
 
 ライセンスは libjxl に合わせて BSD-3-Clause です。
+
+## CI・リリース
+
+PR・main への push・`v*` タグの push・手動実行で、Linux x64 / arm64 のリリースビルドとテストを実行します。examples とドキュメントテストも対象です。Cargo のソースパッケージ（`.crate`）を作成し、展開したパッケージのビルド・テスト後に、SHA-256 チェックサムとともに Actions の `packages` artifact に保存します。
+
+`Cargo.toml` と `Cargo.lock` のバージョンを更新して main にマージすると、対応する `v<version>` タグが未作成の場合にタグと GitHub Release を作成し、`.crate` と `SHA256SUMS` を添付します。バージョンと一致するタグの push でもリリースできます。crates.io への公開は行いません。
