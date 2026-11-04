@@ -5,7 +5,7 @@ mod ans;
 
 use crate::bit_writer::{BitWriter, bits_for};
 use crate::parallel::par_map;
-use ans::{AnsDist, estimate_cost};
+use ans::{AnsDist, estimate_cost, estimate_merged_cost};
 
 /// A value to be entropy coded in a given context.
 ///
@@ -240,9 +240,7 @@ fn visit_values(
 }
 
 fn merged_cost(a: &[u32], b: &[u32]) -> f64 {
-    let mut m = a.to_vec();
-    add_into(&mut m, b);
-    estimate_cost(&m)
+    estimate_merged_cost(a, b)
 }
 
 /// Group contexts with similar statistics. Returns the context map.
@@ -523,6 +521,18 @@ impl EntropyCode {
         } else {
             None
         };
+        // Even an empty ANS stream has a 32-bit state. Tiny simple maps
+        // cannot benefit from building an entropy code (with or without MTF).
+        if let Some(bits) = simple_bits
+            && bits <= 32
+        {
+            w.write_bool(true);
+            w.write(2, u64::from(nbits));
+            for &c in &self.context_map {
+                w.write(nbits, u64::from(c));
+            }
+            return;
+        }
         // Entropy-coded alternative.
         let tokens: Vec<Token> = self
             .context_map
@@ -542,6 +552,35 @@ impl EntropyCode {
         coded.write_bool(false); // no MTF
         code.write_header(&mut coded);
         code.write_tokens(&tokens, &mut coded);
+
+        // MTF can make runs of related contexts much cheaper. Compare actual
+        // encoded headers so it is never selected just on an entropy estimate.
+        let mut order: Vec<u8> = (0..=255).collect();
+        let mtf_tokens: Vec<Token> = self
+            .context_map
+            .iter()
+            .map(|&c| {
+                let index = order.iter().position(|&v| v == c).unwrap();
+                order[..=index].rotate_right(1);
+                Token::new(0, index as u32)
+            })
+            .collect();
+        let mtf_code = EntropyCode::build(
+            &[&mtf_tokens],
+            1,
+            CodeOptions {
+                max_clusters: 1,
+                tune_configs: true,
+                threads: 1,
+            },
+        );
+        let mut mtf = BitWriter::new();
+        mtf.write_bool(true);
+        mtf_code.write_header(&mut mtf);
+        mtf_code.write_tokens(&mtf_tokens, &mut mtf);
+        if mtf.bits_written() < coded.bits_written() {
+            coded = mtf;
+        }
         match simple_bits {
             Some(bits) if bits <= coded.bits_written() => {
                 w.write_bool(true);

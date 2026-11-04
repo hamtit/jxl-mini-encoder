@@ -22,6 +22,8 @@ pub struct AnsDist {
 enum DistEncoding {
     /// Only one symbol is used (or none).
     Single(usize),
+    /// Two symbols with a directly represented 12-bit probability.
+    Binary(usize, usize),
     /// General encoding with the given shift.
     General(u32),
 }
@@ -50,9 +52,21 @@ impl AnsDist {
                     best = Some((cost, f, shift));
                 }
             }
-            let (_, mut f, shift) = best.expect("no valid ANS normalisation");
+            let (cost, mut f, shift) = best.expect("no valid ANS normalisation");
             f.resize(table_size, 0);
-            (f, DistEncoding::General(shift))
+            let mut encoding = DistEncoding::General(shift);
+            if let [a, b] = used[..] {
+                let mut binary = vec![0u16; table_size];
+                binary[a] = ((u64::from(counts[a]) * u64::from(TAB) + total / 2) / total)
+                    .clamp(1, u64::from(TAB - 1)) as u16;
+                binary[b] = TAB as u16 - binary[a];
+                let bits = 2 + u8_bits(a as u32) + u8_bits(b as u32) + LOG_TAB;
+                if (bits as f64 + data_bits(counts, &binary, total)) < cost {
+                    f = binary;
+                    encoding = DistEncoding::Binary(a, b);
+                }
+            }
+            (f, encoding)
         };
         let (slots, start) = reverse_alias_table(&freq, log_alpha);
         AnsDist {
@@ -76,6 +90,13 @@ impl AnsDist {
                 w.write_bool(false); // one symbol
                 write_u8(w, s as u32);
             }
+            DistEncoding::Binary(a, b) => {
+                w.write_bool(true); // simple
+                w.write_bool(true); // two symbols
+                write_u8(w, a as u32);
+                write_u8(w, b as u32);
+                w.write(LOG_TAB, u64::from(self.freq[a]));
+            }
             DistEncoding::General(shift) => write_general(w, &self.freq, shift),
         }
     }
@@ -84,17 +105,51 @@ impl AnsDist {
 /// Approximate cost in bits of coding `counts` with its own distribution,
 /// including the distribution header. Used for clustering decisions.
 pub fn estimate_cost(counts: &[u32]) -> f64 {
-    let total: u64 = counts.iter().map(|&c| u64::from(c)).sum();
+    estimate_cost_counts(counts.iter().copied())
+}
+
+/// Cost a prospective merge without allocating a temporary histogram.
+pub fn estimate_merged_cost(a: &[u32], b: &[u32]) -> f64 {
+    estimate_cost_counts(
+        (0..a.len().max(b.len()))
+            .map(|i| a.get(i).copied().unwrap_or(0) + b.get(i).copied().unwrap_or(0)),
+    )
+}
+
+/// Histogram clustering repeatedly evaluates small integer counts. Tabulating
+/// c*log2(c) avoids a transcendental call per occupied bin, and the entropy is
+/// then xlogx(total) - sum(xlogx(count)). Use f64 to keep tie decisions stable.
+fn xlogx(count: u64) -> f64 {
+    const N: usize = 4096;
+    static TABLE: std::sync::OnceLock<[f64; N]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        std::array::from_fn(|i| {
+            if i == 0 {
+                0.0
+            } else {
+                i as f64 * (i as f64).log2()
+            }
+        })
+    });
+    if count < N as u64 {
+        table[count as usize]
+    } else {
+        count as f64 * (count as f64).log2()
+    }
+}
+
+fn estimate_cost_counts(counts: impl ExactSizeIterator<Item = u32> + Clone) -> f64 {
+    let alphabet = counts.len();
+    let total: u64 = counts.clone().map(u64::from).sum();
     if total == 0 {
         return 0.0;
     }
-    let mut bits = 0.0;
+    let mut bits = xlogx(total);
     let mut nonzero = 0;
-    let t = total as f64;
-    for &c in counts {
+    for c in counts {
         if c > 0 {
             nonzero += 1;
-            bits += f64::from(c) * (t / f64::from(c)).log2();
+            bits -= xlogx(u64::from(c));
         }
     }
     if nonzero <= 1 {
@@ -102,7 +157,7 @@ pub fn estimate_cost(counts: &[u32]) -> f64 {
     }
     // Roughly: shift + alphabet size + ~4 bits of log-count and ~4 bits of
     // mantissa per used symbol, 5 bits per unused one.
-    let header = 12.0 + 8.0 * nonzero as f64 + 5.0 * (counts.len() - nonzero) as f64;
+    let header = 12.0 + 8.0 * nonzero as f64 + 5.0 * (alphabet - nonzero) as f64;
     bits + header
 }
 
@@ -295,6 +350,10 @@ fn write_general(w: &mut BitWriter, f: &[u16], shift: u32) {
         w.write(bc, u64::from(mant));
     }
 }
+
+#[cfg(test)]
+#[path = "ans_tests.rs"]
+mod tests;
 
 /// Rebuild the decoder's alias table and invert it.
 fn reverse_alias_table(freq: &[u16], log_alpha: u32) -> (Vec<u16>, Vec<u32>) {
