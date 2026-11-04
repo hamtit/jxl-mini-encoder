@@ -723,7 +723,8 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
         // graphics-like content, so try them only if a sample of tiles
         // shows a clear estimated gain.
         if params.choose_transforms && opts.effort >= 5 {
-            search.set_small(search.probe_small() >= small_threshold(d));
+            let gain = search.probe_small();
+            search.set_small(gain >= small_threshold(d));
         }
         let (tx, ty) = (bw.div_ceil(8), bh.div_ceil(8));
         let tiles: Vec<Vec<BlockAcs>> = par_map(tx * ty, opts.threads, |i| {

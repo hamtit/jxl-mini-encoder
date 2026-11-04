@@ -516,7 +516,7 @@ struct Config {
 }
 
 /// Chosen transform per block: the transform and the origin of its varblock.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockAcs {
     pub acs: Acs,
     pub ox: u32,
@@ -530,7 +530,12 @@ pub struct Search<'a> {
     cfg: Config,
     /// Whether the small 8x8 transforms are tried.
     small: bool,
+    /// Estimates already paid for while probing small transforms. Read-only
+    /// during the parallel tile search; no scratch buffers are retained.
+    probe_cache: Vec<((usize, usize), EstimateCache)>,
 }
+
+type EstimateCache = [[f32; 64]; ALL.len()];
 
 fn ceil_log2(x: usize) -> usize {
     x.next_power_of_two().trailing_zeros() as usize
@@ -558,7 +563,7 @@ struct Tile {
     entropy: [f32; 64],
     priority: [u8; 64],
     /// Memoised estimates per (transform, tile position).
-    cache: [[f32; 64]; ALL.len()],
+    cache: EstimateCache,
     scratch: Vec<f32>,
 }
 
@@ -618,6 +623,7 @@ impl<'a> Search<'a> {
             dct,
             cfg,
             small: false,
+            probe_cache: Vec::new(),
         }
     }
 
@@ -628,7 +634,8 @@ impl<'a> Search<'a> {
 
     /// Relative estimated gain of trying the small 8x8 transforms, measured
     /// on a sample of tiles: `(sum DCT8 - sum best) / sum DCT8`.
-    pub fn probe_small(&self) -> f32 {
+    pub fn probe_small(&mut self) -> f32 {
+        self.probe_cache.clear();
         let inp = self.inp;
         let (tx, ty) = (inp.bw.div_ceil(8), inp.bh.div_ceil(8));
         let step = (tx * ty / PROBE_TILES).max(1);
@@ -639,6 +646,7 @@ impl<'a> Search<'a> {
             let (b, e) = self.select_8x8(&mut tile, true);
             base += f64::from(b);
             best += f64::from(e);
+            self.probe_cache.push(((bx, by), tile.cache));
             self.release_tile(tile);
         }
         if base > 0.0 {
@@ -659,7 +667,12 @@ impl<'a> Search<'a> {
             origin: std::array::from_fn(|i| ((i % 8) as u8, (i / 8) as u8)),
             entropy: [0.0; 64],
             priority: [0; 64],
-            cache: [[f32::NAN; 64]; ALL.len()],
+            cache: self
+                .probe_cache
+                .iter()
+                .find(|(origin, _)| *origin == (bx, by))
+                .map(|(_, cache)| *cache)
+                .unwrap_or([[f32::NAN; 64]; ALL.len()]),
             scratch: SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut())),
         };
         if tile.scratch.len() < SCRATCH_LEN {
@@ -1076,6 +1089,71 @@ pub fn adjust_quant_field(acs: &[BlockAcs], bw: usize, distance: f32, field: &mu
         for iy in 0..h {
             for ix in 0..w {
                 field[(y + iy) * bw + x + ix] = max;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_cache_does_not_change_tile_choices() {
+        let (bw, bh) = (25usize, 49usize);
+        let stride = bw * 8;
+        let planes: [Vec<f32>; 3] = std::array::from_fn(|c| {
+            (0..stride * bh * 8)
+                .map(|i| {
+                    let x = i % stride;
+                    let y = i / stride;
+                    ((x / 13 + y / 17 + c) % 7) as f32 * 0.03
+                        + ((i * 37 + c * 11) % 101) as f32 * 0.0001
+                })
+                .collect()
+        });
+        let quant = vec![1.0; bw * bh];
+        let mask = vec![0.5; stride * bh * 8];
+        let tables = Tables::new();
+        let dct = Dct::new();
+        for effort in [5, 7, 9] {
+            for distance in [0.3, 1.0, 8.0] {
+                let input = SearchInput {
+                    planes: [&planes[0], &planes[1], &planes[2]],
+                    stride,
+                    bw,
+                    bh,
+                    quant: &quant,
+                    mask1x1: &mask,
+                    cmap: [0.0, 0.0, 1.0],
+                    distance,
+                    effort,
+                };
+                let mut cached = Search::new(&input, &tables, &dct);
+                let mut plain = Search::new(&input, &tables, &dct);
+                cached.probe_small();
+                assert!(cached.probe_cache.len() <= 2 * PROBE_TILES);
+                for small in [false, true] {
+                    cached.set_small(small);
+                    plain.set_small(small);
+                    for by in (0..bh).step_by(8) {
+                        for bx in (0..bw).step_by(8) {
+                            let init = BlockAcs {
+                                acs: Acs::Dct8,
+                                ox: 0,
+                                oy: 0,
+                            };
+                            let mut expected = [init; 64];
+                            let mut actual = expected;
+                            plain.tile(bx, by, &mut expected, 8);
+                            cached.tile(bx, by, &mut actual, 8);
+                            assert_eq!(
+                                actual, expected,
+                                "e{effort} d{distance} small={small} ({bx},{by})"
+                            );
+                        }
+                    }
+                }
             }
         }
     }
