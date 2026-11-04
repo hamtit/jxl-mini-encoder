@@ -5,6 +5,8 @@ mod aq;
 mod dct;
 mod quant;
 mod small;
+#[cfg(test)]
+mod tests;
 pub(crate) mod xyb;
 
 use crate::bit_writer::BitWriter;
@@ -660,6 +662,37 @@ unsafe fn quantize_avx2(
     quantize_impl(coeffs, weights, w, h, m, thres, out)
 }
 
+/// Conservatively recognize flat graphics in the original RGB samples.
+/// Inspect at most 1024 complete 8x8 tiles, ignoring alpha. Requiring whole
+/// tiles to be constant avoids mistaking smooth photographic gradients for UI.
+fn flat_graphics(img: &ImageRef) -> bool {
+    let (w, h) = (img.width as usize, img.height as usize);
+    let (tw, th) = (w / 8, h / 8);
+    let total = tw * th;
+    if total < 4 {
+        return false;
+    }
+    let count = total.min(1024);
+    let stride = img.channels();
+    let mut flat = 0;
+    for i in 0..count {
+        // Evenly distribute samples; split the product to avoid overflow on
+        // 32-bit targets with large input buffers.
+        let tile = i * (total / count) + i * (total % count) / count;
+        let (x, y) = (tile % tw * 8, tile / tw * 8);
+        let origin = (y * w + x) * stride;
+        let color = &img.data[origin..origin + 3];
+        let constant = (0..8).all(|dy| {
+            (0..8).all(|dx| {
+                let p = ((y + dy) * w + x + dx) * stride;
+                &img.data[p..p + 3] == color
+            })
+        });
+        flat += usize::from(constant);
+    }
+    flat * 100 >= count * 85
+}
+
 pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
     let (w, h) = (img.width as usize, img.height as usize);
     let (bw, bh) = (w.div_ceil(8), h.div_ceil(8));
@@ -681,12 +714,13 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
     // MINI_NO_GABORISH=1 turns it off. Like libjxl, only above distance 0.5:
     // at higher fidelity the sharpening overshoots on hard edges (graphics,
     // text) and costs several times the bytes for no gain.
-    let gaborish =
-        params.adaptive_quant && d > 0.5 && std::env::var_os("MINI_NO_GABORISH").is_none();
+    let gaborish = params.adaptive_quant
+        && d > 0.5
+        && std::env::var_os("MINI_NO_GABORISH").is_none()
+        && !flat_graphics(img);
     let (mut field, mask1x1, q_median) = if params.adaptive_quant {
-        // libjxl uses Gaborish at these efforts; here it cost more than it
-        // gained (+7% BD-rate on SSIMULACRA2), so frames are coded without it
-        // and the AQ target is scaled as libjxl does in that case.
+        // Without Gaborish, scale the AQ target as libjxl does. Flat
+        // graphics avoid the sharpening overshoot and extra edge coefficients.
         let d_iqf = if gaborish { d } else { d * 0.62 };
         let maps = aq::initial_quant_field(d_iqf, &xyb, 0.765 / d_iqf, opts.threads);
         (maps.quant_field, maps.mask1x1, 0.39 / d)
@@ -723,7 +757,7 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
         // graphics-like content, so try them only if a sample of tiles
         // shows a clear estimated gain.
         if params.choose_transforms && opts.effort >= 5 {
-            let gain = search.probe_small();
+            let gain = search.probe_small(opts.threads);
             search.set_small(gain >= small_threshold(d));
         }
         let (tx, ty) = (bw.div_ceil(8), bh.div_ceil(8));

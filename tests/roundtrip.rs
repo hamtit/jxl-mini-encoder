@@ -235,9 +235,8 @@ fn threads_do_not_change_output() {
     }
 }
 
-/// Flat colour blocks with hard edges: libjxl does not use Gaborish at
-/// distance <= 0.5, because its sharpening overshoots on such edges and
-/// inflates the output several times over.
+/// Flat colour blocks should avoid sharpening overshoot at both high and
+/// moderate fidelity. The graphics detector must also be thread-independent.
 #[test]
 fn hard_edges_stay_small_at_high_fidelity() {
     let (w, h) = (256u32, 256u32);
@@ -257,16 +256,18 @@ fn hard_edges_stay_small_at_high_fidelity() {
         }
     }
     let img = jxl_mini_encoder::ImageRef::rgb8(w, h, &px).unwrap();
-    let size = |d: f32| {
-        jxl_mini_encoder::Encoder::new()
-            .distance(d)
-            .encode(&img)
-            .unwrap()
-            .len()
-    };
-    // About 1.4 kB with Gaborish off; 22 kB with it on.
-    let high = size(0.3);
-    assert!(high < 5000, "d0.3 produced {high} B");
+    for distance in [0.3, 0.55, 1.0, 2.35] {
+        let enc = jxl_mini_encoder::Encoder::new().distance(distance);
+        let bytes = enc.clone().threads(1).encode(&img).unwrap();
+        assert_eq!(bytes, enc.threads(4).encode(&img).unwrap());
+        assert!(bytes.len() < 5000, "d{distance} produced {} B", bytes.len());
+        let (dw, dh, ch, decoded) = decode(&bytes);
+        assert_eq!((dw, dh, ch), (w, h, 3));
+        assert!(
+            psnr(&px, &decoded) > 35.0,
+            "d{distance}: fidelity regression"
+        );
+    }
 }
 
 /// A page of repeated glyph-like shapes on a flat background, with optional

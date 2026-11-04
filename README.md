@@ -36,7 +36,7 @@ let jxl = jxl_mini_encoder::Encoder::new()
 
 ## エンコード機能
 
-- 逆 Gaborish と量子化のブロック別調整（AdjustQuantBlockAC）は effort 5 以上で有効です。逆 Gaborish は距離 0.5 超でのみ有効です。`MINI_NO_GABORISH=1` / `MINI_NO_ADJUST_QUANT=1` で無効化できます。
+- 逆 Gaborish と量子化のブロック別調整（AdjustQuantBlockAC）は effort 5 以上で有効です。逆 Gaborish は距離 0.5 超で、平坦な図形画像と判定されない場合に有効です（最大1024個の8×8領域を標本化し、85%以上がRGB一定なら無効化）。無効時はAQの目標値も調整します。`MINI_NO_GABORISH=1` / `MINI_NO_ADJUST_QUANT=1` でも無効化できます。
 - パッチは effort 7 以上で有効です。テキストや UI の繰り返し図形を参照フレームに符号化します。`MINI_NO_PATCHES=1` で無効化できます。
 - AFV、ノイズ合成、スプライン、butteraugli による反復量子化は未実装です。
 

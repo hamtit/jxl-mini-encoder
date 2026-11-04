@@ -634,20 +634,27 @@ impl<'a> Search<'a> {
 
     /// Relative estimated gain of trying the small 8x8 transforms, measured
     /// on a sample of tiles: `(sum DCT8 - sum best) / sum DCT8`.
-    pub fn probe_small(&mut self) -> f32 {
+    pub fn probe_small(&mut self, threads: usize) -> f32 {
         self.probe_cache.clear();
         let inp = self.inp;
         let (tx, ty) = (inp.bw.div_ceil(8), inp.bh.div_ceil(8));
         let step = (tx * ty / PROBE_TILES).max(1);
-        let (mut base, mut best) = (0f64, 0f64);
-        for t in (0..tx * ty).step_by(step) {
+        let sampled: Vec<usize> = (0..tx * ty).step_by(step).collect();
+        let results = crate::parallel::par_map(sampled.len(), threads, |i| {
+            let t = sampled[i];
             let (bx, by) = ((t % tx) * 8, (t / tx) * 8);
             let mut tile = self.new_tile(bx, by);
             let (b, e) = self.select_8x8(&mut tile, true);
+            let cache = tile.cache;
+            self.release_tile(tile);
+            ((bx, by), cache, b, e)
+        });
+        // Preserve the serial reduction order, independently of thread count.
+        let (mut base, mut best) = (0f64, 0f64);
+        for (origin, cache, b, e) in results {
             base += f64::from(b);
             best += f64::from(e);
-            self.probe_cache.push(((bx, by), tile.cache));
-            self.release_tile(tile);
+            self.probe_cache.push((origin, cache));
         }
         if base > 0.0 {
             ((base - best) / base) as f32
@@ -1131,7 +1138,8 @@ mod tests {
                 };
                 let mut cached = Search::new(&input, &tables, &dct);
                 let mut plain = Search::new(&input, &tables, &dct);
-                cached.probe_small();
+                let mut serial = Search::new(&input, &tables, &dct);
+                assert_eq!(cached.probe_small(4), serial.probe_small(1));
                 assert!(cached.probe_cache.len() <= 2 * PROBE_TILES);
                 for small in [false, true] {
                     cached.set_small(small);
