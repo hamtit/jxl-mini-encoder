@@ -90,6 +90,42 @@ fn lossless_groups() {
     }
 }
 
+#[test]
+fn constant_planes_and_binary_images() {
+    for (w, h) in [(1u32, 1u32), (17, 9), (257, 259)] {
+        for alpha in [0u8, 255] {
+            let pixels: Vec<u8> = (0..w * h).flat_map(|_| [0, 127, 255, alpha]).collect();
+            let image = jxl_mini_encoder::ImageRef::rgba8(w, h, &pixels).unwrap();
+            for quality in [90.0, 100.0] {
+                let out = jxl_mini_encoder::Encoder::new()
+                    .quality(quality)
+                    .encode(&image)
+                    .unwrap();
+                let (dw, dh, ch, decoded) = decode(&out);
+                assert_eq!((dw, dh, ch), (w, h, 4));
+                assert!(decoded.chunks_exact(4).all(|p| p[3] == alpha));
+                if quality == 100.0 {
+                    assert_eq!(decoded, pixels);
+                }
+            }
+        }
+    }
+    let (w, h) = (257u32, 259u32);
+    let pixels: Vec<u8> = (0..w * h)
+        .flat_map(|i| {
+            let v = if (i % w + i / w) % 2 == 0 { 0 } else { 255 };
+            [v, v, v]
+        })
+        .collect();
+    let image = jxl_mini_encoder::ImageRef::rgb8(w, h, &pixels).unwrap();
+    for effort in [1, 3, 7, 9] {
+        let enc = jxl_mini_encoder::Encoder::new().lossless().effort(effort);
+        let out = enc.clone().threads(1).encode(&image).unwrap();
+        assert_eq!(out, enc.threads(4).encode(&image).unwrap());
+        assert_eq!(decode(&out).3, pixels);
+    }
+}
+
 fn psnr(a: &[u8], b: &[u8]) -> f64 {
     let mse: f64 = a
         .iter()

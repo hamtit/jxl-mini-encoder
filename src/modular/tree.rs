@@ -24,8 +24,9 @@ pub enum Node {
     },
 }
 
-/// A tree stored in breadth-first order (the order it is serialised in, which
-/// also numbers the leaf contexts).
+/// A learned tree in breadth-first serialisation order, which also numbers
+/// the leaf contexts. Tokenisation-only specialisations may have a different
+/// node order but retain the learned tree's context numbers.
 #[derive(Clone, Debug)]
 pub struct Tree {
     nodes: Vec<Node>,
@@ -126,6 +127,86 @@ impl Tree {
         }
     }
 
+    /// Resolve properties that are constant for a whole channel. In particular,
+    /// a weighted predictor in another channel must not make this one maintain
+    /// weighted-predictor state. Leaf context numbers remain those of the
+    /// original, serialised tree.
+    fn specialize(&self, channel: i32, stream: i32) -> std::borrow::Cow<'_, Self> {
+        if !self
+            .nodes
+            .iter()
+            .any(|n| matches!(n, Node::Split { prop: 0 | 1, .. }))
+        {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        fn copy(tree: &Tree, i: usize, channel: i32, stream: i32, out: &mut Vec<Node>) -> u32 {
+            if let Node::Split {
+                prop: 0 | 1,
+                val,
+                left,
+                right,
+            } = tree.nodes[i]
+            {
+                let prop = match tree.nodes[i] {
+                    Node::Split { prop: 0, .. } => channel,
+                    _ => stream,
+                };
+                return copy(
+                    tree,
+                    if prop > val { left } else { right } as usize,
+                    channel,
+                    stream,
+                    out,
+                );
+            }
+            let index = out.len() as u32;
+            out.push(tree.nodes[i]);
+            if let Node::Split {
+                prop,
+                val,
+                left,
+                right,
+            } = tree.nodes[i]
+            {
+                let left = copy(tree, left as usize, channel, stream, out);
+                let right = copy(tree, right as usize, channel, stream, out);
+                out[index as usize] = Node::Split {
+                    prop,
+                    val,
+                    left,
+                    right,
+                };
+            }
+            index
+        }
+        let mut nodes = Vec::new();
+        copy(self, 0, channel, stream, &mut nodes);
+        let uses_wp = nodes.iter().any(|n| {
+            matches!(
+                n,
+                Node::Split { prop: 15, .. }
+                    | Node::Leaf {
+                        pred: Predictor::Weighted,
+                        ..
+                    }
+            )
+        });
+        let max_prev = nodes
+            .iter()
+            .filter_map(|n| match n {
+                Node::Split { prop, .. } if *prop >= 16 => Some((*prop as usize - 16) / 4 + 1),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        std::borrow::Cow::Owned(Self {
+            nodes,
+            num_leaves: self.num_leaves,
+            uses_wp,
+            max_prev,
+        })
+    }
+
     /// Serialise the tree with its own entropy code.
     pub fn write(&self, w: &mut BitWriter) {
         let mut tokens = Vec::with_capacity(self.nodes.len() * 2);
@@ -186,15 +267,16 @@ impl Tree {
         if ch.w == 0 || ch.h == 0 {
             return;
         }
-        let prev = previous_same_size(channels, i, self.max_prev);
+        let tree = self.specialize(i as i32, stream as i32);
+        let prev = previous_same_size(channels, i, tree.max_prev);
         visit(
             ch,
             i as i32,
             stream as i32,
             &prev,
-            self.uses_wp,
+            tree.uses_wp,
             |props, nb, wp, v| {
-                let (pred, ctx) = self.leaf(props);
+                let (pred, ctx) = tree.leaf(props);
                 let p = pred.predict(nb, wp);
                 out.push(Token::new(ctx, pack_signed(v.wrapping_sub(p))));
             },
@@ -245,6 +327,110 @@ fn visit(
             if let (Some(wp), Some(p)) = (wp.as_mut(), wpp.as_ref()) {
                 wp.record(p, v);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn split(prop: u8, val: i32, left: Build, right: Build) -> Build {
+        Build::Split {
+            prop,
+            val,
+            pred: Predictor::Gradient,
+            left: Box::new(left),
+            right: Box::new(right),
+        }
+    }
+
+    #[test]
+    fn specialized_tokens_match_full_tree() {
+        let tree = Tree::from_build(split(
+            0,
+            1,
+            split(
+                1,
+                2,
+                split(
+                    19,
+                    0,
+                    Build::Leaf(Predictor::Gradient),
+                    Build::Leaf(Predictor::AvgAll),
+                ),
+                Build::Leaf(Predictor::North),
+            ),
+            split(
+                15,
+                0,
+                Build::Leaf(Predictor::Weighted),
+                split(
+                    23,
+                    0,
+                    Build::Leaf(Predictor::Weighted),
+                    Build::Leaf(Predictor::Gradient),
+                ),
+            ),
+        ));
+        assert!(tree.uses_wp);
+        assert!(!tree.specialize(2, 3).uses_wp);
+        assert_eq!(tree.specialize(2, 0).max_prev, 0);
+        for (w, h) in [(1, 1), (1, 19), (19, 1), (17, 13)] {
+            let channels: Vec<Channel> = (0..4)
+                .map(|c| Channel {
+                    w,
+                    h,
+                    data: (0..w * h)
+                        .map(|i| ((i * 37 + c * 71) % 511) as i32 - 255)
+                        .collect(),
+                })
+                .collect();
+            let refs: Vec<_> = channels.iter().collect();
+            for stream in [0, 3, 91] {
+                let mut expected = Vec::new();
+                for (i, ch) in channels.iter().enumerate() {
+                    let prev = previous_same_size(&refs, i, tree.max_prev);
+                    visit(
+                        ch,
+                        i as i32,
+                        stream as i32,
+                        &prev,
+                        tree.uses_wp,
+                        |props, nb, wp, v| {
+                            let (pred, ctx) = tree.leaf(props);
+                            expected.push(Token::new(
+                                ctx,
+                                pack_signed(v.wrapping_sub(pred.predict(nb, wp))),
+                            ));
+                        },
+                    );
+                }
+                assert_eq!(tree.tokenize_par(&refs, stream, 1), expected);
+                assert_eq!(tree.tokenize_par(&refs, stream, 3), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn constant_planes_use_gradient_tree() {
+        let channels: Vec<_> = [-91, 0, 255]
+            .into_iter()
+            .map(|v| Channel {
+                w: 17,
+                h: 13,
+                data: vec![v; 17 * 13],
+            })
+            .collect();
+        let refs: Vec<_> = channels.iter().collect();
+        let opts = super::super::ModularOptions::for_effort(7, 17 * 13 * 3);
+        let tree = learn(&[(0, refs.clone())], opts.learn.as_ref().unwrap());
+        assert_eq!(tree.num_leaves(), 1);
+        assert!(!tree.uses_wp);
+        let tokens = tree.tokenize_par(&refs, 0, 2);
+        for (c, plane) in tokens.chunks(17 * 13).enumerate() {
+            assert_eq!(plane[0].value(), pack_signed(channels[c].data[0]));
+            assert!(plane[1..].iter().all(|t| t.value() == 0));
         }
     }
 }
@@ -383,6 +569,18 @@ impl Hist {
 
 /// Learn a tree for the given streams (each a list of channels).
 pub fn learn(streams: &[(u32, Vec<&Channel>)], opts: &LearnOptions) -> Tree {
+    // Constant planes (notably opaque alpha) need only their first sample and
+    // zero gradient residuals thereafter. Sampling and weighted-predictor
+    // training cannot improve those residuals, but still visit every pixel.
+    if streams.iter().all(|(_, channels)| {
+        channels.iter().all(|ch| {
+            ch.data
+                .first()
+                .is_none_or(|first| ch.data.iter().all(|v| v == first))
+        })
+    }) {
+        return Tree::single(Predictor::Gradient);
+    }
     // Bound each sample's stride by the number of properties actually used.
     // Keep a few size classes rather than specializing for every effort.
     match opts.props.len() {
