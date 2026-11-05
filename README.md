@@ -37,7 +37,10 @@ let jxl = jxl_mini_encoder::Encoder::new()
 ## エンコード機能
 
 - 逆 Gaborish と量子化のブロック別調整（AdjustQuantBlockAC）は effort 5 以上で有効です。逆 Gaborish は距離 0.5 超で、平坦な図形画像と判定されない場合に有効です（最大1024個の8×8領域を標本化し、85%以上がRGB一定なら無効化）。無効時はAQの目標値も調整します。`MINI_NO_GABORISH=1` / `MINI_NO_ADJUST_QUANT=1` でも無効化できます。
-- 逆Gaborish使用時の距離1.5以上では、EPFの平滑化を少し弱めて写真の細部を保持します。高品質域・逆Gaborish無効時の設定は変更していません。
+- effort 6 以上（距離 0.5 以上）では libjxl と同様に、ブロックごとの EPF 強度をエンコーダ内でデコード（逆量子化・逆 DCT・Gaborish・EPF）して選びます。候補（距離 4.5 以下は {0, 2, 7}、超は {0, 4}）ごとに輝度マスク付き誤差を比べ、最小の強度を採用します。処理は 16 ブロック行の帯ごとに行うため、作業メモリは画像全体に比例しません。`MINI_NO_DYNAMIC_EPF=1` で無効化できます。
+- effort 5 以下、または上記を無効にした場合は定数強度です。逆Gaborish使用時の距離1.5以上ではEPFの平滑化を少し弱めて写真の細部を保持します（高品質域・逆Gaborish無効時は変更していません）。
+- effort 7 以上では libjxl と同様に、画素統計から X / B チャンネルの量子化スケール（x_qm_scale / b_qm_scale）を引き上げます。`MINI_NO_CHROMA_ADJUST=1` で無効化できます。
+- 適応量子化の係数には、libjxl と同じ品質・effort での SSIMULACRA2 を揃えるための較正係数（`aq_calibration`）を掛けています。effort 6–7 で最大 +5%（低品質ほど大きい）、effort 8 以上で −4% です。libjxl は effort 8 以上で Butteraugli 反復量子化を使うため、出力サイズ・スコアの動作点が異なります。
 - パッチは effort 7 以上で有効です。テキストや UI の繰り返し図形を参照フレームに符号化します。`MINI_NO_PATCHES=1` で無効化できます。
 - AFV、ノイズ合成、スプライン、butteraugli による反復量子化は未実装です。
 
@@ -65,6 +68,13 @@ cargo run --release --example eval -- -q 90 -e 7 image.png   # サイズ・PSNR�
 `--encode-only` は復号・画質指標の計算を省き、入力読み込みとエンコーダのみのプロセスRSSを測定できます。
 出力サイズ・エンコード時間・出力ハッシュも表示します。
 2つのバイナリの反復比較・同サイズ画質比較には `tools/compare_photos.py` を使用できます。
+
+
+libjxl の `cjxl` と同じ品質・effort で比較するには、`eval` をビルドしたうえで次を実行します（どちらも同じデコーダと SSIMULACRA2 で採点します）。
+
+```sh
+tools/compare_libjxl.py --cjxl /path/to/cjxl -q 50 -q 75 -q 90 -e 7 images/*.png
+```
 
 ライセンスは libjxl に合わせて BSD-3-Clause です。
 
