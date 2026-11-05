@@ -363,24 +363,31 @@ impl Ctx<'_> {
                 let (nbx, nby) = blk.acs.blocks();
                 let inv_qac = 1.0 / blk.qac;
                 let orig = [&x_all[blk.off..], &y_all[blk.off..], &b_all[blk.off..]];
-                for i in 0..n {
-                    let (x, y) = (i % t.w, i / t.w);
-                    if x < nbx && y < nby {
-                        // Lowest frequencies come from the LF image, which
-                        // is kept almost exactly.
+                // Dequantise everything without branching (so that the loop
+                // vectorises), then put the lowest frequencies back: they
+                // come from the LF image, which is kept almost exactly.
+                {
+                    let (q0, q2) = (&q[0][..n], &q[2][..n]);
+                    let (iw0, iw2) = (&t.inv_weights[0][..n], &t.inv_weights[2][..n]);
+                    let yr = &yr[..n];
+                    let [rc0, rc1, rc2] = &mut rc;
+                    let (rc0, rc1, rc2) = (&mut rc0[..n], &mut rc1[..n], &mut rc2[..n]);
+                    for i in 0..n {
+                        let yv = yr[i];
+                        rc1[i] = yv;
+                        rc0[i] =
+                            rx * yv + dequant_bias(q0[i], 0) * iw0[i] * inv_qac / self.qm_mult[0];
+                        rc2[i] =
+                            rb * yv + dequant_bias(q2[i], 2) * iw2[i] * inv_qac / self.qm_mult[2];
+                    }
+                }
+                for y in 0..nby {
+                    for x in 0..nbx {
+                        let i = y * t.w + x;
                         for c in 0..3 {
                             rc[c][i] = orig[c][i];
                         }
-                        continue;
                     }
-                    let yv = yr[i];
-                    rc[1][i] = yv;
-                    rc[0][i] = rx * yv
-                        + dequant_bias(q[0][i], 0) * t.inv_weights[0][i] * inv_qac
-                            / self.qm_mult[0];
-                    rc[2][i] = rb * yv
-                        + dequant_bias(q[2][i], 2) * t.inv_weights[2][i] * inv_qac
-                            / self.qm_mult[2];
                 }
                 let (pw, ph) = (nbx * 8, nby * 8);
                 for c in 0..3 {
@@ -857,7 +864,10 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
         && d >= 0.5
         && !mask1x1.is_empty()
         && std::env::var_os("MINI_NO_DYNAMIC_EPF").is_none();
-    let epf_orig: Option<[Vec<f32>; 3]> = dynamic_epf.then(|| xyb.planes.clone());
+    let epf_orig: Option<[Vec<f32>; 3]> = dynamic_epf.then(|| {
+        let mut planes = par_map(3, opts.threads, |c| xyb.planes[c].clone()).into_iter();
+        std::array::from_fn(|_| planes.next().unwrap())
+    });
     if gaborish {
         xyb::gaborish_inverse(&mut xyb, opts.threads);
     }
