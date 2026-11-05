@@ -821,6 +821,38 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
     let (w, h) = (img.width as usize, img.height as usize);
     let (bw, bh) = (w.div_ceil(8), h.div_ceil(8));
     let mut params = Params::new(opts.distance, opts.effort);
+    // The alpha channel does not depend on the colour pipeline: learn its
+    // tree and tokenise it on a worker while the colour channels are coded.
+    let alpha_mopts = ModularOptions::for_effort(opts.effort, w * h).with_threads(opts.threads);
+    let small = w <= GROUP_DIM && h <= GROUP_DIM;
+    let alpha_rect = |x: usize, y: usize, rw: usize, rh: usize| {
+        let mut data = Vec::with_capacity(rw * rh);
+        for row in y..y + rh {
+            let base = (row * w + x) * 4 + 3;
+            data.extend(
+                img.data[base..base + (rw - 1) * 4 + 1]
+                    .iter()
+                    .step_by(4)
+                    .map(|&v| i32::from(v)),
+            );
+        }
+        Channel { w: rw, h: rh, data }
+    };
+    let alpha_job = (img.has_alpha() && !small).then(|| {
+        let alpha_layout = Layout::new(w, h);
+        let (ng, nlf) = (alpha_layout.num_groups(), alpha_layout.num_lf_groups());
+        let streams: Vec<(u32, Vec<Channel>)> = (0..ng)
+            .map(|g| {
+                let (x, y, gw, gh) = alpha_layout.group_rect(g);
+                (
+                    (1 + 3 * nlf + 17 + g) as u32,
+                    vec![alpha_rect(x, y, gw, gh)],
+                )
+            })
+            .collect();
+        let mopts = alpha_mopts.clone();
+        std::thread::spawn(move || GlobalTree::build_owned(streams, &mopts))
+    });
     let xyb = Xyb::from_srgb8(img.data, img.channels(), w, h, bw * 8, bh * 8, opts.threads);
     if opts.effort >= 7 && std::env::var_os("MINI_NO_CHROMA_ADJUST").is_none() {
         let (x, b) = chroma_scales(&xyb, w, h);
@@ -899,7 +931,7 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
             distance: d,
             effort: opts.effort,
         };
-        let mut search = acs::Search::new(&input, &tables, &dct);
+            let mut search = acs::Search::new(&input, &tables, &dct);
         // The small transforms cost search time and only paid off on
         // graphics-like content, so try them only if a sample of tiles
         // shows a clear estimated gain.
@@ -922,7 +954,7 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
                 }
             }
         }
-        acs::adjust_quant_field(&acs_map, bw, d, &mut field);
+            acs::adjust_quant_field(&acs_map, bw, d, &mut field);
     }
     let mut quantizer = Quantizer::new(params.quant_dc, q_median, &field);
     drop(field);
@@ -991,7 +1023,7 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
             iters: params.epf_iters,
             gaborish,
         };
-        epf::choose(&input, &rec, opts.threads)
+            epf::choose(&input, &rec, opts.threads)
     });
     drop(mask1x1);
 
@@ -1034,45 +1066,56 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
         s.write(2, 0); // extra precision
         let crops: Vec<Channel> = lf.iter().map(|c| c.crop(lbx, lby, lbw, lbh)).collect();
         let refs: Vec<&Channel> = crops.iter().collect();
-        write_standalone(&mut s, &refs, (1 + i) as u32, &[], &mopts);
-        // HF metadata: colour correlation maps, block types and quant field, EPF sharpness.
-        let mut blocks = Vec::new();
-        for by in lby..lby + lbh {
-            for bx in lbx..lbx + lbw {
-                let b = acs_map[by * bw + bx];
-                if (b.ox as usize, b.oy as usize) == (bx, by) {
-                    blocks.push((b.acs as i32, i32::from(quantizer.raw[by * bw + bx])));
-                }
-            }
-        }
-        let nb = blocks.len();
-        s.write(ceil_log2((lbw * lbh) as u64), (nb - 1) as u64);
-        let cw = lw.div_ceil(64);
-        let chh = lh.div_ceil(64);
-        let mut info = Channel::new(nb, 2);
-        for (k, &(t, m)) in blocks.iter().enumerate() {
-            info.set(k, 0, t);
-            info.set(k, 1, m);
-        }
-        let mut sharp = Channel::new(lbw, lbh);
-        match &epf_map {
-            Some(map) => {
-                for by in 0..lbh {
-                    for bx in 0..lbw {
-                        sharp.set(bx, by, i32::from(map[(lby + by) * bw + lbx + bx]));
+        // The LF image and the HF metadata are independent streams: code the
+        // LF image on a worker and append both in order.
+        std::thread::scope(|sc| {
+            let lf_job = sc.spawn(|| {
+                let mut b = BitWriter::new();
+                write_standalone(&mut b, &refs, (1 + i) as u32, &[], &mopts);
+                b
+            });
+            let mut m = BitWriter::new();
+            // HF metadata: colour correlation maps, block types and quant field, EPF sharpness.
+            let mut blocks = Vec::new();
+            for by in lby..lby + lbh {
+                for bx in lbx..lbx + lbw {
+                    let b = acs_map[by * bw + bx];
+                    if (b.ox as usize, b.oy as usize) == (bx, by) {
+                        blocks.push((b.acs as i32, i32::from(quantizer.raw[by * bw + bx])));
                     }
                 }
             }
-            None => sharp.data.fill(epf_sharpness(d, gaborish)),
-        }
-        let meta = [
-            ytox.crop(x / 64, y / 64, cw, chh),
-            ytob.crop(x / 64, y / 64, cw, chh),
-            info,
-            sharp,
-        ];
-        let refs: Vec<&Channel> = meta.iter().collect();
-        write_standalone(&mut s, &refs, (1 + 2 * nlf + i) as u32, &[], &mopts);
+            let nb = blocks.len();
+            m.write(ceil_log2((lbw * lbh) as u64), (nb - 1) as u64);
+            let cw = lw.div_ceil(64);
+            let chh = lh.div_ceil(64);
+            let mut info = Channel::new(nb, 2);
+            for (k, &(t, m)) in blocks.iter().enumerate() {
+                info.set(k, 0, t);
+                info.set(k, 1, m);
+            }
+            let mut sharp = Channel::new(lbw, lbh);
+            match &epf_map {
+                Some(map) => {
+                    for by in 0..lbh {
+                        for bx in 0..lbw {
+                            sharp.set(bx, by, i32::from(map[(lby + by) * bw + lbx + bx]));
+                        }
+                    }
+                }
+                None => sharp.data.fill(epf_sharpness(d, gaborish)),
+            }
+            let meta = [
+                ytox.crop(x / 64, y / 64, cw, chh),
+                ytob.crop(x / 64, y / 64, cw, chh),
+                info,
+                sharp,
+            ];
+            let refs: Vec<&Channel> = meta.iter().collect();
+            write_standalone(&mut m, &refs, (1 + 2 * nlf + i) as u32, &[], &mopts);
+            s.append(&lf_job.join().expect("LF worker panicked"));
+            s.append(&m);
+        });
         s
     });
 
@@ -1088,35 +1131,9 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
     };
     let hf_code = EntropyCode::build(&streams, NUM_HF_CTX, code_opts);
 
-    // Alpha as a modular extra channel.
-    let alpha_mopts = ModularOptions::for_effort(opts.effort, w * h).with_threads(opts.threads);
-    let small = w <= GROUP_DIM && h <= GROUP_DIM;
-    let alpha_rect = |x: usize, y: usize, rw: usize, rh: usize| {
-        let mut data = Vec::with_capacity(rw * rh);
-        for row in y..y + rh {
-            let base = (row * w + x) * 4 + 3;
-            data.extend(
-                img.data[base..base + (rw - 1) * 4 + 1]
-                    .iter()
-                    .step_by(4)
-                    .map(|&v| i32::from(v)),
-            );
-        }
-        Channel { w: rw, h: rh, data }
-    };
+    // Alpha as a modular extra channel (its tree was learned concurrently).
     let alpha = (img.has_alpha() && small).then(|| alpha_rect(0, 0, w, h));
-    let alpha_tree = (img.has_alpha() && !small).then(|| {
-        let streams: Vec<(u32, Vec<Channel>)> = (0..ng)
-            .map(|g| {
-                let (x, y, gw, gh) = layout.group_rect(g);
-                (
-                    (1 + 3 * nlf + 17 + g) as u32,
-                    vec![alpha_rect(x, y, gw, gh)],
-                )
-            })
-            .collect();
-        GlobalTree::build_owned(streams, &alpha_mopts)
-    });
+    let alpha_tree = alpha_job.map(|h| h.join().expect("alpha worker panicked"));
 
     let frame = FrameInfo {
         encoding: Encoding::VarDct {
