@@ -37,6 +37,7 @@ let jxl = jxl_mini_encoder::Encoder::new()
 ## エンコード機能
 
 - 逆 Gaborish と量子化のブロック別調整（AdjustQuantBlockAC）は effort 5 以上で有効です。逆 Gaborish は距離 0.5 超で、平坦な図形画像と判定されない場合に有効です（最大1024個の8×8領域を標本化し、85%以上がRGB一定なら無効化）。無効時はAQの目標値も調整します。`MINI_NO_GABORISH=1` / `MINI_NO_ADJUST_QUANT=1` でも無効化できます。
+- 逆Gaborish使用時の距離1.5以上では、EPFの平滑化を少し弱めて写真の細部を保持します。Kodak 24枚でサイズをほぼ変えずにSSIMULACRA2が品質40で平均+1.90、品質60で+0.26、品質75で+0.11改善しました。高品質域・逆Gaborish無効時の設定は変更していません。知覚指標の改善であり、全画像での主観画質向上を保証するものではありません。
 - パッチは effort 7 以上で有効です。テキストや UI の繰り返し図形を参照フレームに符号化します。`MINI_NO_PATCHES=1` で無効化できます。
 - AFV、ノイズ合成、スプライン、butteraugli による反復量子化は未実装です。
 
@@ -63,6 +64,8 @@ cargo run --release --example eval -- -q 90 -e 7 image.png   # サイズ・PSNR�
 `/usr/bin/time -v target/release/examples/eval --encode-only ...` で直接バイナリを計測してください。
 `--encode-only` は復号・画質指標の計算を省き、入力読み込みとエンコーダのみのプロセスRSSを測定できます。
 出力サイズ・エンコード時間・出力ハッシュも表示します。
+2つのバイナリの反復比較・同サイズ画質比較には `tools/compare_photos.py` を使用できます。
+[写真向け最適化の測定結果・不採用案・再現手順](docs/photo-optimization.md)も参照してください。
 
 ライセンスは libjxl に合わせて BSD-3-Clause です。
 
