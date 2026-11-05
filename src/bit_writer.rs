@@ -174,6 +174,37 @@ fn f32_to_f16(v: f32) -> u16 {
     sign | ((exp as u16) << 10) | m as u16
 }
 
+/// Compact storage of an in-memory sample as an IEEE half float: rounds to
+/// nearest, flushes tiny values to subnormals and saturates instead of
+/// panicking.
+pub fn pack_f16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let abs = bits & 0x7fff_ffff;
+    if abs >= 0x4780_0000 {
+        // 65536 and above (or NaN/inf): saturate to the largest finite value.
+        return sign | 0x7bff;
+    }
+    if abs < 0x3880_0000 {
+        // Below 2^-14: subnormal; scale so that the rounding is exact.
+        let m = (f32::from_bits(abs) * 16_777_216.0).round_ties_even() as u16;
+        return sign | m;
+    }
+    let r = abs - 0x3800_0000 + 0x0fff + ((abs >> 13) & 1);
+    sign | (r >> 13).min(0x7bff) as u16
+}
+
+/// Inverse of `pack_f16`.
+pub fn unpack_f16(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+    let exp = i32::from((h >> 10) & 0x1f);
+    let mant = f32::from(h & 0x3ff);
+    if exp == 0 {
+        return sign * mant / 16_777_216.0;
+    }
+    sign * (1.0 + mant / 1024.0) * 2f32.powi(exp - 15)
+}
+
 /// `ceil(log2(x + 1))`: the number of bits needed to store values up to `x`.
 pub fn bits_for(x: u32) -> u32 {
     32 - x.leading_zeros()
@@ -187,6 +218,16 @@ pub fn ceil_log2(x: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pack_f16_round_trips_within_half_ulp() {
+        for &v in &[
+            0.0f32, 1e-9, 3e-5, 6.1e-5, 0.01, -0.03, 0.5, 0.8573, -1.2, 100.0,
+        ] {
+            let r = unpack_f16(pack_f16(v));
+            assert!((r - v).abs() <= v.abs() / 1024.0 + 3e-8, "{v} -> {r}");
+        }
+    }
 
     #[test]
     fn writes_lsb_first() {

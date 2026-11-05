@@ -353,10 +353,16 @@ fn run_band_impl(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2
     }
 }
 
+/// Source of the original XYB for a range of block rows.
+pub type OrigRows<'a> = dyn Fn(usize, usize) -> [Vec<f32>; 3] + Sync + 'a;
+/// Source of the decoded (pre-Gaborish) image: fills a row of one channel.
+pub type RecRows<'a> = dyn Fn(usize, usize, &mut [f32]) + Sync + 'a;
+
 /// Inputs of the selection.
 pub struct Input<'a> {
-    /// Original (pre-Gaborish) XYB.
-    pub orig: [&'a [f32]; 3],
+    /// Original (pre-Gaborish) XYB of the block rows `by0..by1`, as three
+    /// planes of stride `w` (so that no full-size copy has to be kept).
+    pub orig: &'a OrigRows<'a>,
     /// Perceptual masking per pixel.
     pub mask1x1: &'a [f32],
     /// Per-block `quant_scale * hf_mul` (as in the decoder's sigma).
@@ -370,7 +376,14 @@ pub struct Input<'a> {
 
 /// Masked error of the block rows `rows` (local to `rec`, which starts at
 /// image row `y_off`) against the original.
-fn block_errors(inp: &Input, rec: &Planes, y_off: isize, rows: std::ops::Range<usize>) -> Vec<f32> {
+fn block_errors(
+    inp: &Input,
+    rec: &Planes,
+    orig: &[Vec<f32>; 3],
+    y_off: isize,
+    orig_y0: usize,
+    rows: std::ops::Range<usize>,
+) -> Vec<f32> {
     const KW: [f32; 3] = [12.339_445, 1.0, 0.2];
     let (w, bw) = (inp.w, inp.w / 8);
     let mut out = Vec::with_capacity(rows.len() * bw);
@@ -380,7 +393,8 @@ fn block_errors(inp: &Input, rec: &Planes, y_off: isize, rows: std::ops::Range<u
         for ly in br * 8..br * 8 + 8 {
             let gy = (y_off + ly as isize) as usize;
             let mask = &inp.mask1x1[gy * w..(gy + 1) * w];
-            let o: [&[f32]; 3] = std::array::from_fn(|c| &inp.orig[c][gy * w..(gy + 1) * w]);
+            let oy = gy - orig_y0;
+            let o: [&[f32]; 3] = std::array::from_fn(|c| &orig[c][oy * w..(oy + 1) * w]);
             let r: [&[f32]; 3] = std::array::from_fn(|c| &rec.p[c][ly * w..(ly + 1) * w]);
             // Each block keeps its own running sums, added in raster order, so
             // the blocks of a row are independent and can overlap.
@@ -414,7 +428,7 @@ const MIN_STRIP_BLOCK_ROWS: usize = 4;
 /// masked error of each block, one vector per candidate.
 fn strip_errors(
     inp: &Input,
-    rec: &Planes,
+    rec: &RecRows,
     steps: &[usize],
     by0: usize,
     by1: usize,
@@ -431,13 +445,15 @@ fn strip_errors(
     for c in 0..3 {
         for ly in 0..local_bh * 8 {
             let gy = mirror(lo * 8 + ly as isize, h);
-            strip.p[c][ly * w..(ly + 1) * w].copy_from_slice(&rec.p[c][gy * w..(gy + 1) * w]);
+            rec(c, gy, &mut strip.p[c][ly * w..(ly + 1) * w]);
         }
     }
     if inp.gaborish {
         gaborish(&mut strip, 1);
     }
     let interior = 1..local_bh - 1;
+    let orig = (inp.orig)(by0, by1);
+    let orig_y0 = by0 * 8;
     let skip = flat_neighbourhoods(&strip, local_bh, bw);
     let y_off = by0 as isize * 8 - 8;
     let quant: Vec<f32> = (0..local_bh)
@@ -470,7 +486,14 @@ fn strip_errors(
     for &val in steps {
         if val == 0 {
             // Zero strength leaves every block unfiltered.
-            result.push(block_errors(inp, &strip, y_off, interior.clone()));
+            result.push(block_errors(
+                inp,
+                &strip,
+                &orig,
+                y_off,
+                orig_y0,
+                interior.clone(),
+            ));
             continue;
         }
         let inv_sigma: Vec<f32> = quant
@@ -491,7 +514,7 @@ fn strip_errors(
             std::mem::swap(&mut cur, &mut tmp);
         }
         let decoded = if stages.is_empty() { &strip } else { &cur };
-        let mut errs = block_errors(inp, decoded, y_off, interior.clone());
+        let mut errs = block_errors(inp, decoded, &orig, y_off, orig_y0, interior.clone());
         // Unfiltered blocks have the error of strength zero.
         if let Some(zero) = result.first() {
             for (i, e) in errs.iter_mut().enumerate() {
@@ -547,7 +570,7 @@ fn flat_neighbourhoods(strip: &Planes, bh: usize, bw: usize) -> Vec<bool> {
 
 /// Choose an EPF sharpness (0..=7) for each 8x8 block. `rec` is the decoded
 /// image before Gaborish.
-pub fn choose(inp: &Input, rec: &Planes, threads: usize) -> Vec<u8> {
+pub fn choose(inp: &Input, rec: &RecRows, threads: usize) -> Vec<u8> {
     let (bw, bh) = (inp.w / 8, inp.h / 8);
     let steps: &[usize] = if inp.distance > 4.5 {
         &[0, 4]
@@ -689,8 +712,11 @@ mod tests {
         let mask = vec![1.0f32; w * h];
         let quant = vec![0.5f32; (w / 8) * (h / 8)];
         for (distance, iters, steps) in [(2.0f32, 2u32, &[0u8, 2, 7][..]), (6.0, 3, &[0, 4][..])] {
+            let orig_rows = |by0: usize, by1: usize| -> [Vec<f32>; 3] {
+                std::array::from_fn(|c| orig.p[c][by0 * 8 * w..by1 * 8 * w].to_vec())
+            };
             let input = Input {
-                orig: [&orig.p[0], &orig.p[1], &orig.p[2]],
+                orig: &orig_rows,
                 mask1x1: &mask,
                 quant: &quant,
                 w,
@@ -699,8 +725,11 @@ mod tests {
                 iters,
                 gaborish: true,
             };
-            let a = choose(&input, &rec, 1);
-            let b = choose(&input, &rec, 3);
+            let rec_rows = |c: usize, y: usize, dst: &mut [f32]| {
+                dst.copy_from_slice(&rec.p[c][y * w..(y + 1) * w]);
+            };
+            let a = choose(&input, &rec_rows, 1);
+            let b = choose(&input, &rec_rows, 3);
             assert_eq!(a, b);
             assert_eq!(a.len(), (w / 8) * (h / 8));
             assert!(a.iter().all(|v| steps.contains(v)));

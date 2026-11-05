@@ -483,15 +483,26 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
 impl Patches {
     /// Remove the patches from the image (they are added back when decoding).
     pub fn subtract(&self, xyb: &mut Xyb) {
+        let rows = xyb.h;
         let stride = xyb.w;
+        self.subtract_rows(&mut xyb.planes, stride, 0, rows);
+    }
+
+    /// Like `subtract`, for the image rows `y0..y0 + rows` held in `planes`
+    /// (row 0 of `planes` is image row `y0`).
+    pub fn subtract_rows(&self, planes: &mut [Vec<f32>; 3], stride: usize, y0: usize, rows: usize) {
         for p in &self.patches {
             for &(px, py) in &p.positions {
                 for y in 0..p.h {
+                    let gy = py + y;
+                    if gy < y0 || gy >= y0 + rows {
+                        continue;
+                    }
                     for x in 0..p.w {
                         let r = (p.ry + y) * self.ref_w + p.rx + x;
-                        let i = (py + y) * stride + px + x;
+                        let i = (gy - y0) * stride + px + x;
                         for c in 0..3 {
-                            xyb.planes[c][i] -= self.decoded[c][r];
+                            planes[c][i] -= self.decoded[c][r];
                         }
                     }
                 }
