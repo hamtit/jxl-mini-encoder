@@ -239,7 +239,7 @@ pub struct Input<'a> {
 
 /// Masked error of the block rows `rows` (local to `rec`, which starts at
 /// image row `y_off`) against the original.
-fn block_errors(inp: &Input, rec: &Planes, y_off: usize, rows: std::ops::Range<usize>) -> Vec<f32> {
+fn block_errors(inp: &Input, rec: &Planes, y_off: isize, rows: std::ops::Range<usize>) -> Vec<f32> {
     const KW: [f32; 3] = [12.339_445, 1.0, 0.2];
     let (w, bw) = (inp.w, inp.w / 8);
     let mut out = Vec::with_capacity(rows.len() * bw);
@@ -247,7 +247,7 @@ fn block_errors(inp: &Input, rec: &Planes, y_off: usize, rows: std::ops::Range<u
         for bx in 0..bw {
             let mut err = [0f32; 3];
             for ly in br * 8..br * 8 + 8 {
-                let gy = y_off + ly;
+                let gy = (y_off + ly as isize) as usize;
                 for x in bx * 8..bx * 8 + 8 {
                     let m = inp.mask1x1[gy * w + x];
                     let m2 = m * m;
@@ -296,7 +296,7 @@ fn strip_errors(
         gaborish(&mut strip, 1);
     }
     let interior = 1..local_bh - 1;
-    let y_off = by0 * 8 - 8;
+    let y_off = by0 as isize * 8 - 8;
     let quant: Vec<f32> = (0..local_bh)
         .flat_map(|lb| {
             let gb = mirror(lo + lb as isize, bh);

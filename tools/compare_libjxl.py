@@ -55,6 +55,9 @@ def main():
     parser.add_argument("-e", "--effort", type=int, action="append", help="repeatable; default: 7")
     parser.add_argument("images", nargs="+", type=Path)
     args = parser.parse_args()
+    names = [image.name for image in args.images]
+    if len(set(names)) != len(names):
+        sys.exit("input images must have distinct file names (references are keyed by name)")
     qualities = args.quality or [50, 75, 90]
     efforts = args.effort or [7]
     print(f"{'effort':>6} {'quality':>7} | {'cjxl B':>9} {'ssim2':>6} | {'mini B':>9} {'ssim2':>6} | {'bytes':>7} {'ssim2':>6}")
