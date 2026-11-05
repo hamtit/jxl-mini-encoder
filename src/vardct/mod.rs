@@ -3,6 +3,7 @@
 mod acs;
 mod aq;
 mod dct;
+mod epf;
 mod quant;
 mod small;
 #[cfg(test)]
@@ -73,6 +74,48 @@ impl Params {
     }
 }
 
+/// libjxl's pixel statistics for chromacity adjustment (effort >= 7): the
+/// largest neighbour differences in X and B raise the X/B quantisation
+/// multipliers on saturated, high-contrast content.
+fn chroma_scales(xyb: &Xyb, w: usize, h: usize) -> (u32, u32) {
+    let stride = xyb.w;
+    let (px, py, pb) = (&xyb.planes[0], &xyb.planes[1], &xyb.planes[2]);
+    let (mut dx, mut db, mut exposed) = (0f32, 0f32, 0f32);
+    for y in 1..h {
+        for x in 1..w {
+            let i = y * stride + x;
+            dx = dx
+                .max((px[i] - px[i - 1]).abs())
+                .max((px[i] - px[i - stride]).abs());
+            let diff = pb[i] - py[i];
+            let diff_prev = pb[i - 1] - py[i - 1];
+            let diff_row = pb[i - stride] - py[i - stride];
+            db = db
+                .max((diff - diff_prev).abs())
+                .max((diff - diff_row).abs());
+            let exposed_b = pb[i] - py[i] * 1.2;
+            if exposed_b >= 0.0 {
+                let edge = (pb[i] - pb[i - 1]).abs() + (pb[i] - pb[i - stride]).abs();
+                exposed = exposed.max(exposed_b * edge);
+            }
+        }
+    }
+    let x_extra = match dx {
+        v if v >= 0.026 => 3,
+        v if v >= 0.022 => 2,
+        v if v >= 0.015 => 1,
+        _ => 0,
+    };
+    let add = u32::from(exposed >= 0.13);
+    let b_extra = match db {
+        v if v > 0.38 => 2 + add,
+        v if v > 0.33 => 1 + add,
+        v if v > 0.28 => add,
+        _ => 0,
+    };
+    (2 + x_extra, 2 + b_extra)
+}
+
 /// Estimated relative gain of the small transforms (see `probe_small`) that
 /// is needed to enable them. Photos stay below it (<= 0.0085 for d >= 1.2,
 /// <= 0.03 below) while graphics are above (>= 0.013, >= 0.07 below); at
@@ -86,6 +129,24 @@ fn small_threshold(distance: f32) -> f32 {
 /// Keep the original strength for high fidelity and unsharpened graphics.
 fn epf_sharpness(distance: f32, gaborish: bool) -> i32 {
     if gaborish && distance >= 1.5 { 3 } else { 4 }
+}
+
+/// Multiplier on the adaptive quantisation field, calibrated so that the
+/// SSIMULACRA2 score at a given quality and effort stays close to libjxl's
+/// (measured on photographs, 8 Kodak images, qualities 30-95).
+///
+/// Effort 5 already matches without it. For effort 6 and 7 libjxl's search
+/// finds somewhat better transforms and filter strengths than this encoder,
+/// so a slightly finer quantiser is needed at the same distance; the factor
+/// fades towards high fidelity where the gap closes. From effort 8 libjxl
+/// runs a Butteraugli-driven quantisation loop that yields smaller files at a
+/// lower score, so a coarser quantiser tracks it.
+fn aq_calibration(distance: f32, effort: u32) -> f32 {
+    match effort {
+        ..=5 => 1.0,
+        6..=7 => 1.0 + 0.05 * ((distance - 0.8) / 2.4).clamp(0.0, 1.0),
+        _ => 0.96,
+    }
 }
 
 fn initial_quant_dc(distance: f32) -> f32 {
@@ -129,6 +190,8 @@ struct Ctx<'a> {
     dct: &'a Dct,
     /// libjxl's per-block quantiser adjustment (effort >= 5).
     adjust: bool,
+    /// Also reconstruct the decoded image (for the EPF strength choice).
+    recon: bool,
 }
 
 /// Output of coding one group: HF tokens and the block LF values.
@@ -140,6 +203,8 @@ struct GroupOut {
     dc: Vec<(usize, usize, [f32; 3])>,
     /// (block index in the whole image, new raw quantiser value)
     raw_updates: Vec<(usize, u8)>,
+    /// Decoded X, Y, B of the group before the loop filters (gbw*8 wide).
+    recon: [Vec<f32>; 3],
 }
 
 impl Ctx<'_> {
@@ -161,6 +226,7 @@ impl Ctx<'_> {
         let mut blks: Vec<Blk> = Vec::new();
         let (mut x_all, mut b_all, mut yr_all, mut qy_all) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut y_all = Vec::new();
         for by in 0..gbh {
             for bx in 0..gbw {
                 let (abx, aby) = (bx0 + bx, by0 + by);
@@ -229,6 +295,9 @@ impl Ctx<'_> {
                     qac,
                     off: x_all.len(),
                 });
+                if self.recon {
+                    y_all.extend_from_slice(&coeffs[1][..n]);
+                }
                 x_all.extend_from_slice(&coeffs[0][..n]);
                 b_all.extend_from_slice(&coeffs[2][..n]);
                 yr_all.extend_from_slice(&y_rec[..n]);
@@ -251,6 +320,14 @@ impl Ctx<'_> {
             }
         }
         // Pass 3: quantise X and B and emit tokens in block order.
+        let rstride = gbw * 8;
+        let mut recon: [Vec<f32>; 3] = if self.recon {
+            std::array::from_fn(|_| vec![0f32; rstride * gbh * 8])
+        } else {
+            Default::default()
+        };
+        let mut rc: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0f32; 64 * 64]);
+        let mut pix = vec![0f32; 64 * 64];
         for blk in &blks {
             let t = self.tables.get(blk.acs);
             let n = t.w * t.h;
@@ -282,12 +359,45 @@ impl Ctx<'_> {
                 &mut q[2],
             );
             self.tokenize(blk.bx, blk.by, blk.acs, &q, &mut nz_row, &mut tokens);
+            if self.recon {
+                let (nbx, nby) = blk.acs.blocks();
+                let inv_qac = 1.0 / blk.qac;
+                let orig = [&x_all[blk.off..], &y_all[blk.off..], &b_all[blk.off..]];
+                for i in 0..n {
+                    let (x, y) = (i % t.w, i / t.w);
+                    if x < nbx && y < nby {
+                        // Lowest frequencies come from the LF image, which
+                        // is kept almost exactly.
+                        for c in 0..3 {
+                            rc[c][i] = orig[c][i];
+                        }
+                        continue;
+                    }
+                    let yv = yr[i];
+                    rc[1][i] = yv;
+                    rc[0][i] = rx * yv
+                        + dequant_bias(q[0][i], 0) * t.inv_weights[0][i] * inv_qac
+                            / self.qm_mult[0];
+                    rc[2][i] = rb * yv
+                        + dequant_bias(q[2][i], 2) * t.inv_weights[2][i] * inv_qac
+                            / self.qm_mult[2];
+                }
+                let (pw, ph) = (nbx * 8, nby * 8);
+                for c in 0..3 {
+                    acs::inverse_block(self.dct, blk.acs, &rc[c][..n], &mut pix[..n]);
+                    for y in 0..ph {
+                        let dst = (blk.by * 8 + y) * rstride + blk.bx * 8;
+                        recon[c][dst..dst + pw].copy_from_slice(&pix[y * pw..(y + 1) * pw]);
+                    }
+                }
+            }
         }
         GroupOut {
             tokens,
             dc,
             cmap,
             raw_updates,
+            recon,
         }
     }
 
@@ -703,8 +813,13 @@ fn flat_graphics(img: &ImageRef) -> bool {
 pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
     let (w, h) = (img.width as usize, img.height as usize);
     let (bw, bh) = (w.div_ceil(8), h.div_ceil(8));
-    let params = Params::new(opts.distance, opts.effort);
+    let mut params = Params::new(opts.distance, opts.effort);
     let xyb = Xyb::from_srgb8(img.data, img.channels(), w, h, bw * 8, bh * 8, opts.threads);
+    if opts.effort >= 7 && std::env::var_os("MINI_NO_CHROMA_ADJUST").is_none() {
+        let (x, b) = chroma_scales(&xyb, w, h);
+        params.x_qm_scale = params.x_qm_scale.max(x);
+        params.b_qm_scale = b;
+    }
     let d = params.distance;
     // Patches (effort >= 7): repeated glyph-like shapes are coded once in a
     // reference frame and removed from the image.
@@ -735,9 +850,24 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
         let q = 0.79 / d;
         (vec![q; bw * bh], Vec::new(), q)
     };
+    // libjxl (effort >= 6) picks the EPF strength of every block by decoding
+    // under a few candidates; that needs the pre-Gaborish original.
+    let dynamic_epf = opts.effort >= 6
+        && params.epf_iters > 0
+        && d >= 0.5
+        && !mask1x1.is_empty()
+        && std::env::var_os("MINI_NO_DYNAMIC_EPF").is_none();
+    let epf_orig: Option<[Vec<f32>; 3]> = dynamic_epf.then(|| xyb.planes.clone());
     if gaborish {
         xyb::gaborish_inverse(&mut xyb, opts.threads);
     }
+    let qk = if params.adaptive_quant {
+        aq_calibration(d, opts.effort)
+    } else {
+        1.0
+    };
+    field.iter_mut().for_each(|v| *v *= qk);
+    let q_median = q_median * qk;
     let dct = Dct::new();
     let tables = Tables::new();
     let mut acs_map: Vec<BlockAcs> = (0..bw * bh)
@@ -784,7 +914,6 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
         }
         acs::adjust_quant_field(&acs_map, bw, d, &mut field);
     }
-    drop(mask1x1);
     let mut quantizer = Quantizer::new(params.quant_dc, q_median, &field);
     drop(field);
     let layout = Layout::new(w, h);
@@ -805,15 +934,56 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
             ],
             dct: &dct,
             adjust: params.adaptive_quant && std::env::var_os("MINI_NO_ADJUST_QUANT").is_none(),
+            recon: dynamic_epf,
         };
         par_map(ng, opts.threads, |g| ctx.code_group(g))
     };
+    let (xyb_w, xyb_h) = (xyb.w, xyb.h);
     drop(xyb);
+    let mut groups = groups;
     for g in &groups {
         for &(i, r) in &g.raw_updates {
             quantizer.raw[i] = r;
         }
     }
+    let epf_map: Option<Vec<u8>> = epf_orig.map(|orig| {
+        let mut rec = epf::Planes {
+            w: xyb_w,
+            h: xyb_h,
+            p: std::array::from_fn(|_| vec![0f32; xyb_w * xyb_h]),
+        };
+        for (g, out) in groups.iter_mut().enumerate() {
+            let (gx, gy, gw, gh) = layout.group_rect(g);
+            let (rw, rh) = (gw.div_ceil(8) * 8, gh.div_ceil(8) * 8);
+            let recon = std::mem::take(&mut out.recon);
+            for c in 0..3 {
+                for y in 0..rh {
+                    let dst = (gy + y) * xyb_w + gx;
+                    rec.p[c][dst..dst + rw].copy_from_slice(&recon[c][y * rw..(y + 1) * rw]);
+                }
+            }
+        }
+        let scale = quantizer.scale();
+        let quant: Vec<f32> = (0..bw * bh)
+            .map(|i| {
+                let b = acs_map[i];
+                let origin = b.oy as usize * bw + b.ox as usize;
+                scale * (f32::from(quantizer.raw[origin]) + 1.0)
+            })
+            .collect();
+        let input = epf::Input {
+            orig: [&orig[0], &orig[1], &orig[2]],
+            mask1x1: &mask1x1,
+            quant: &quant,
+            w: xyb_w,
+            h: xyb_h,
+            distance: d,
+            iters: params.epf_iters,
+            gaborish,
+        };
+        epf::choose(&input, &rec, opts.threads)
+    });
+    drop(mask1x1);
 
     // Colour-correlation maps, one entry per 64x64 tile.
     let (ctw, cth) = (w.div_ceil(64), h.div_ceil(64));
@@ -875,7 +1045,16 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
             info.set(k, 1, m);
         }
         let mut sharp = Channel::new(lbw, lbh);
-        sharp.data.fill(epf_sharpness(d, gaborish));
+        match &epf_map {
+            Some(map) => {
+                for by in 0..lbh {
+                    for bx in 0..lbw {
+                        sharp.set(bx, by, i32::from(map[(lby + by) * bw + lbx + bx]));
+                    }
+                }
+            }
+            None => sharp.data.fill(epf_sharpness(d, gaborish)),
+        }
         let meta = [
             ytox.crop(x / 64, y / 64, cw, chh),
             ytob.crop(x / 64, y / 64, cw, chh),
