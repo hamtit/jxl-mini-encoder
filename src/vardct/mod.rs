@@ -817,6 +817,13 @@ fn flat_graphics(img: &ImageRef) -> bool {
     flat * 100 >= count * 85
 }
 
+/// The alpha tree, learned either on a worker or (single-thread encodes) later
+/// on the calling thread.
+enum AlphaJob {
+    Worker(std::thread::JoinHandle<GlobalTree>),
+    Inline(Vec<(u32, Vec<Channel>)>, ModularOptions),
+}
+
 pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
     let (w, h) = (img.width as usize, img.height as usize);
     let (bw, bh) = (w.div_ceil(8), h.div_ceil(8));
@@ -851,7 +858,14 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
             })
             .collect();
         let mopts = alpha_mopts.clone();
-        std::thread::spawn(move || GlobalTree::build_owned(streams, &mopts))
+        if opts.threads > 1 {
+            AlphaJob::Worker(std::thread::spawn(move || {
+                GlobalTree::build_owned(streams, &mopts)
+            }))
+        } else {
+            // A single-thread encode stays on the calling thread.
+            AlphaJob::Inline(streams, mopts)
+        }
     });
     let xyb = Xyb::from_srgb8(img.data, img.channels(), w, h, bw * 8, bh * 8, opts.threads);
     if opts.effort >= 7 && std::env::var_os("MINI_NO_CHROMA_ADJUST").is_none() {
@@ -931,7 +945,7 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
             distance: d,
             effort: opts.effort,
         };
-            let mut search = acs::Search::new(&input, &tables, &dct);
+        let mut search = acs::Search::new(&input, &tables, &dct);
         // The small transforms cost search time and only paid off on
         // graphics-like content, so try them only if a sample of tiles
         // shows a clear estimated gain.
@@ -954,7 +968,7 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
                 }
             }
         }
-            acs::adjust_quant_field(&acs_map, bw, d, &mut field);
+        acs::adjust_quant_field(&acs_map, bw, d, &mut field);
     }
     let mut quantizer = Quantizer::new(params.quant_dc, q_median, &field);
     drop(field);
@@ -1023,7 +1037,7 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
             iters: params.epf_iters,
             gaborish,
         };
-            epf::choose(&input, &rec, opts.threads)
+        epf::choose(&input, &rec, opts.threads)
     });
     drop(mask1x1);
 
@@ -1069,11 +1083,13 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
         // The LF image and the HF metadata are independent streams: code the
         // LF image on a worker and append both in order.
         std::thread::scope(|sc| {
-            let lf_job = sc.spawn(|| {
+            let lf_fn = || {
                 let mut b = BitWriter::new();
                 write_standalone(&mut b, &refs, (1 + i) as u32, &[], &mopts);
                 b
-            });
+            };
+            // A single-thread encode stays on the calling thread.
+            let lf_job = (opts.threads > 1).then(|| sc.spawn(lf_fn));
             let mut m = BitWriter::new();
             // HF metadata: colour correlation maps, block types and quant field, EPF sharpness.
             let mut blocks = Vec::new();
@@ -1113,7 +1129,11 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
             ];
             let refs: Vec<&Channel> = meta.iter().collect();
             write_standalone(&mut m, &refs, (1 + 2 * nlf + i) as u32, &[], &mopts);
-            s.append(&lf_job.join().expect("LF worker panicked"));
+            let lf_bits = match lf_job {
+                Some(job) => job.join().expect("LF worker panicked"),
+                None => lf_fn(),
+            };
+            s.append(&lf_bits);
             s.append(&m);
         });
         s
@@ -1133,7 +1153,10 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
 
     // Alpha as a modular extra channel (its tree was learned concurrently).
     let alpha = (img.has_alpha() && small).then(|| alpha_rect(0, 0, w, h));
-    let alpha_tree = alpha_job.map(|h| h.join().expect("alpha worker panicked"));
+    let alpha_tree = alpha_job.map(|job| match job {
+        AlphaJob::Worker(h) => h.join().expect("alpha worker panicked"),
+        AlphaJob::Inline(streams, mopts) => GlobalTree::build_owned(streams, &mopts),
+    });
 
     let frame = FrameInfo {
         encoding: Encoding::VarDct {

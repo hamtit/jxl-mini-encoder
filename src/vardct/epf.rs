@@ -167,6 +167,8 @@ fn run_stage(src: &Planes, dst: &mut Planes, inv_sigma: &[f32], stage: Stage, th
         if !matches!(stage, Stage::Two) {
             diff = vec![0f32; offs.len() * drows * dw];
         }
+        let mut isig_px = vec![0f32; w];
+        let mut active = vec![0f32; w];
         for &(rb0, rb1) in &runs {
             let (xs, xe) = (rb0 * 8, rb1 * 8);
             if !matches!(stage, Stage::Two) {
@@ -191,17 +193,15 @@ fn run_stage(src: &Planes, dst: &mut Planes, inv_sigma: &[f32], stage: Stage, th
                     }
                 }
             }
-            let mut isig_px = vec![0f32; w];
-            let mut active = vec![0f32; w];
             for r in 0..rows {
                 let y = y0 + r;
                 let border_row = r == 0 || r == 7;
-                for (bx, (ip, ac)) in isig_px
+                for (k, (ip, ac)) in isig_px[xs..xe]
                     .chunks_exact_mut(8)
-                    .zip(active.chunks_exact_mut(8))
+                    .zip(active[xs..xe].chunks_exact_mut(8))
                     .enumerate()
                 {
-                    let isig = sigmas[bx];
+                    let isig = sigmas[rb0 + k];
                     if isig >= MIN_SIGMA {
                         ac.fill(1.0);
                         ip.fill(isig * if border_row { bsm } else { sm });
