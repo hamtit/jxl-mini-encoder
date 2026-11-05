@@ -609,7 +609,8 @@ impl Tile {
             return false;
         }
         let v0 = self.flat_val[cy * 8 + cx];
-        (cy..cy + n).all(|y| (cx..cx + n).all(|x| self.flat[y * 8 + x] && self.flat_val[y * 8 + x] == v0))
+        (cy..cy + n)
+            .all(|y| (cx..cx + n).all(|x| self.flat[y * 8 + x] && self.flat_val[y * 8 + x] == v0))
     }
 
     fn set_entropy(&mut self, cx: usize, cy: usize, acs: Acs, e: f32) {
@@ -622,7 +623,6 @@ impl Tile {
         self.entropy[cy * 8 + cx] = e;
     }
 }
-
 
 /// Quantisation stage of `estimate` for one channel: writes the scaled
 /// rounding error to `e` and returns the number of non-zero quantised
@@ -676,7 +676,10 @@ unsafe fn quant_stage_avx2(
     use std::arch::x86_64::*;
     let n = c0.len();
     let (kv, qv) = (_mm256_set1_ps(k), _mm256_set1_ps(quant));
-    let (zero, absmask) = (_mm256_setzero_ps(), _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff)));
+    let (zero, absmask) = (
+        _mm256_setzero_ps(),
+        _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff)),
+    );
     let (mut acc, mut nzv) = (zero, _mm256_setzero_si256());
     let mut i = 0;
     while i < n {
@@ -688,7 +691,10 @@ unsafe fn quant_stage_avx2(
             let iwv = _mm256_loadu_ps(iw.as_ptr().add(i));
             let v = _mm256_mul_ps(_mm256_mul_ps(_mm256_sub_ps(a, _mm256_mul_ps(kv, b)), w), qv);
             let r = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(v);
-            _mm256_storeu_ps(e.as_mut_ptr().add(i), _mm256_mul_ps(_mm256_sub_ps(v, r), iwv));
+            _mm256_storeu_ps(
+                e.as_mut_ptr().add(i),
+                _mm256_mul_ps(_mm256_sub_ps(v, r), iwv),
+            );
             let q = _mm256_and_ps(r, absmask);
             acc = _mm256_add_ps(acc, _mm256_sqrt_ps(q));
             // The compare mask is all ones (-1) where q != 0.
@@ -1331,6 +1337,33 @@ pub fn adjust_quant_field(acs: &[BlockAcs], bw: usize, distance: f32, field: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lcg(seed: &mut u32) -> f32 {
+        *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (*seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+    }
+
+    #[test]
+    fn avx2_kernels_match_scalar() {
+        if !Dct::new().has_avx2() {
+            return;
+        }
+        let mut seed = 7;
+        for n in [64usize, 128, 256, 1024] {
+            let mut rnd =
+                |scale: f32| -> Vec<f32> { (0..n).map(|_| lcg(&mut seed) * scale).collect() };
+            let (c0, c1, wt, iw) = (rnd(9.0), rnd(9.0), rnd(1.0), rnd(1.0));
+            let (mut e_a, mut e_b) = (vec![0f32; n], vec![0f32; n]);
+            let a = quant_stage(true, &c0, &c1, 0.25, &wt, &iw, 1.7, &mut e_a);
+            let b = quant_stage(false, &c0, &c1, 0.25, &wt, &iw, 1.7, &mut e_b);
+            assert_eq!(a.0, b.0);
+            assert_eq!(a.1.to_bits(), b.1.to_bits());
+            assert_eq!(e_a, e_b);
+            let (m, p) = (rnd(3.0), rnd(0.4));
+            let (la, lb) = (loss_row(true, &m, &p, 4.0), loss_row(false, &m, &p, 4.0));
+            assert_eq!(la.to_bits(), lb.to_bits());
+        }
+    }
 
     #[test]
     fn bounded_search_and_probe_cache_preserve_tile_choices() {

@@ -199,7 +199,8 @@ fn correlation_cost_impl(s: &[f32], y: &[f32], wm: &[f32], r: f32) -> f32 {
         }
         i += 8;
     }
-    let mut total = ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
+    let mut total =
+        ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
     while i < n {
         total += fast_log2(1.0 + ((s[i] - r * y[i]) * wm[i]).abs());
         i += 1;
@@ -1072,7 +1073,7 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
             }
         });
         drop(recons);
-            let scale = quantizer.scale();
+        let scale = quantizer.scale();
         let quant: Vec<f32> = (0..bw * bh)
             .map(|i| {
                 let b = acs_map[i];

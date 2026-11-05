@@ -130,7 +130,17 @@ fn run_stage(src: &Planes, dst: &mut Planes, inv_sigma: &[f32], stage: Stage, th
         .zip(d2.chunks_mut(w * 8))
         .enumerate()
         .collect();
-    let ctx = StageCtx { w, bw, pw, padded_src: &padded_src, inv_sigma, stage, offs, sm, bsm };
+    let ctx = StageCtx {
+        w,
+        bw,
+        pw,
+        padded_src: &padded_src,
+        inv_sigma,
+        stage,
+        offs,
+        sm,
+        bsm,
+    };
     #[cfg(target_arch = "x86_64")]
     let avx2 = std::arch::is_x86_feature_detected!("avx2");
     #[cfg(not(target_arch = "x86_64"))]
@@ -172,13 +182,29 @@ fn run_band(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn run_band_avx2(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2: &mut [f32]) {
+unsafe fn run_band_avx2(
+    ctx: &StageCtx,
+    band: usize,
+    o0: &mut [f32],
+    o1: &mut [f32],
+    o2: &mut [f32],
+) {
     run_band_impl(ctx, band, o0, o1, o2)
 }
 
 #[inline(always)]
 fn run_band_impl(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2: &mut [f32]) {
-    let StageCtx { w, bw, pw, padded_src, inv_sigma, stage, offs, sm, bsm } = *ctx;
+    let StageCtx {
+        w,
+        bw,
+        pw,
+        padded_src,
+        inv_sigma,
+        stage,
+        offs,
+        sm,
+        bsm,
+    } = *ctx;
     let y0 = band * 8;
     let rows = o0.len() / w;
     let sigmas = &inv_sigma[band * bw..(band + 1) * bw];
@@ -226,12 +252,9 @@ fn run_band_impl(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2
                     let out = &mut diff[(k * drows + r) * dw..(k * drows + r + 1) * dw];
                     let base = (y * pw as isize + PAD as isize - 1) as usize;
                     let nb = (base as isize + dy * pw as isize + dx) as usize;
-                    let (a0, b0) =
-                        (&padded_src[0][base..base + dw], &padded_src[0][nb..nb + dw]);
-                    let (a1, b1) =
-                        (&padded_src[1][base..base + dw], &padded_src[1][nb..nb + dw]);
-                    let (a2, b2) =
-                        (&padded_src[2][base..base + dw], &padded_src[2][nb..nb + dw]);
+                    let (a0, b0) = (&padded_src[0][base..base + dw], &padded_src[0][nb..nb + dw]);
+                    let (a1, b1) = (&padded_src[1][base..base + dw], &padded_src[1][nb..nb + dw]);
+                    let (a2, b2) = (&padded_src[2][base..base + dw], &padded_src[2][nb..nb + dw]);
                     for x in xs..xe + 2 {
                         let t0 = (a0[x] - b0[x]).abs() * CHANNEL_SCALE[0];
                         let t1 = (a1[x] - b1[x]).abs() * CHANNEL_SCALE[1];
@@ -273,8 +296,7 @@ fn run_band_impl(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2
                 a0[..tw].copy_from_slice(&padded_src[0][row + x0..row + x0 + tw]);
                 a1[..tw].copy_from_slice(&padded_src[1][row + x0..row + x0 + tw]);
                 a2[..tw].copy_from_slice(&padded_src[2][row + x0..row + x0 + tw]);
-                let (ws, a0, a1, a2) =
-                    (&mut ws[..tw], &mut a0[..tw], &mut a1[..tw], &mut a2[..tw]);
+                let (ws, a0, a1, a2) = (&mut ws[..tw], &mut a0[..tw], &mut a1[..tw], &mut a2[..tw]);
                 for (k, &(dy, dx)) in offs.iter().enumerate() {
                     let nb = (row as isize + dy * pw as isize + dx) as usize + x0;
                     let (p0, p1, p2) = (
@@ -302,9 +324,8 @@ fn run_band_impl(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2
                     } else {
                         // Plus-shaped sum of the difference plane around the pixel.
                         let d = &diff[k * drows * dw..(k + 1) * drows * dw];
-                        let line = |l: usize, off: usize| {
-                            &d[l * dw + off + x0..l * dw + off + x0 + tw]
-                        };
+                        let line =
+                            |l: usize, off: usize| &d[l * dw + off + x0..l * dw + off + x0 + tw];
                         let (c, up, down) = (line(r + 1, 1), line(r, 1), line(r + 2, 1));
                         let (left, right) = (line(r + 1, 0), line(r + 1, 2));
                         for x in 0..tw {

@@ -316,52 +316,52 @@ fn modulate_row_impl(
     row: &mut [f32],
 ) {
     for bx in 0..row.len() {
-            let (x0, y0) = (bx * 8, by * 8);
-            let mut v = compute_mask(row[bx]);
-            // Gamma modulation.
-            let mut ratio = 0f32;
-            for dy in 0..8 {
-                for dx in 0..8 {
-                    let i = (y0 + dy) * w + x0 + dx;
-                    let iny = py[i] + 0.16;
-                    let inx = px[i];
-                    ratio += ratio_of_derivatives(iny - inx, true);
-                    ratio += ratio_of_derivatives(iny + inx, true);
-                }
+        let (x0, y0) = (bx * 8, by * 8);
+        let mut v = compute_mask(row[bx]);
+        // Gamma modulation.
+        let mut ratio = 0f32;
+        for dy in 0..8 {
+            for dx in 0..8 {
+                let i = (y0 + dy) * w + x0 + dx;
+                let iny = py[i] + 0.16;
+                let inx = px[i];
+                ratio += ratio_of_derivatives(iny - inx, true);
+                ratio += ratio_of_derivatives(iny + inx, true);
             }
-            v += 0.100_561_33 * (ratio * (0.5 / 64.0)).log2();
-            // HF modulation.
-            let mut sum_y = 0f32;
-            for dy in 0..8 {
-                let r = (y0 + dy) * w + x0;
-                let rn = if dy == 7 { r } else { r + w };
-                for dx in 0..8 {
-                    if dx < 7 {
-                        sum_y += (py[r + dx] - py[r + dx + 1]).abs().min(0.0206);
-                    }
-                    sum_y += (py[r + dx] - py[rn + dx]).abs().min(0.0206);
-                }
-            }
-            let hf = v + sum_y * -0.38 + 0.42;
-            // Blue modulation.
-            const LIMIT_B: f32 = 0.010_474_085;
-            let mut sum_b = 0f32;
-            for dy in 0..8 {
-                for dx in 0..8 {
-                    let i = (y0 + dy) * w + x0 + dx;
-                    let eff = py[i] + 0.003_199_477 + px[i].abs();
-                    if pb[i] > eff {
-                        sum_b += (pb[i] - eff).min(LIMIT_B);
-                    }
-                }
-            }
-            if sum_b >= 32.0 * LIMIT_B {
-                sum_b = 64.0 * LIMIT_B - sum_b;
-            }
-            sum_b = sum_b.min(15.463_398 * LIMIT_B) * 0.905_908;
-            let out = hf.min(v + sum_b);
-            row[bx] = out.exp() * mulv + addv;
         }
+        v += 0.100_561_33 * (ratio * (0.5 / 64.0)).log2();
+        // HF modulation.
+        let mut sum_y = 0f32;
+        for dy in 0..8 {
+            let r = (y0 + dy) * w + x0;
+            let rn = if dy == 7 { r } else { r + w };
+            for dx in 0..8 {
+                if dx < 7 {
+                    sum_y += (py[r + dx] - py[r + dx + 1]).abs().min(0.0206);
+                }
+                sum_y += (py[r + dx] - py[rn + dx]).abs().min(0.0206);
+            }
+        }
+        let hf = v + sum_y * -0.38 + 0.42;
+        // Blue modulation.
+        const LIMIT_B: f32 = 0.010_474_085;
+        let mut sum_b = 0f32;
+        for dy in 0..8 {
+            for dx in 0..8 {
+                let i = (y0 + dy) * w + x0 + dx;
+                let eff = py[i] + 0.003_199_477 + px[i].abs();
+                if pb[i] > eff {
+                    sum_b += (pb[i] - eff).min(LIMIT_B);
+                }
+            }
+        }
+        if sum_b >= 32.0 * LIMIT_B {
+            sum_b = 64.0 * LIMIT_B - sum_b;
+        }
+        sum_b = sum_b.min(15.463_398 * LIMIT_B) * 0.905_908;
+        let out = hf.min(v + sum_b);
+        row[bx] = out.exp() * mulv + addv;
+    }
 }
 
 fn blur_mask1x1(m: Vec<f32>, w: usize, h: usize, threads: usize) -> Vec<f32> {
@@ -533,6 +533,20 @@ fn symmetric5_out_of_place(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_ln1p_matches_libm() {
+        let mut x = 0f32;
+        while x < 40.0 {
+            let (a, b) = (fast_ln1p(x), x.ln_1p());
+            assert!(
+                (a - b).abs() <= 2e-6 * b.max(1e-2) + 1e-6,
+                "x={x}: {a} vs {b}"
+            );
+            x += 0.0137;
+        }
+        assert_eq!(fast_ln1p(0.0), 0.0);
+    }
 
     #[test]
     fn in_place_blur_matches_reference() {
