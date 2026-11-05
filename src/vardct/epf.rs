@@ -143,114 +143,142 @@ fn run_stage(src: &Planes, dst: &mut Planes, inv_sigma: &[f32], stage: Stage, th
             }
             return;
         }
+        // Blocks that are not filtered are copied; the rest is processed in
+        // runs of consecutive active blocks.
+        for (c, out) in [&mut *o0, &mut *o1, &mut *o2].into_iter().enumerate() {
+            for r in 0..rows {
+                let from = (y0 + r + PAD) * pw + PAD;
+                out[r * w..(r + 1) * w].copy_from_slice(&padded_src[c][from..from + w]);
+            }
+        }
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (bx, &v) in sigmas.iter().enumerate() {
+            if v < MIN_SIGMA {
+                continue;
+            }
+            match runs.last_mut() {
+                Some(last) if last.1 == bx => last.1 = bx + 1,
+                _ => runs.push((bx, bx + 1)),
+            }
+        }
         // Per-offset channel differences for rows y0-1..=y0+8, x -1..=w.
         let (dw, drows) = (w + 2, rows + 2);
         let mut diff: Vec<f32> = Vec::new();
         if !matches!(stage, Stage::Two) {
             diff = vec![0f32; offs.len() * drows * dw];
-            for (k, &(dy, dx)) in offs.iter().enumerate() {
-                for r in 0..drows {
-                    let y = (y0 + r + PAD - 1) as isize;
-                    let out = &mut diff[(k * drows + r) * dw..(k * drows + r + 1) * dw];
-                    let base = (y * pw as isize + PAD as isize - 1) as usize;
-                    let nb = (base as isize + dy * pw as isize + dx) as usize;
-                    let (a0, b0) = (&padded_src[0][base..base + dw], &padded_src[0][nb..nb + dw]);
-                    let (a1, b1) = (&padded_src[1][base..base + dw], &padded_src[1][nb..nb + dw]);
-                    let (a2, b2) = (&padded_src[2][base..base + dw], &padded_src[2][nb..nb + dw]);
-                    for x in 0..dw {
-                        let t0 = (a0[x] - b0[x]).abs() * CHANNEL_SCALE[0];
-                        let t1 = (a1[x] - b1[x]).abs() * CHANNEL_SCALE[1];
-                        let t2 = (a2[x] - b2[x]).abs() * CHANNEL_SCALE[2];
-                        out[x] = t0 + t1 + t2;
-                    }
-                }
-            }
         }
         let mut isig_px = vec![0f32; w];
         let mut active = vec![0f32; w];
-        for r in 0..rows {
-            let y = y0 + r;
-            let border_row = r == 0 || r == 7;
-            for (bx, (ip, ac)) in isig_px
-                .chunks_exact_mut(8)
-                .zip(active.chunks_exact_mut(8))
-                .enumerate()
-            {
-                let isig = sigmas[bx];
-                if isig >= MIN_SIGMA {
-                    ac.fill(1.0);
-                    ip.fill(isig * if border_row { bsm } else { sm });
-                    ip[0] = isig * bsm;
-                    ip[7] = isig * bsm;
-                } else {
-                    ac.fill(0.0);
-                    ip.fill(0.0);
-                }
-            }
-            let row = (y + PAD) * pw + PAD;
-            // Work in tiles so that the accumulators and every stream they
-            // read stay in the L1 cache across the candidate offsets.
-            for x0 in (0..w).step_by(TILE) {
-                let tw = TILE.min(w - x0);
-                let (ip, ac) = (&isig_px[x0..x0 + tw], &active[x0..x0 + tw]);
-                let mut ws = [1f32; TILE];
-                let mut a0 = [0f32; TILE];
-                let mut a1 = [0f32; TILE];
-                let mut a2 = [0f32; TILE];
-                a0[..tw].copy_from_slice(&padded_src[0][row + x0..row + x0 + tw]);
-                a1[..tw].copy_from_slice(&padded_src[1][row + x0..row + x0 + tw]);
-                a2[..tw].copy_from_slice(&padded_src[2][row + x0..row + x0 + tw]);
-                let (ws, a0, a1, a2) = (&mut ws[..tw], &mut a0[..tw], &mut a1[..tw], &mut a2[..tw]);
+        for &(rb0, rb1) in &runs {
+            let (xs, xe) = (rb0 * 8, rb1 * 8);
+            if !matches!(stage, Stage::Two) {
                 for (k, &(dy, dx)) in offs.iter().enumerate() {
-                    let nb = (row as isize + dy * pw as isize + dx) as usize + x0;
-                    let (p0, p1, p2) = (
-                        &padded_src[0][nb..nb + tw],
-                        &padded_src[1][nb..nb + tw],
-                        &padded_src[2][nb..nb + tw],
-                    );
-                    if matches!(stage, Stage::Two) {
-                        let (m0, m1, m2) = (
-                            &padded_src[0][row + x0..row + x0 + tw],
-                            &padded_src[1][row + x0..row + x0 + tw],
-                            &padded_src[2][row + x0..row + x0 + tw],
-                        );
-                        for x in 0..tw {
-                            let t0 = (p0[x] - m0[x]).abs() * CHANNEL_SCALE[0];
-                            let t1 = (p1[x] - m1[x]).abs() * CHANNEL_SCALE[1];
-                            let t2 = (p2[x] - m2[x]).abs() * CHANNEL_SCALE[2];
-                            let sad = t0 + t1 + t2;
-                            let wt = (sad * ip[x] + 1.0).max(0.0) * ac[x];
-                            ws[x] += wt;
-                            a0[x] += wt * p0[x];
-                            a1[x] += wt * p1[x];
-                            a2[x] += wt * p2[x];
-                        }
-                    } else {
-                        // Plus-shaped sum of the difference plane around the pixel.
-                        let d = &diff[k * drows * dw..(k + 1) * drows * dw];
-                        let line =
-                            |l: usize, off: usize| &d[l * dw + off + x0..l * dw + off + x0 + tw];
-                        let (c, up, down) = (line(r + 1, 1), line(r, 1), line(r + 2, 1));
-                        let (left, right) = (line(r + 1, 0), line(r + 1, 2));
-                        for x in 0..tw {
-                            let sad = c[x] + up[x] + down[x] + left[x] + right[x];
-                            let wt = (sad * ip[x] + 1.0).max(0.0) * ac[x];
-                            ws[x] += wt;
-                            a0[x] += wt * p0[x];
-                            a1[x] += wt * p1[x];
-                            a2[x] += wt * p2[x];
+                    for r in 0..drows {
+                        let y = (y0 + r + PAD - 1) as isize;
+                        let out = &mut diff[(k * drows + r) * dw..(k * drows + r + 1) * dw];
+                        let base = (y * pw as isize + PAD as isize - 1) as usize;
+                        let nb = (base as isize + dy * pw as isize + dx) as usize;
+                        let (a0, b0) =
+                            (&padded_src[0][base..base + dw], &padded_src[0][nb..nb + dw]);
+                        let (a1, b1) =
+                            (&padded_src[1][base..base + dw], &padded_src[1][nb..nb + dw]);
+                        let (a2, b2) =
+                            (&padded_src[2][base..base + dw], &padded_src[2][nb..nb + dw]);
+                        for x in xs..xe + 2 {
+                            let t0 = (a0[x] - b0[x]).abs() * CHANNEL_SCALE[0];
+                            let t1 = (a1[x] - b1[x]).abs() * CHANNEL_SCALE[1];
+                            let t2 = (a2[x] - b2[x]).abs() * CHANNEL_SCALE[2];
+                            out[x] = t0 + t1 + t2;
                         }
                     }
                 }
-                let (o0, o1, o2) = (
-                    &mut o0[r * w + x0..r * w + x0 + tw],
-                    &mut o1[r * w + x0..r * w + x0 + tw],
-                    &mut o2[r * w + x0..r * w + x0 + tw],
-                );
-                for x in 0..tw {
-                    o0[x] = a0[x] / ws[x];
-                    o1[x] = a1[x] / ws[x];
-                    o2[x] = a2[x] / ws[x];
+            }
+            for r in 0..rows {
+                let y = y0 + r;
+                let border_row = r == 0 || r == 7;
+                for (k, (ip, ac)) in isig_px[xs..xe]
+                    .chunks_exact_mut(8)
+                    .zip(active[xs..xe].chunks_exact_mut(8))
+                    .enumerate()
+                {
+                    let isig = sigmas[rb0 + k];
+                    if isig >= MIN_SIGMA {
+                        ac.fill(1.0);
+                        ip.fill(isig * if border_row { bsm } else { sm });
+                        ip[0] = isig * bsm;
+                        ip[7] = isig * bsm;
+                    } else {
+                        ac.fill(0.0);
+                        ip.fill(0.0);
+                    }
+                }
+                let row = (y + PAD) * pw + PAD;
+                // Work in tiles so that the accumulators and every stream they
+                // read stay in the L1 cache across the candidate offsets.
+                for x0 in (xs..xe).step_by(TILE) {
+                    let tw = TILE.min(xe - x0);
+                    let (ip, ac) = (&isig_px[x0..x0 + tw], &active[x0..x0 + tw]);
+                    let mut ws = [1f32; TILE];
+                    let mut a0 = [0f32; TILE];
+                    let mut a1 = [0f32; TILE];
+                    let mut a2 = [0f32; TILE];
+                    a0[..tw].copy_from_slice(&padded_src[0][row + x0..row + x0 + tw]);
+                    a1[..tw].copy_from_slice(&padded_src[1][row + x0..row + x0 + tw]);
+                    a2[..tw].copy_from_slice(&padded_src[2][row + x0..row + x0 + tw]);
+                    let (ws, a0, a1, a2) =
+                        (&mut ws[..tw], &mut a0[..tw], &mut a1[..tw], &mut a2[..tw]);
+                    for (k, &(dy, dx)) in offs.iter().enumerate() {
+                        let nb = (row as isize + dy * pw as isize + dx) as usize + x0;
+                        let (p0, p1, p2) = (
+                            &padded_src[0][nb..nb + tw],
+                            &padded_src[1][nb..nb + tw],
+                            &padded_src[2][nb..nb + tw],
+                        );
+                        if matches!(stage, Stage::Two) {
+                            let (m0, m1, m2) = (
+                                &padded_src[0][row + x0..row + x0 + tw],
+                                &padded_src[1][row + x0..row + x0 + tw],
+                                &padded_src[2][row + x0..row + x0 + tw],
+                            );
+                            for x in 0..tw {
+                                let t0 = (p0[x] - m0[x]).abs() * CHANNEL_SCALE[0];
+                                let t1 = (p1[x] - m1[x]).abs() * CHANNEL_SCALE[1];
+                                let t2 = (p2[x] - m2[x]).abs() * CHANNEL_SCALE[2];
+                                let sad = t0 + t1 + t2;
+                                let wt = (sad * ip[x] + 1.0).max(0.0) * ac[x];
+                                ws[x] += wt;
+                                a0[x] += wt * p0[x];
+                                a1[x] += wt * p1[x];
+                                a2[x] += wt * p2[x];
+                            }
+                        } else {
+                            // Plus-shaped sum of the difference plane around the pixel.
+                            let d = &diff[k * drows * dw..(k + 1) * drows * dw];
+                            let line = |l: usize, off: usize| {
+                                &d[l * dw + off + x0..l * dw + off + x0 + tw]
+                            };
+                            let (c, up, down) = (line(r + 1, 1), line(r, 1), line(r + 2, 1));
+                            let (left, right) = (line(r + 1, 0), line(r + 1, 2));
+                            for x in 0..tw {
+                                let sad = c[x] + up[x] + down[x] + left[x] + right[x];
+                                let wt = (sad * ip[x] + 1.0).max(0.0) * ac[x];
+                                ws[x] += wt;
+                                a0[x] += wt * p0[x];
+                                a1[x] += wt * p1[x];
+                                a2[x] += wt * p2[x];
+                            }
+                        }
+                    }
+                    let (o0, o1, o2) = (
+                        &mut o0[r * w + x0..r * w + x0 + tw],
+                        &mut o1[r * w + x0..r * w + x0 + tw],
+                        &mut o2[r * w + x0..r * w + x0 + tw],
+                    );
+                    for x in 0..tw {
+                        o0[x] = a0[x] / ws[x];
+                        o1[x] = a1[x] / ws[x];
+                        o2[x] = a2[x] / ws[x];
+                    }
                 }
             }
         }
@@ -342,6 +370,7 @@ fn strip_errors(
         gaborish(&mut strip, 1);
     }
     let interior = 1..local_bh - 1;
+    let skip = flat_neighbourhoods(&strip, local_bh, bw);
     let y_off = by0 as isize * 8 - 8;
     let quant: Vec<f32> = (0..local_bh)
         .flat_map(|lb| {
@@ -378,7 +407,12 @@ fn strip_errors(
         }
         let inv_sigma: Vec<f32> = quant
             .iter()
-            .map(|&q| {
+            .zip(&skip)
+            .map(|(&q, &flat)| {
+                if flat {
+                    // The filter leaves a flat neighbourhood unchanged.
+                    return -1e9;
+                }
                 let sigma = QUANT_MUL / (q * INV_SIGMA_NUM) * (val as f32 / 7.0);
                 1.0 / sigma.min(-1e-4)
             })
@@ -389,9 +423,58 @@ fn strip_errors(
             std::mem::swap(&mut cur, &mut tmp);
         }
         let decoded = if stages.is_empty() { &strip } else { &cur };
-        result.push(block_errors(inp, decoded, y_off, interior.clone()));
+        let mut errs = block_errors(inp, decoded, y_off, interior.clone());
+        // Unfiltered blocks have the error of strength zero.
+        if let Some(zero) = result.first() {
+            for (i, e) in errs.iter_mut().enumerate() {
+                if skip[bw + i] {
+                    *e = zero[i];
+                }
+            }
+        }
+        result.push(errs);
     }
     result
+}
+
+/// Per 8x8 block of `strip`: whether the block and its eight neighbours are
+/// all one colour, so that no EPF stage (total reach below 8 pixels) can
+/// change it. Edge block rows are never flagged.
+fn flat_neighbourhoods(strip: &Planes, bh: usize, bw: usize) -> Vec<bool> {
+    const EPS: f32 = 1e-5;
+    let w = strip.w;
+    let mut colour: Vec<Option<[f32; 3]>> = vec![None; bw * bh];
+    for by in 0..bh {
+        for bx in 0..bw {
+            let mut c = [0f32; 3];
+            let mut flat = true;
+            for (ch, cv) in c.iter_mut().enumerate() {
+                let first = strip.p[ch][by * 8 * w + bx * 8];
+                *cv = first;
+                for y in by * 8..by * 8 + 8 {
+                    let row = &strip.p[ch][y * w + bx * 8..y * w + bx * 8 + 8];
+                    flat &= row.iter().all(|&v| (v - first).abs() <= EPS);
+                }
+            }
+            if flat {
+                colour[by * bw + bx] = Some(c);
+            }
+        }
+    }
+    let mut skip = vec![false; bw * bh];
+    for by in 1..bh.saturating_sub(1) {
+        for bx in 0..bw {
+            let Some(c) = colour[by * bw + bx] else {
+                continue;
+            };
+            skip[by * bw + bx] = (by - 1..=by + 1).all(|y| {
+                (bx.saturating_sub(1)..=(bx + 1).min(bw - 1)).all(|x| {
+                    colour[y * bw + x].is_some_and(|n| (0..3).all(|k| (n[k] - c[k]).abs() <= EPS))
+                })
+            });
+        }
+    }
+    skip
 }
 
 /// Choose an EPF sharpness (0..=7) for each 8x8 block. `rec` is the decoded

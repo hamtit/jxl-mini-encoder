@@ -132,7 +132,16 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
     // that is not (yet) background can grow it, so only those are queued.
     // The queue is FIFO and consumed entries are dropped, so it holds only
     // the frontier of the flood fill.
-    let mut queue: std::collections::VecDeque<(u32, u32)> = std::collections::VecDeque::new();
+    // Entries carry their coordinates and the source colour so that the hot
+    // loop needs neither divisions nor a lookup of the source pixel.
+    struct Item {
+        x: u32,
+        y: u32,
+        sx: u32,
+        sy: u32,
+        color: [f32; 3],
+    }
+    let mut queue: std::collections::VecDeque<Item> = std::collections::VecDeque::new();
     for py in 1..ph - 1 {
         for qx in 1..pw - 1 {
             if !seeds[py * pw + qx] {
@@ -151,41 +160,58 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
             if !seeds[py * pw + qx] {
                 continue;
             }
+            // Pixels of a block whose eight neighbouring blocks are seeds too
+            // are never next to a non-background pixel.
+            if (py - 1..=py + 1).all(|v| (qx - 1..=qx + 1).all(|u| seeds[v * pw + u])) {
+                continue;
+            }
             for y in py * SIDE..(py + 1) * SIDE {
                 for x in qx * SIDE..(qx + 1) * SIDE {
                     let open = (y.saturating_sub(1)..(y + 2).min(h)).any(|ny| {
                         (x.saturating_sub(1)..(x + 2).min(w)).any(|nx| !is_bg[ny * w + nx])
                     });
                     if open {
-                        let i = (y * w + x) as u32;
-                        queue.push_back((i, i));
+                        queue.push_back(Item {
+                            x: x as u32,
+                            y: y as u32,
+                            sx: x as u32,
+                            sy: y as u32,
+                            color: px(x, y),
+                        });
                     }
                 }
             }
         }
     }
-    while let Some((cur, src)) = queue.pop_front() {
-        let (cur, src) = (cur as usize, src as usize);
-        let (cx, cy) = (cur % w, cur / w);
-        let (sx, sy) = (src % w, src / w);
-        bg_src[cur] = src as u32;
-        let src_color = px(sx, sy);
-        for dy in -1i32..=1 {
-            for dx in -1i32..=1 {
-                let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
-                if nx < 0 || ny < 0 || nx as usize >= w || ny as usize >= h {
+    while let Some(Item {
+        x: cx,
+        y: cy,
+        sx,
+        sy,
+        color,
+    }) = queue.pop_front()
+    {
+        let (cx, cy) = (cx as usize, cy as usize);
+        bg_src[cy * w + cx] = sy * w as u32 + sx;
+        let (x0, x1) = (cx.saturating_sub(1), (cx + 2).min(w));
+        for ny in cy.saturating_sub(1)..(cy + 2).min(h) {
+            let row = ny * w;
+            for nx in x0..x1 {
+                if is_bg[row + nx] {
                     continue;
                 }
-                let next = (nx as usize, ny as usize);
-                if is_bg[next.1 * w + next.0] {
+                if nx.abs_diff(sx as usize) + ny.abs_diff(sy as usize) > DISTANCE_LIMIT {
                     continue;
                 }
-                if next.0.abs_diff(sx) + next.1.abs_diff(sy) > DISTANCE_LIMIT {
-                    continue;
-                }
-                if similar(src_color, px(next.0, next.1), 0.8) {
-                    queue.push_back(((next.1 * w + next.0) as u32, src as u32));
-                    is_bg[next.1 * w + next.0] = true;
+                if similar(color, px(nx, ny), 0.8) {
+                    queue.push_back(Item {
+                        x: nx as u32,
+                        y: ny as u32,
+                        sx,
+                        sy,
+                        color,
+                    });
+                    is_bg[row + nx] = true;
                 }
             }
         }
@@ -245,11 +271,7 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
                         if !is_bg[next.1 * w + next.0] {
                             stack.push(next);
                         } else if let Some(r) = reference {
-                            if !similar(
-                                background(next.0, next.1),
-                                background(r.0, r.1),
-                                0.03,
-                            ) {
+                            if !similar(background(next.0, next.1), background(r.0, r.1), 0.03) {
                                 all_similar = false;
                             }
                         } else {
