@@ -533,6 +533,8 @@ pub struct Search<'a> {
     /// Estimates already paid for while probing small transforms. Read-only
     /// during the parallel tile search; no scratch buffers are retained.
     probe_cache: Vec<((usize, usize), EstimateCache)>,
+    #[cfg(test)]
+    disable_pruning: bool,
 }
 
 type EstimateCache = [[f32; 64]; ALL.len()];
@@ -624,6 +626,8 @@ impl<'a> Search<'a> {
             cfg,
             small: false,
             probe_cache: Vec::new(),
+            #[cfg(test)]
+            disable_pruning: false,
         }
     }
 
@@ -699,14 +703,15 @@ impl<'a> Search<'a> {
         bx: usize,
         by: usize,
         entropy_mul: f32,
+        limit: f32,
         scratch: &mut [f32],
     ) -> f32 {
         #[cfg(target_arch = "x86_64")]
         if self.dct.has_avx2() {
             // SAFETY: AVX2 support was detected at runtime.
-            return unsafe { self.estimate_avx2(acs, bx, by, entropy_mul, scratch) };
+            return unsafe { self.estimate_avx2(acs, bx, by, entropy_mul, limit, scratch) };
         }
-        self.estimate_impl(acs, bx, by, entropy_mul, scratch)
+        self.estimate_impl(acs, bx, by, entropy_mul, limit, scratch)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -717,9 +722,10 @@ impl<'a> Search<'a> {
         bx: usize,
         by: usize,
         entropy_mul: f32,
+        limit: f32,
         scratch: &mut [f32],
     ) -> f32 {
-        self.estimate_impl(acs, bx, by, entropy_mul, scratch)
+        self.estimate_impl(acs, bx, by, entropy_mul, limit, scratch)
     }
 
     #[inline(always)]
@@ -729,6 +735,7 @@ impl<'a> Search<'a> {
         bx: usize,
         by: usize,
         entropy_mul: f32,
+        limit: f32,
         scratch: &mut [f32],
     ) -> f32 {
         let inp = self.inp;
@@ -799,6 +806,18 @@ impl<'a> Search<'a> {
             for &v in chunks.remainder() {
                 sum_sqrt += v;
             }
+            entropy += self.cfg.cost_delta * sum_sqrt;
+            let nbits = ceil_log2(nz as usize + 1) + 1;
+            entropy += self.cfg.zeros_mul * (ceil_log2(nbits + 17) + nbits) as f32;
+            if c == 0 && nb >= 2 {
+                entropy *= 1.0 + (nb as f32 / 8.0).min(3.0);
+            }
+            // Remaining coefficient costs and distortion are non-negative.
+            // Reject only candidates that cannot beat the incumbent, before
+            // paying for their inverse DCT and pixel-domain distortion.
+            if entropy * entropy_mul >= limit {
+                return f32::INFINITY;
+            }
             inverse_block(self.dct, acs, &err[..n], pix);
             let mut lacc = [0f64; 4];
             for y in 0..t.h {
@@ -816,12 +835,8 @@ impl<'a> Search<'a> {
             }
             let lossc = (lacc[0] + lacc[2]) + (lacc[1] + lacc[3]);
             loss += lossc * CHANNEL_MUL[c];
-            entropy += self.cfg.cost_delta * sum_sqrt;
-            let nbits = ceil_log2(nz as usize + 1) + 1;
-            entropy += self.cfg.zeros_mul * (ceil_log2(nbits + 17) + nbits) as f32;
             if c == 0 && nb >= 2 {
                 let w = 1.0 + (nb as f32 / 8.0).min(3.0);
-                entropy *= w;
                 loss *= f64::from(w);
             }
         }
@@ -832,11 +847,42 @@ impl<'a> Search<'a> {
 
     /// `estimate` for a tile-relative position, memoised.
     fn est(&self, tile: &mut Tile, acs: Acs, cx: usize, cy: usize, mul: f32) -> f32 {
+        self.est_bounded(tile, acs, cx, cy, mul, f32::INFINITY)
+    }
+
+    fn est_bounded(
+        &self,
+        tile: &mut Tile,
+        acs: Acs,
+        cx: usize,
+        cy: usize,
+        mul: f32,
+        limit: f32,
+    ) -> f32 {
+        #[cfg(test)]
+        let limit = if self.disable_pruning {
+            f32::INFINITY
+        } else {
+            limit
+        };
         let slot = &mut tile.cache[acs.index()][cy * 8 + cx];
-        if slot.is_nan() {
-            *slot = self.estimate(acs, tile.bx + cx, tile.by + cy, mul, &mut tile.scratch);
+        if !slot.is_nan() {
+            return *slot;
         }
-        *slot
+        let cost = self.estimate(
+            acs,
+            tile.bx + cx,
+            tile.by + cy,
+            mul,
+            limit,
+            &mut tile.scratch,
+        );
+        // A rejected estimate is only a bound, not a reusable exact cost:
+        // a later comparison may have a larger incumbent.
+        if cost.is_finite() {
+            *slot = cost;
+        }
+        cost
     }
 
     /// libjxl's FindBestFirstLevelDivisionForSquare.
@@ -874,23 +920,25 @@ impl<'a> Search<'a> {
         let (mut v_left, mut v_right, mut h_top, mut h_bottom) = (max, max, max, max);
         if allow_v {
             if tile.acs[cy * 8 + cx] != vsplit {
-                v_left = self.est(tile, vsplit, cx, cy, mul_split);
+                v_left = self.est_bounded(tile, vsplit, cx, cy, mul_split, q[0][0] + q[1][0]);
             }
             if tile.acs[cy * 8 + cx + half] != vsplit {
-                v_right = self.est(tile, vsplit, cx + half, cy, mul_split);
+                v_right =
+                    self.est_bounded(tile, vsplit, cx + half, cy, mul_split, q[0][1] + q[1][1]);
             }
         }
         if allow_h {
             if tile.acs[cy * 8 + cx] != hsplit {
-                h_top = self.est(tile, hsplit, cx, cy, mul_split);
+                h_top = self.est_bounded(tile, hsplit, cx, cy, mul_split, q[0][0] + q[0][1]);
             }
             if tile.acs[(cy + half) * 8 + cx] != hsplit {
-                h_bottom = self.est(tile, hsplit, cx, cy + half, mul_split);
+                h_bottom =
+                    self.est_bounded(tile, hsplit, cx, cy + half, mul_split, q[1][0] + q[1][1]);
             }
         }
-        let e_square = self.est(tile, square, cx, cy, mul_square);
         let cost_v = v_left.min(q[0][0] + q[1][0]) + v_right.min(q[0][1] + q[1][1]);
         let cost_h = h_top.min(q[0][0] + q[0][1]) + h_bottom.min(q[1][0] + q[1][1]);
+        let e_square = self.est_bounded(tile, square, cx, cy, mul_square, cost_v.min(cost_h));
         if e_square < cost_v && e_square < cost_h {
             tile.set(cx, cy, square);
             tile.set_entropy(cx, cy, square, e_square);
@@ -927,7 +975,7 @@ impl<'a> Search<'a> {
                 current += tile.entropy[y * 8 + x];
             }
         }
-        let cand = self.est(tile, acs, cx, cy, mul);
+        let cand = self.est_bounded(tile, acs, cx, cy, mul, current);
         if cand >= current {
             return;
         }
@@ -976,7 +1024,7 @@ impl<'a> Search<'a> {
                         let k = if d < 12.0 { 8.0 / (d - 4.0) } else { 1.0 };
                         mul += 0.5 * k;
                     }
-                    let e = self.est(tile, acs, x, y, mul);
+                    let e = self.est_bounded(tile, acs, x, y, mul, best.0);
                     if e < best.0 {
                         best = (e, acs);
                     }
@@ -1106,7 +1154,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn probe_cache_does_not_change_tile_choices() {
+    fn bounded_search_and_probe_cache_preserve_tile_choices() {
         let (bw, bh) = (25usize, 49usize);
         let stride = bw * 8;
         let planes: [Vec<f32>; 3] = std::array::from_fn(|c| {
@@ -1119,8 +1167,10 @@ mod tests {
                 })
                 .collect()
         });
-        let quant = vec![1.0; bw * bh];
-        let mask = vec![0.5; stride * bh * 8];
+        let quant: Vec<f32> = (0..bw * bh).map(|i| 0.2 + (i % 19) as f32 * 0.11).collect();
+        let mask: Vec<f32> = (0..stride * bh * 8)
+            .map(|i| 0.1 + (i % 31) as f32)
+            .collect();
         let tables = Tables::new();
         let dct = Dct::new();
         for effort in [5, 7, 9] {
@@ -1139,6 +1189,19 @@ mod tests {
                 let mut cached = Search::new(&input, &tables, &dct);
                 let mut plain = Search::new(&input, &tables, &dct);
                 let mut serial = Search::new(&input, &tables, &dct);
+                plain.disable_pruning = true;
+                serial.disable_pruning = true;
+                // Rejected costs must not poison the memoised exact costs.
+                let mut tile = cached.new_tile(0, 0);
+                assert!(
+                    cached
+                        .est_bounded(&mut tile, Acs::Dct8, 0, 0, 1.0, 0.0)
+                        .is_infinite()
+                );
+                assert!(tile.cache[Acs::Dct8.index()][0].is_nan());
+                let exact = cached.est(&mut tile, Acs::Dct8, 0, 0, 1.0);
+                assert!(exact.is_finite());
+                cached.release_tile(tile);
                 assert_eq!(cached.probe_small(4), serial.probe_small(1));
                 assert!(cached.probe_cache.len() <= 2 * PROBE_TILES);
                 for small in [false, true] {
