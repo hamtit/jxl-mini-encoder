@@ -81,6 +81,13 @@ fn small_threshold(distance: f32) -> f32 {
     if distance < 1.2 { 0.045 } else { 0.012 }
 }
 
+/// Reduce EPF smoothing at medium/low fidelity when inverse Gaborish is
+/// active. This preserves photographic texture without changing the AC data.
+/// Keep the original strength for high fidelity and unsharpened graphics.
+fn epf_sharpness(distance: f32, gaborish: bool) -> i32 {
+    if gaborish && distance >= 1.5 { 3 } else { 4 }
+}
+
 fn initial_quant_dc(distance: f32) -> f32 {
     const DC_MUL: f32 = 0.3;
     let d = (0.5 * distance).max(distance.min(DC_MUL * ((1.0 / DC_MUL) * distance).powf(0.83)));
@@ -868,7 +875,7 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
             info.set(k, 1, m);
         }
         let mut sharp = Channel::new(lbw, lbh);
-        sharp.data.fill(4);
+        sharp.data.fill(epf_sharpness(d, gaborish));
         let meta = [
             ytox.crop(x / 64, y / 64, cw, chh),
             ytob.crop(x / 64, y / 64, cw, chh),
