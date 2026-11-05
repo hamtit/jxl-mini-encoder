@@ -782,7 +782,9 @@ impl<'a> Search<'a> {
         let (pix, sq) = rest.split_at_mut(4096);
         let mut cs = coeffs.chunks_exact_mut(4096);
         let coeffs: [&mut [f32]; 3] = std::array::from_fn(|_| cs.next().unwrap());
-        for c in 0..3 {
+        // X needs Y's coefficients; B is transformed only if the candidate
+        // survives the X and Y pruning checks.
+        for c in [1, 0] {
             forward_block(
                 self.dct,
                 acs,
@@ -796,6 +798,15 @@ impl<'a> Search<'a> {
         const MASK_OFFSET: [f32; 3] = [12.0, 0.0, 4.0];
         const CHANNEL_MUL: [f64; 3] = [27_984_208.0, 1.0, 1.266_770_081_387_4]; // 8.2^8, 1, 1.03^8
         for c in 0..3 {
+            if c == 2 {
+                forward_block(
+                    self.dct,
+                    acs,
+                    &inp.planes[2][origin..],
+                    inp.stride,
+                    coeffs[2],
+                );
+            }
             let mut nz = 0u32;
             let k = inp.cmap[c];
             let (wt, iw) = (&t.weights[c][..n], &t.inv_weights[c][..n]);
@@ -1146,7 +1157,9 @@ impl<'a> Search<'a> {
             }
         }
         // 64x32 / 32x64 / 64x64 on a full tile.
-        if w == 8 && h == 8 {
+        // Below effort 8 the 64-sample transforms are not searched: on photos
+        // they are rarely chosen and cost ~9% of encode time at equal quality.
+        if w == 8 && h == 8 && inp.effort >= 8 {
             self.divide_square(&mut tile, 8, 0, 0, MUL_64, MUL_64);
         }
         if inp.effort >= 8 {
