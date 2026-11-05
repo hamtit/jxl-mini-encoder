@@ -567,6 +567,9 @@ struct Tile {
     /// Memoised estimates per (transform, tile position).
     cache: EstimateCache,
     scratch: Vec<f32>,
+    /// Blocks whose pixels are constant in every plane, and that constant.
+    flat: [bool; 64],
+    flat_val: [[f32; 3]; 64],
 }
 
 impl Tile {
@@ -598,6 +601,15 @@ impl Tile {
             return false;
         }
         (y0..y1.min(self.h)).any(|y| (self.origin[y * 8 + x].0 as usize) < x)
+    }
+
+    /// Is the n x n block region at (cx, cy) one constant colour?
+    fn region_flat(&self, cx: usize, cy: usize, n: usize) -> bool {
+        if cx + n > self.w || cy + n > self.h {
+            return false;
+        }
+        let v0 = self.flat_val[cy * 8 + cx];
+        (cy..cy + n).all(|y| (cx..cx + n).all(|x| self.flat[y * 8 + x] && self.flat_val[y * 8 + x] == v0))
     }
 
     fn set_entropy(&mut self, cx: usize, cy: usize, acs: Acs, e: f32) {
@@ -685,7 +697,12 @@ impl<'a> Search<'a> {
                 .map(|(_, cache)| *cache)
                 .unwrap_or([[f32::NAN; 64]; ALL.len()]),
             scratch: SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut())),
+            flat: [false; 64],
+            flat_val: [[0.0; 3]; 64],
         };
+        if std::env::var_os("MINI_NO_FLAT").is_none() {
+            self.find_flat(&mut tile);
+        }
         if tile.scratch.len() < SCRATCH_LEN {
             tile.scratch = vec![0f32; SCRATCH_LEN];
         }
@@ -908,6 +925,12 @@ impl<'a> Search<'a> {
         {
             return;
         }
+        if tile.region_flat(cx, cy, blocks) {
+            let e = self.est(tile, square, cx, cy, mul_square);
+            tile.set(cx, cy, square);
+            tile.set_entropy(cx, cy, square, e);
+            return;
+        }
         let allow_v = !tile.crosses_v(cx + half, cy, cy + blocks);
         let allow_h = !tile.crosses_h(cx, cy + half, cx + blocks);
         let mut q = [[0f32; 2]; 2];
@@ -1009,8 +1032,9 @@ impl<'a> Search<'a> {
         for y in 0..tile.h {
             for x in 0..tile.w {
                 let mut best = (f32::MAX, Acs::Dct8);
+                let flat = tile.flat[y * 8 + x];
                 for &(acs, m, min_effort) in &TRY8 {
-                    if inp.effort < min_effort || (acs != Acs::Dct8 && !small) {
+                    if inp.effort < min_effort || (acs != Acs::Dct8 && (!small || flat)) {
                         continue;
                     }
                     let mut mul = m / TRY8[0].1;
@@ -1038,12 +1062,53 @@ impl<'a> Search<'a> {
         (sum_base, sum_best)
     }
 
+    fn find_flat(&self, tile: &mut Tile) {
+        let inp = self.inp;
+        for y in 0..tile.h {
+            for x in 0..tile.w {
+                let o = (tile.by + y) * 8 * inp.stride + (tile.bx + x) * 8;
+                let mut val = [0f32; 3];
+                let mut flat = true;
+                for c in 0..3 {
+                    let p = inp.planes[c];
+                    let first = p[o];
+                    val[c] = first;
+                    for r in 0..8 {
+                        if p[o + r * inp.stride..][..8].iter().any(|&v| v != first) {
+                            flat = false;
+                            break;
+                        }
+                    }
+                    if !flat {
+                        break;
+                    }
+                }
+                tile.flat[y * 8 + x] = flat;
+                tile.flat_val[y * 8 + x] = val;
+            }
+        }
+    }
+
     /// Decide the transforms of the 8x8-block tile at (bx, by); `out` is
     /// tile-local with row stride `out_stride`, origins are absolute.
     pub fn tile(&self, bx: usize, by: usize, out: &mut [BlockAcs], out_stride: usize) {
         let mut tile = self.new_tile(bx, by);
         let (w, h) = (tile.w, tile.h);
         let inp = self.inp;
+        if tile.region_flat(0, 0, 8) {
+            // A constant 64x64 tile: one DCT64 carries only its DC.
+            for y in 0..8 {
+                for x in 0..8 {
+                    out[y * out_stride + x] = BlockAcs {
+                        acs: Acs::Dct64,
+                        ox: bx as u32,
+                        oy: by as u32,
+                    };
+                }
+            }
+            SCRATCH.with(|c| *c.borrow_mut() = std::mem::take(&mut tile.scratch));
+            return;
+        }
         self.select_8x8(&mut tile, self.small);
         const MUL_16X8: f32 = 1.21;
         const MUL_16X16: f32 = 1.34;
