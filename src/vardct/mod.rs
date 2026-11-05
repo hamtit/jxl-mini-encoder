@@ -168,6 +168,46 @@ fn fast_log2(x: f32) -> f32 {
     x.to_bits() as f32 * (1.0 / 8_388_608.0) - 127.0
 }
 
+/// Sum of `fast_log2(1 + |(s - r y) * wm|)`, in eight interleaved lanes.
+fn correlation_cost(avx2: bool, s: &[f32], y: &[f32], wm: &[f32], r: f32) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if avx2 {
+        // SAFETY: AVX2 support was detected at runtime.
+        return unsafe { correlation_cost_avx2(s, y, wm, r) };
+    }
+    let _ = avx2;
+    correlation_cost_impl(s, y, wm, r)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn correlation_cost_avx2(s: &[f32], y: &[f32], wm: &[f32], r: f32) -> f32 {
+    correlation_cost_impl(s, y, wm, r)
+}
+
+#[inline(always)]
+fn correlation_cost_impl(s: &[f32], y: &[f32], wm: &[f32], r: f32) -> f32 {
+    let n = s.len();
+    let (y, wm) = (&y[..n], &wm[..n]);
+    let mut acc = [0f32; 8];
+    let mut i = 0;
+    while i + 8 <= n {
+        for j in 0..8 {
+            let v = 1.0 + ((s[i + j] - r * y[i + j]) * wm[i + j]).abs();
+            // v >= 1, so the bit pattern fits a signed int (cheaper to convert).
+            acc[j] += (v.to_bits() as i32) as f32 * (1.0 / 8_388_608.0) - 127.0;
+        }
+        i += 8;
+    }
+    let mut total =
+        ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
+    while i < n {
+        total += fast_log2(1.0 + ((s[i] - r * y[i]) * wm[i]).abs());
+        i += 1;
+    }
+    total
+}
+
 /// A block whose HF coefficients are held back until its tile's colour
 /// correlation is known.
 struct Blk {
@@ -630,13 +670,10 @@ impl Ctx<'_> {
         if s.len() < CFL_MIN_COEFFS {
             return 0;
         }
+        let avx2 = self.dct.has_avx2();
         let cost = |k: i32| -> f32 {
             let r = base + k as f32 / CFL_FACTOR;
-            let mut total = 0.0f32;
-            for i in 0..s.len() {
-                total += fast_log2(1.0 + ((s[i] - r * y[i]) * wm[i]).abs());
-            }
-            total
+            correlation_cost(avx2, &s, &y, &wm, r)
         };
         let zero = cost(0);
         let mut best = (zero, 0i32);
@@ -1008,17 +1045,34 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
             h: xyb_h,
             p: std::array::from_fn(|_| vec![0f32; xyb_w * xyb_h]),
         };
-        for (g, out) in groups.iter_mut().enumerate() {
-            let (gx, gy, gw, gh) = layout.group_rect(g);
-            let (rw, rh) = (gw.div_ceil(8) * 8, gh.div_ceil(8) * 8);
-            let recon = std::mem::take(&mut out.recon);
-            for c in 0..3 {
+        // Stitch the group reconstructions into full planes: one task per
+        // channel and group row, each owning its rows of the plane.
+        let recons: Vec<[Vec<f32>; 3]> = groups
+            .iter_mut()
+            .map(|g| std::mem::take(&mut g.recon))
+            .collect();
+        let tasks: Vec<(usize, usize, &mut [f32])> = rec
+            .p
+            .iter_mut()
+            .enumerate()
+            .flat_map(|(c, plane)| {
+                plane
+                    .chunks_mut(GROUP_DIM * xyb_w)
+                    .enumerate()
+                    .map(move |(r, rows)| (c, r, rows))
+            })
+            .collect();
+        crate::parallel::par_tasks(tasks, opts.threads, |(c, r, rows)| {
+            for g in (0..ng).filter(|&g| layout.group_rect(g).1 == r * GROUP_DIM) {
+                let (gx, _, gw, gh) = layout.group_rect(g);
+                let (rw, rh) = (gw.div_ceil(8) * 8, gh.div_ceil(8) * 8);
                 for y in 0..rh {
-                    let dst = (gy + y) * xyb_w + gx;
-                    rec.p[c][dst..dst + rw].copy_from_slice(&recon[c][y * rw..(y + 1) * rw]);
+                    let dst = y * xyb_w + gx;
+                    rows[dst..dst + rw].copy_from_slice(&recons[g][c][y * rw..(y + 1) * rw]);
                 }
             }
-        }
+        });
+        drop(recons);
         let scale = quantizer.scale();
         let quant: Vec<f32> = (0..bw * bh)
             .map(|i| {
@@ -1071,7 +1125,7 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
         }
     }
 
-    let mopts = ModularOptions::for_effort(opts.effort.min(7), bw * bh * 3)
+    let mopts = ModularOptions::for_effort(opts.effort.min(4), bw * bh * 3)
         .with_threads(opts.threads.div_ceil(nlf));
     let lf_sections: Vec<BitWriter> = par_map(nlf, opts.threads, |i| {
         let (x, y, lw, lh) = layout.lf_group_rect(i);

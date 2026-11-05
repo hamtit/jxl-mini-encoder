@@ -24,7 +24,9 @@ fn cached_cost_matches_reference_and_materialized_merges() {
     let values = [0, 1, 2, 7, 4095, 4096, 65536, u32::MAX / 4];
     for n in 0..=256 {
         let a: Vec<_> = (0..n).map(|i| values[(i * 7 + n) % values.len()]).collect();
-        let b: Vec<_> = (0..n / 2).map(|i| values[(i * 3 + n) % values.len()]).collect();
+        let b: Vec<_> = (0..n / 2)
+            .map(|i| values[(i * 3 + n) % values.len()])
+            .collect();
         for counts in [&a, &b] {
             let expected = reference_cost(counts);
             assert!((estimate_cost(counts) - expected).abs() <= 1e-9 * expected.max(1.0));
@@ -54,7 +56,10 @@ fn sparse_binary_histograms_use_simple_header() {
             assert!(dist.freq[0] > 0 && dist.freq[last] > 0);
             let mut w = BitWriter::new();
             dist.write(&mut w);
-            assert_eq!(w.bits_written(), (2 + u8_bits(0) + u8_bits(last as u32) + LOG_TAB) as usize);
+            assert_eq!(
+                w.bits_written(),
+                (2 + u8_bits(0) + u8_bits(last as u32) + LOG_TAB) as usize
+            );
             assert_eq!(w.finish()[0] & 3, 3);
         }
     }

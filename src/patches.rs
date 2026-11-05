@@ -225,7 +225,15 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
     // Connected components outside the background are candidate patches.
     const MIN_PEAK: i32 = 2;
     const SIMILAR_RADIUS: usize = 2;
-    let mut visited = vec![false; w * h];
+    // Background pixels count as visited, so the fills below test one array.
+    // It has a one-pixel border (also "visited") so neighbours need no bounds
+    // checks: `vi` maps a pixel to its index.
+    let vw = w + 2;
+    let vi = |x: usize, y: usize| (y + 1) * vw + x + 1;
+    let mut visited = vec![true; vw * (h + 2)];
+    for y in 0..h {
+        visited[vi(0, y)..vi(0, y) + w].copy_from_slice(&is_bg[y * w..(y + 1) * w]);
+    }
     type Key = (usize, usize, [Vec<i8>; 3]);
     type Found = (Key, [Vec<f32>; 3], Vec<(usize, usize)>);
     let mut found: Vec<Found> = Vec::new();
@@ -234,7 +242,7 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
     let mut fill: Vec<u32> = Vec::new();
     for y in 0..h {
         for x in 0..w {
-            if is_bg[y * w + x] || visited[y * w + x] {
+            if visited[vi(x, y)] {
                 continue;
             }
             stack.clear();
@@ -244,10 +252,10 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
             let mut all_similar = true;
             let mut oversize = None;
             while let Some(cur) = stack.pop() {
-                if visited[cur.1 * w + cur.0] {
+                if visited[vi(cur.0, cur.1)] {
                     continue;
                 }
-                visited[cur.1 * w + cur.0] = true;
+                visited[vi(cur.0, cur.1)] = true;
                 min_x = min_x.min(cur.0);
                 max_x = max_x.max(cur.0);
                 min_y = min_y.min(cur.1);
@@ -285,22 +293,30 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
                 // of the component as visited, marking on push so that the
                 // stack never holds more than one entry per pixel.
                 fill.clear();
-                fill.push((cutoff.1 * w + cutoff.0) as u32);
+                fill.push(vi(cutoff.0, cutoff.1) as u32);
                 for &(sx, sy) in &stack {
-                    if !visited[sy * w + sx] {
-                        visited[sy * w + sx] = true;
-                        fill.push((sy * w + sx) as u32);
+                    let i = vi(sx, sy);
+                    if !visited[i] {
+                        visited[i] = true;
+                        fill.push(i as u32);
                     }
                 }
+                let around = [
+                    -(vw as isize) - 1,
+                    -(vw as isize),
+                    -(vw as isize) + 1,
+                    -1,
+                    1,
+                    vw as isize - 1,
+                    vw as isize,
+                    vw as isize + 1,
+                ];
                 while let Some(cur) = fill.pop() {
-                    let (cx, cy) = (cur as usize % w, cur as usize / w);
-                    for ny in cy.saturating_sub(1)..(cy + 2).min(h) {
-                        for nx in cx.saturating_sub(1)..(cx + 2).min(w) {
-                            let i = ny * w + nx;
-                            if !is_bg[i] && !visited[i] {
-                                visited[i] = true;
-                                fill.push(i as u32);
-                            }
+                    for off in around {
+                        let i = (cur as isize + off) as usize;
+                        if !visited[i] {
+                            visited[i] = true;
+                            fill.push(i as u32);
                         }
                     }
                 }

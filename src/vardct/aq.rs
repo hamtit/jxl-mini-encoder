@@ -73,8 +73,6 @@ pub fn initial_quant_field(distance: f32, xyb: &Xyb, scale: f32, threads: usize)
     let (w, h) = (xyb.w, xyb.h);
     let (bw, bh) = (w / 8, h / 8);
     let py = &xyb.planes[1];
-    const MATCH_GAMMA_OFFSET: f32 = 0.019;
-    const LIMIT: f32 = 0.2;
 
     // Per-pixel masking and the 4x4-downsampled pre-erosion map.
     let (qw, qh) = (w / 4, h / 4);
@@ -85,25 +83,9 @@ pub fn initial_quant_field(distance: f32, xyb: &Xyb, scale: f32, threads: usize)
         .zip(pre.chunks_mut(qw * 2))
         .enumerate()
         .collect();
+    let avx2 = has_avx2();
     par_tasks(tasks, threads, |(band, (mask, pre))| {
-        for ry in 0..8 {
-            let y = band * 8 + ry;
-            let y1 = y.saturating_sub(1);
-            let y2 = (y + 1).min(h - 1);
-            let row = &py[y * w..(y + 1) * w];
-            let row1 = &py[y1 * w..(y1 + 1) * w];
-            let row2 = &py[y2 * w..(y2 + 1) * w];
-            for x in 0..w {
-                let x1 = x.saturating_sub(1);
-                let x2 = (x + 1).min(w - 1);
-                let base = 0.25 * (row2[x] + row1[x] + row[x1] + row[x2]);
-                let gammac = ratio_of_derivatives(row[x] + MATCH_GAMMA_OFFSET, false);
-                let d = gammac * (row[x] - base);
-                mask[ry * w + x] = 1.0 / (d.abs().ln_1p() + 0.01);
-                let diff = masking_sqrt((d * d).min(LIMIT));
-                pre[(ry / 4) * qw + x / 4] += diff * 0.25;
-            }
-        }
+        mask_band(avx2, py, w, h, qw, band, mask, pre)
     });
 
     // Fuzzy erosion to block resolution.
@@ -165,60 +147,220 @@ pub fn initial_quant_field(distance: f32, xyb: &Xyb, scale: f32, threads: usize)
     par_tasks(
         aq.chunks_mut(bw).enumerate().collect(),
         threads,
-        |(by, row)| {
-            for bx in 0..bw {
-                let (x0, y0) = (bx * 8, by * 8);
-                let mut v = compute_mask(row[bx]);
-                // Gamma modulation.
-                let mut ratio = 0f32;
-                for dy in 0..8 {
-                    for dx in 0..8 {
-                        let i = (y0 + dy) * w + x0 + dx;
-                        let iny = py[i] + 0.16;
-                        let inx = px[i];
-                        ratio += ratio_of_derivatives(iny - inx, true);
-                        ratio += ratio_of_derivatives(iny + inx, true);
-                    }
-                }
-                v += 0.100_561_33 * (ratio * (0.5 / 64.0)).log2();
-                // HF modulation.
-                let mut sum_y = 0f32;
-                for dy in 0..8 {
-                    let r = (y0 + dy) * w + x0;
-                    let rn = if dy == 7 { r } else { r + w };
-                    for dx in 0..8 {
-                        if dx < 7 {
-                            sum_y += (py[r + dx] - py[r + dx + 1]).abs().min(0.0206);
-                        }
-                        sum_y += (py[r + dx] - py[rn + dx]).abs().min(0.0206);
-                    }
-                }
-                let hf = v + sum_y * -0.38 + 0.42;
-                // Blue modulation.
-                const LIMIT_B: f32 = 0.010_474_085;
-                let mut sum_b = 0f32;
-                for dy in 0..8 {
-                    for dx in 0..8 {
-                        let i = (y0 + dy) * w + x0 + dx;
-                        let eff = py[i] + 0.003_199_477 + px[i].abs();
-                        if pb[i] > eff {
-                            sum_b += (pb[i] - eff).min(LIMIT_B);
-                        }
-                    }
-                }
-                if sum_b >= 32.0 * LIMIT_B {
-                    sum_b = 64.0 * LIMIT_B - sum_b;
-                }
-                sum_b = sum_b.min(15.463_398 * LIMIT_B) * 0.905_908;
-                let out = hf.min(v + sum_b);
-                row[bx] = out.exp() * mulv + addv;
-            }
-        },
+        |(by, row)| modulate_row(avx2, [px, py, pb], w, by, mulv, addv, row),
     );
 
     AqMaps {
         quant_field: aq,
         mask1x1: blur_mask1x1(mask1x1, w, h, threads),
+    }
+}
+
+fn has_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// `ln(1 + x)` for `x >= 0`, written without libm calls so that it vectorises.
+/// Relative error below 1e-6 for the range used here.
+#[inline(always)]
+fn fast_ln1p(x: f32) -> f32 {
+    let y = 1.0 + x;
+    let bits = y.to_bits();
+    // Split y = m * 2^e with m in [0.75, 1.5).
+    let adj = bits.wrapping_sub(0x3f40_0000);
+    let e = (adj as i32) >> 23;
+    let m = f32::from_bits(bits.wrapping_sub((e as u32) << 23));
+    let s = (m - 1.0) / (m + 1.0);
+    let s2 = s * s;
+    let p = 1.0 + s2 * (1.0 / 3.0 + s2 * (0.2 + s2 * (1.0 / 7.0 + s2 * (1.0 / 9.0))));
+    e as f32 * std::f32::consts::LN_2 + 2.0 * s * p
+}
+
+fn mask_band(
+    avx2: bool,
+    py: &[f32],
+    w: usize,
+    h: usize,
+    qw: usize,
+    band: usize,
+    mask: &mut [f32],
+    pre: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2 {
+        // SAFETY: AVX2 support was detected at runtime.
+        return unsafe { mask_band_avx2(py, w, h, qw, band, mask, pre) };
+    }
+    let _ = avx2;
+    mask_band_impl(py, w, h, qw, band, mask, pre)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn mask_band_avx2(
+    py: &[f32],
+    w: usize,
+    h: usize,
+    qw: usize,
+    band: usize,
+    mask: &mut [f32],
+    pre: &mut [f32],
+) {
+    mask_band_impl(py, w, h, qw, band, mask, pre)
+}
+
+/// Per-pixel masking of one band of eight rows, and its 4x4 downsampled
+/// pre-erosion sums.
+#[inline(always)]
+fn mask_band_impl(
+    py: &[f32],
+    w: usize,
+    h: usize,
+    qw: usize,
+    band: usize,
+    mask: &mut [f32],
+    pre: &mut [f32],
+) {
+    const MATCH_GAMMA_OFFSET: f32 = 0.019;
+    const LIMIT: f32 = 0.2;
+    let mut diff = vec![0f32; w];
+    for ry in 0..8 {
+        let y = band * 8 + ry;
+        let y1 = y.saturating_sub(1);
+        let y2 = (y + 1).min(h - 1);
+        let row = &py[y * w..(y + 1) * w];
+        let row1 = &py[y1 * w..(y1 + 1) * w];
+        let row2 = &py[y2 * w..(y2 + 1) * w];
+        let mrow = &mut mask[ry * w..(ry + 1) * w];
+        let one = |x: usize| -> (f32, f32) {
+            let x1 = x.saturating_sub(1);
+            let x2 = (x + 1).min(w - 1);
+            let base = 0.25 * (row2[x] + row1[x] + row[x1] + row[x2]);
+            let gammac = ratio_of_derivatives(row[x] + MATCH_GAMMA_OFFSET, false);
+            let d = gammac * (row[x] - base);
+            (
+                1.0 / (fast_ln1p(d.abs()) + 0.01),
+                masking_sqrt((d * d).min(LIMIT)),
+            )
+        };
+        // Edge columns clamp their neighbours; the interior is a plain
+        // vector loop.
+        for x in [0, w - 1] {
+            (mrow[x], diff[x]) = one(x);
+        }
+        let n = w - 2;
+        let (lo, mid, hi) = (&row[..n], &row[1..=n], &row[2..=n + 1]);
+        let (u, dn) = (&row1[1..=n], &row2[1..=n]);
+        let (mo, di) = (&mut mrow[1..=n], &mut diff[1..=n]);
+        for i in 0..n {
+            let base = 0.25 * (dn[i] + u[i] + lo[i] + hi[i]);
+            let gammac = ratio_of_derivatives(mid[i] + MATCH_GAMMA_OFFSET, false);
+            let d = gammac * (mid[i] - base);
+            mo[i] = 1.0 / (fast_ln1p(d.abs()) + 0.01);
+            di[i] = masking_sqrt((d * d).min(LIMIT));
+        }
+        let prow = &mut pre[(ry / 4) * qw..(ry / 4 + 1) * qw];
+        for (p, d4) in prow.iter_mut().zip(diff.chunks_exact(4)) {
+            for &v in d4 {
+                *p += v * 0.25;
+            }
+        }
+    }
+}
+
+fn modulate_row(
+    avx2: bool,
+    planes: [&[f32]; 3],
+    w: usize,
+    by: usize,
+    mulv: f32,
+    addv: f32,
+    row: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2 {
+        // SAFETY: AVX2 support was detected at runtime.
+        return unsafe { modulate_row_avx2(planes, w, by, mulv, addv, row) };
+    }
+    let _ = avx2;
+    modulate_row_impl(planes, w, by, mulv, addv, row)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn modulate_row_avx2(
+    planes: [&[f32]; 3],
+    w: usize,
+    by: usize,
+    mulv: f32,
+    addv: f32,
+    row: &mut [f32],
+) {
+    modulate_row_impl(planes, w, by, mulv, addv, row)
+}
+
+#[inline(always)]
+fn modulate_row_impl(
+    [px, py, pb]: [&[f32]; 3],
+    w: usize,
+    by: usize,
+    mulv: f32,
+    addv: f32,
+    row: &mut [f32],
+) {
+    for bx in 0..row.len() {
+        let (x0, y0) = (bx * 8, by * 8);
+        let mut v = compute_mask(row[bx]);
+        // Gamma modulation.
+        let mut ratio = 0f32;
+        for dy in 0..8 {
+            for dx in 0..8 {
+                let i = (y0 + dy) * w + x0 + dx;
+                let iny = py[i] + 0.16;
+                let inx = px[i];
+                ratio += ratio_of_derivatives(iny - inx, true);
+                ratio += ratio_of_derivatives(iny + inx, true);
+            }
+        }
+        v += 0.100_561_33 * (ratio * (0.5 / 64.0)).log2();
+        // HF modulation.
+        let mut sum_y = 0f32;
+        for dy in 0..8 {
+            let r = (y0 + dy) * w + x0;
+            let rn = if dy == 7 { r } else { r + w };
+            for dx in 0..8 {
+                if dx < 7 {
+                    sum_y += (py[r + dx] - py[r + dx + 1]).abs().min(0.0206);
+                }
+                sum_y += (py[r + dx] - py[rn + dx]).abs().min(0.0206);
+            }
+        }
+        let hf = v + sum_y * -0.38 + 0.42;
+        // Blue modulation.
+        const LIMIT_B: f32 = 0.010_474_085;
+        let mut sum_b = 0f32;
+        for dy in 0..8 {
+            for dx in 0..8 {
+                let i = (y0 + dy) * w + x0 + dx;
+                let eff = py[i] + 0.003_199_477 + px[i].abs();
+                if pb[i] > eff {
+                    sum_b += (pb[i] - eff).min(LIMIT_B);
+                }
+            }
+        }
+        if sum_b >= 32.0 * LIMIT_B {
+            sum_b = 64.0 * LIMIT_B - sum_b;
+        }
+        sum_b = sum_b.min(15.463_398 * LIMIT_B) * 0.905_908;
+        let out = hf.min(v + sum_b);
+        row[bx] = out.exp() * mulv + addv;
     }
 }
 
@@ -391,6 +533,20 @@ fn symmetric5_out_of_place(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_ln1p_matches_libm() {
+        let mut x = 0f32;
+        while x < 40.0 {
+            let (a, b) = (fast_ln1p(x), x.ln_1p());
+            assert!(
+                (a - b).abs() <= 2e-6 * b.max(1e-2) + 1e-6,
+                "x={x}: {a} vs {b}"
+            );
+            x += 0.0137;
+        }
+        assert_eq!(fast_ln1p(0.0), 0.0);
+    }
 
     #[test]
     fn in_place_blur_matches_reference() {

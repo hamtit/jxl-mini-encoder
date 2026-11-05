@@ -543,7 +543,7 @@ fn ceil_log2(x: usize) -> usize {
     x.next_power_of_two().trailing_zeros() as usize
 }
 
-const SCRATCH_LEN: usize = 6 * 4096;
+const SCRATCH_LEN: usize = 8 * 4096;
 /// Tiles sampled when deciding whether the small transforms are worth trying.
 const PROBE_TILES: usize = 12;
 
@@ -609,7 +609,8 @@ impl Tile {
             return false;
         }
         let v0 = self.flat_val[cy * 8 + cx];
-        (cy..cy + n).all(|y| (cx..cx + n).all(|x| self.flat[y * 8 + x] && self.flat_val[y * 8 + x] == v0))
+        (cy..cy + n)
+            .all(|y| (cx..cx + n).all(|x| self.flat[y * 8 + x] && self.flat_val[y * 8 + x] == v0))
     }
 
     fn set_entropy(&mut self, cx: usize, cy: usize, acs: Acs, e: f32) {
@@ -621,6 +622,140 @@ impl Tile {
         }
         self.entropy[cy * 8 + cx] = e;
     }
+}
+
+/// Quantisation stage of `estimate` for one channel: writes the scaled
+/// rounding error to `e` and returns the number of non-zero quantised
+/// values and the lane-ordered sum of their square roots.
+#[allow(clippy::too_many_arguments)]
+fn quant_stage(
+    avx2: bool,
+    c0: &[f32],
+    c1: &[f32],
+    k: f32,
+    wt: &[f32],
+    iw: &[f32],
+    quant: f32,
+    e: &mut [f32],
+) -> (u32, f32) {
+    let n = c0.len();
+    assert!(n % 8 == 0 && c1.len() == n && wt.len() == n && iw.len() == n && e.len() == n);
+    #[cfg(target_arch = "x86_64")]
+    if avx2 {
+        // SAFETY: AVX2 support was detected at runtime; lengths checked above.
+        return unsafe { quant_stage_avx2(c0, c1, k, wt, iw, quant, e) };
+    }
+    let _ = avx2;
+    let (mut nz, mut acc) = (0u32, [0f32; 8]);
+    for i in 0..n {
+        let v = (c0[i] - k * c1[i]) * wt[i] * quant;
+        let r = v.round_ties_even();
+        e[i] = (v - r) * iw[i];
+        let q = r.abs();
+        acc[i % 8] += q.sqrt();
+        nz += u32::from(q != 0.0);
+    }
+    (nz, reduce8(&acc))
+}
+
+fn reduce8(a: &[f32; 8]) -> f32 {
+    ((a[0] + a[4]) + (a[1] + a[5])) + ((a[2] + a[6]) + (a[3] + a[7]))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn quant_stage_avx2(
+    c0: &[f32],
+    c1: &[f32],
+    k: f32,
+    wt: &[f32],
+    iw: &[f32],
+    quant: f32,
+    e: &mut [f32],
+) -> (u32, f32) {
+    use std::arch::x86_64::*;
+    let n = c0.len();
+    let (kv, qv) = (_mm256_set1_ps(k), _mm256_set1_ps(quant));
+    let (zero, absmask) = (
+        _mm256_setzero_ps(),
+        _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff)),
+    );
+    let (mut acc, mut nzv) = (zero, _mm256_setzero_si256());
+    let mut i = 0;
+    while i < n {
+        // SAFETY: i + 8 <= n and every slice has n elements.
+        unsafe {
+            let a = _mm256_loadu_ps(c0.as_ptr().add(i));
+            let b = _mm256_loadu_ps(c1.as_ptr().add(i));
+            let w = _mm256_loadu_ps(wt.as_ptr().add(i));
+            let iwv = _mm256_loadu_ps(iw.as_ptr().add(i));
+            let v = _mm256_mul_ps(_mm256_mul_ps(_mm256_sub_ps(a, _mm256_mul_ps(kv, b)), w), qv);
+            let r = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(v);
+            _mm256_storeu_ps(
+                e.as_mut_ptr().add(i),
+                _mm256_mul_ps(_mm256_sub_ps(v, r), iwv),
+            );
+            let q = _mm256_and_ps(r, absmask);
+            acc = _mm256_add_ps(acc, _mm256_sqrt_ps(q));
+            // The compare mask is all ones (-1) where q != 0.
+            let m = _mm256_castps_si256(_mm256_cmp_ps::<_CMP_NEQ_OQ>(q, zero));
+            nzv = _mm256_sub_epi32(nzv, m);
+        }
+        i += 8;
+    }
+    let mut lanes = [0f32; 8];
+    let mut nzs = [0i32; 8];
+    // SAFETY: both arrays hold eight 32-bit lanes.
+    unsafe {
+        _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+        _mm256_storeu_si256(nzs.as_mut_ptr().cast(), nzv);
+    }
+    (nzs.iter().sum::<i32>() as u32, reduce8(&lanes))
+}
+
+/// Sum of eighth powers of `(mask + off) * pix` over one row (width a
+/// multiple of 8), accumulated in f32 lanes.
+fn loss_row(avx2: bool, mrow: &[f32], prow: &[f32], off: f32) -> f64 {
+    assert!(mrow.len() % 8 == 0 && prow.len() == mrow.len());
+    #[cfg(target_arch = "x86_64")]
+    if avx2 {
+        // SAFETY: AVX2 support was detected at runtime; lengths checked above.
+        return unsafe { loss_row_avx2(mrow, prow, off) };
+    }
+    let _ = avx2;
+    let mut lacc = [0f32; 8];
+    for (i, (&m, &p)) in mrow.iter().zip(prow).enumerate() {
+        let e = (m + off) * p;
+        let e2 = e * e;
+        let e4 = e2 * e2;
+        lacc[i % 8] += e4 * e4;
+    }
+    f64::from(reduce8(&lacc))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn loss_row_avx2(mrow: &[f32], prow: &[f32], off: f32) -> f64 {
+    use std::arch::x86_64::*;
+    let ov = _mm256_set1_ps(off);
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0;
+    while i < mrow.len() {
+        // SAFETY: i + 8 <= len for both slices.
+        unsafe {
+            let m = _mm256_loadu_ps(mrow.as_ptr().add(i));
+            let p = _mm256_loadu_ps(prow.as_ptr().add(i));
+            let e = _mm256_mul_ps(_mm256_add_ps(m, ov), p);
+            let e2 = _mm256_mul_ps(e, e);
+            let e4 = _mm256_mul_ps(e2, e2);
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(e4, e4));
+        }
+        i += 8;
+    }
+    let mut lanes = [0f32; 8];
+    // SAFETY: the array holds eight f32 lanes.
+    unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), acc) };
+    f64::from(reduce8(&lanes))
 }
 
 impl<'a> Search<'a> {
@@ -778,13 +913,18 @@ impl<'a> Search<'a> {
         };
         let origin = by * 8 * inp.stride + bx * 8;
         let (coeffs, rest) = scratch.split_at_mut(3 * 4096);
-        let (err, rest) = rest.split_at_mut(4096);
-        let (pix, sq) = rest.split_at_mut(4096);
+        let (err, rest) = rest.split_at_mut(3 * 4096);
+        let pix = &mut rest[..4096];
         let mut cs = coeffs.chunks_exact_mut(4096);
         let coeffs: [&mut [f32]; 3] = std::array::from_fn(|_| cs.next().unwrap());
-        // X needs Y's coefficients; B is transformed only if the candidate
-        // survives the X and Y pruning checks.
-        for c in [1, 0] {
+        let mut es = err.chunks_exact_mut(4096);
+        let err: [&mut [f32]; 3] = std::array::from_fn(|_| es.next().unwrap());
+        // Phase 1: entropy of every channel, Y first. Each channel's cost is
+        // non-negative, so the candidate is dropped as soon as the partial
+        // sum cannot beat the incumbent -- before any inverse DCT.
+        // X needs Y's coefficients (k = cmap[0]); B is transformed last.
+        let mut entropy = 0f32;
+        for c in [1, 0, 2] {
             forward_block(
                 self.dct,
                 acs,
@@ -792,76 +932,43 @@ impl<'a> Search<'a> {
                 inp.stride,
                 coeffs[c],
             );
+            let k = inp.cmap[c];
+            let (wt, iw) = (&t.weights[c][..n], &t.inv_weights[c][..n]);
+            let (c0, c1) = (&coeffs[c][..n], &coeffs[1][..n]);
+            let e = &mut err[c][..n];
+            let (nz, sum_sqrt) = quant_stage(
+                self.dct.has_avx2(),
+                &c0[..n],
+                &c1[..n],
+                k,
+                &wt[..n],
+                &iw[..n],
+                quant,
+                e,
+            );
+            let nbits = ceil_log2(nz as usize + 1) + 1;
+            let mut ec = self.cfg.cost_delta * sum_sqrt;
+            ec += self.cfg.zeros_mul * (ceil_log2(nbits + 17) + nbits) as f32;
+            if c == 0 && nb >= 2 {
+                ec *= 1.0 + (nb as f32 / 8.0).min(3.0);
+            }
+            entropy += ec;
+            if entropy * entropy_mul >= limit {
+                return f32::INFINITY;
+            }
         }
-        let mut entropy = 0f32;
+        // Phase 2: pixel-domain distortion.
         let mut loss = 0f64;
         const MASK_OFFSET: [f32; 3] = [12.0, 0.0, 4.0];
         const CHANNEL_MUL: [f64; 3] = [27_984_208.0, 1.0, 1.266_770_081_387_4]; // 8.2^8, 1, 1.03^8
         for c in 0..3 {
-            if c == 2 {
-                forward_block(
-                    self.dct,
-                    acs,
-                    &inp.planes[2][origin..],
-                    inp.stride,
-                    coeffs[2],
-                );
-            }
-            let mut nz = 0u32;
-            let k = inp.cmap[c];
-            let (wt, iw) = (&t.weights[c][..n], &t.inv_weights[c][..n]);
-            let (c0, c1) = (&coeffs[c][..n], &coeffs[1][..n]);
-            // Element-wise part: vectorisable.
-            for i in 0..n {
-                let v = (c0[i] - k * c1[i]) * wt[i] * quant;
-                let r = v.round();
-                err[i] = (v - r) * iw[i];
-                let q = r.abs();
-                sq[i] = q.sqrt();
-                nz += u32::from(q != 0.0);
-            }
-            // Ordered sums (kept sequential so results do not depend on the
-            // vector width).
-            let mut acc = [0f32; 8];
-            let mut chunks = sq[..n].chunks_exact(8);
-            for ch in &mut chunks {
-                for j in 0..8 {
-                    acc[j] += ch[j];
-                }
-            }
-            let mut sum_sqrt =
-                ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
-            for &v in chunks.remainder() {
-                sum_sqrt += v;
-            }
-            entropy += self.cfg.cost_delta * sum_sqrt;
-            let nbits = ceil_log2(nz as usize + 1) + 1;
-            entropy += self.cfg.zeros_mul * (ceil_log2(nbits + 17) + nbits) as f32;
-            if c == 0 && nb >= 2 {
-                entropy *= 1.0 + (nb as f32 / 8.0).min(3.0);
-            }
-            // Remaining coefficient costs and distortion are non-negative.
-            // Reject only candidates that cannot beat the incumbent, before
-            // paying for their inverse DCT and pixel-domain distortion.
-            if entropy * entropy_mul >= limit {
-                return f32::INFINITY;
-            }
-            inverse_block(self.dct, acs, &err[..n], pix);
-            let mut lacc = [0f64; 4];
+            inverse_block(self.dct, acs, &err[c][..n], pix);
+            let off = MASK_OFFSET[c];
+            let mut lossc = 0f64;
             for y in 0..t.h {
                 let mrow = &inp.mask1x1[(by * 8 + y) * inp.stride + bx * 8..][..t.w];
-                let prow = &pix[y * t.w..(y + 1) * t.w];
-                let off = MASK_OFFSET[c];
-                for (mc, pc) in mrow.chunks(4).zip(prow.chunks(4)) {
-                    for j in 0..mc.len() {
-                        let e = (mc[j] + off) * pc[j];
-                        let e2 = e * e;
-                        let e4 = f64::from(e2 * e2);
-                        lacc[j] += e4 * e4;
-                    }
-                }
+                lossc += loss_row(self.dct.has_avx2(), mrow, &pix[y * t.w..(y + 1) * t.w], off);
             }
-            let lossc = (lacc[0] + lacc[2]) + (lacc[1] + lacc[3]);
             loss += lossc * CHANNEL_MUL[c];
             if c == 0 && nb >= 2 {
                 let w = 1.0 + (nb as f32 / 8.0).min(3.0);
@@ -1230,6 +1337,33 @@ pub fn adjust_quant_field(acs: &[BlockAcs], bw: usize, distance: f32, field: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lcg(seed: &mut u32) -> f32 {
+        *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (*seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+    }
+
+    #[test]
+    fn avx2_kernels_match_scalar() {
+        if !Dct::new().has_avx2() {
+            return;
+        }
+        let mut seed = 7;
+        for n in [64usize, 128, 256, 1024] {
+            let mut rnd =
+                |scale: f32| -> Vec<f32> { (0..n).map(|_| lcg(&mut seed) * scale).collect() };
+            let (c0, c1, wt, iw) = (rnd(9.0), rnd(9.0), rnd(1.0), rnd(1.0));
+            let (mut e_a, mut e_b) = (vec![0f32; n], vec![0f32; n]);
+            let a = quant_stage(true, &c0, &c1, 0.25, &wt, &iw, 1.7, &mut e_a);
+            let b = quant_stage(false, &c0, &c1, 0.25, &wt, &iw, 1.7, &mut e_b);
+            assert_eq!(a.0, b.0);
+            assert_eq!(a.1.to_bits(), b.1.to_bits());
+            assert_eq!(e_a, e_b);
+            let (m, p) = (rnd(3.0), rnd(0.4));
+            let (la, lb) = (loss_row(true, &m, &p, 4.0), loss_row(false, &m, &p, 4.0));
+            assert_eq!(la.to_bits(), lb.to_bits());
+        }
+    }
 
     #[test]
     fn bounded_search_and_probe_cache_preserve_tile_choices() {
