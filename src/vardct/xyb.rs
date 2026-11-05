@@ -178,40 +178,122 @@ pub fn gaborish_inverse(x: &mut Xyb, threads: usize) {
         [n * K[0], n * K[1], n * K[3]],
         [n * K[2], n * K[3], n * K[4]],
     ];
-    let (w, h) = (x.w, x.h);
-    let mirror = |v: isize, len: usize| -> usize {
-        let l = len as isize;
-        let mut v = v;
-        while v < 0 || v >= l {
-            v = if v < 0 { -v - 1 } else { 2 * l - 1 - v };
-        }
-        v as usize
-    };
     for plane in &mut x.planes {
-        let src = std::mem::take(plane);
-        let mut dst = vec![0f32; w * h];
-        const BAND: usize = 8;
-        let tasks: Vec<_> = dst.chunks_mut(w * BAND).enumerate().collect();
-        par_tasks(tasks, threads, |(bi, out)| {
-            let mut s = [vec![0f32; w], vec![0f32; w], vec![0f32; w]];
+        *plane = gaborish_plane(std::mem::take(plane), x.w, x.h, &wt, threads);
+    }
+}
+
+fn mirror(mut v: isize, len: usize) -> usize {
+    let len = len as isize;
+    while v < 0 || v >= len {
+        v = if v < 0 { -v - 1 } else { 2 * len - 1 - v };
+    }
+    v as usize
+}
+
+/// Sharpen in place using five original rows per band. Snapshot the halos
+/// before starting workers so no band reads a neighbour's overwritten pixels.
+/// Workspace scales with width * workers, not the image area.
+fn gaborish_plane(
+    mut src: Vec<f32>,
+    w: usize,
+    h: usize,
+    wt: &[[f32; 3]; 3],
+    threads: usize,
+) -> Vec<f32> {
+    let band_rows = h.div_ceil(threads.max(1)).max(8);
+    // Halos (4), ring (5, of which 2 reuse halos), row sums (3).
+    if h <= 10 * h.div_ceil(band_rows) {
+        return gaborish_out_of_place(&src, w, h, wt, threads);
+    }
+    let halos: Vec<[Vec<f32>; 4]> = (0..h)
+        .step_by(band_rows)
+        .map(|start| {
+            let end = (start + band_rows).min(h);
+            [
+                start as isize - 2,
+                start as isize - 1,
+                end as isize,
+                end as isize + 1,
+            ]
+            .map(|y| {
+                let y = mirror(y, h);
+                src[y * w..(y + 1) * w].to_vec()
+            })
+        })
+        .collect();
+    par_tasks(
+        src.chunks_mut(w * band_rows).zip(halos).collect(),
+        threads,
+        |(chunk, [top2, top1, bottom1, bottom2])| {
+            let rows = chunk.len() / w;
+            let mut ring = [top2, top1, vec![0.0; w], vec![0.0; w], vec![0.0; w]];
+            for i in 0..3 {
+                let row = if i < rows {
+                    &chunk[i * w..(i + 1) * w]
+                } else if i == rows {
+                    &bottom1
+                } else {
+                    &bottom2
+                };
+                ring[i + 2].copy_from_slice(row);
+            }
+            let mut s = [vec![0.0; w], vec![0.0; w], vec![0.0; w]];
+            for y in 0..rows {
+                let r: [&[f32]; 5] = std::array::from_fn(|i| ring[(y + i) % 5].as_slice());
+                for i in 0..w {
+                    s[0][i] = r[2][i];
+                    s[1][i] = r[1][i] + r[3][i];
+                    s[2][i] = r[0][i] + r[4][i];
+                }
+                gaborish_row(&s, wt, &mut chunk[y * w..(y + 1) * w], mirror);
+                if y + 1 < rows {
+                    let next = y + 3;
+                    let row = if next < rows {
+                        &chunk[next * w..(next + 1) * w]
+                    } else if next == rows {
+                        &bottom1
+                    } else {
+                        &bottom2
+                    };
+                    ring[y % 5].copy_from_slice(row);
+                }
+            }
+        },
+    );
+    src
+}
+
+fn gaborish_out_of_place(
+    src: &[f32],
+    w: usize,
+    h: usize,
+    wt: &[[f32; 3]; 3],
+    threads: usize,
+) -> Vec<f32> {
+    let mut dst = vec![0.0; w * h];
+    par_tasks(
+        dst.chunks_mut(w * 8).enumerate().collect(),
+        threads,
+        |(bi, out)| {
+            let mut s = [vec![0.0; w], vec![0.0; w], vec![0.0; w]];
             for (ry, orow) in out.chunks_mut(w).enumerate() {
-                let y = bi * BAND + ry;
+                let y = bi * 8 + ry;
                 let r = |d: isize| {
                     let i = mirror(y as isize + d, h);
                     &src[i * w..(i + 1) * w]
                 };
                 let (rm2, rm1, r0, rp1, rp2) = (r(-2), r(-1), r(0), r(1), r(2));
-                // Rows at equal vertical distance share weights: add them first.
                 for i in 0..w {
                     s[0][i] = r0[i];
                     s[1][i] = rm1[i] + rp1[i];
                     s[2][i] = rm2[i] + rp2[i];
                 }
-                gaborish_row(&s, &wt, orow, mirror);
+                gaborish_row(&s, wt, orow, mirror);
             }
-        });
-        *plane = dst;
-    }
+        },
+    );
+    dst
 }
 
 #[inline(always)]
@@ -280,7 +362,40 @@ fn gaborish_row(
 
 #[cfg(test)]
 mod tests {
-    use super::fast_cbrt;
+    use super::*;
+
+    #[test]
+    fn in_place_gaborish_matches_reference() {
+        let wt = [
+            [1.2, -0.1, 0.015],
+            [-0.1, -0.04, -0.002],
+            [0.015, -0.002, 0.007],
+        ];
+        for (w, h) in [
+            (1, 1),
+            (1, 37),
+            (2, 65),
+            (3, 33),
+            (8, 8),
+            (31, 67),
+            (193, 129),
+        ] {
+            let src: Vec<f32> = (0..w * h)
+                .map(|i| ((i * 1237 % 65521) as f32 - 17000.0) / 257.0)
+                .collect();
+            let expected = gaborish_out_of_place(&src, w, h, &wt, 1);
+            for threads in [1, 2, 3, 4, 8, 100] {
+                let actual = gaborish_plane(src.clone(), w, h, &wt, threads);
+                assert!(
+                    actual
+                        .iter()
+                        .zip(&expected)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{w}x{h} t{threads}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn fast_cbrt_accurate() {

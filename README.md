@@ -59,6 +59,11 @@ cargo test --release                 # jxl-oxide でラウンドトリップ（�
 cargo run --release --example eval -- -q 90 -e 7 image.png   # サイズ・PSNR・SSIMULACRA2
 ```
 
+ピークメモリを比較するときは、先に `cargo build --release --example eval` を実行し、
+`/usr/bin/time -v target/release/examples/eval --encode-only ...` で直接バイナリを計測してください。
+`--encode-only` は復号・画質指標の計算を省き、入力読み込みとエンコーダのみのプロセスRSSを測定できます。
+出力サイズ・エンコード時間・出力ハッシュも表示します。
+
 ライセンスは libjxl に合わせて BSD-3-Clause です。
 
 ## CI・リリース

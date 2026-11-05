@@ -1,7 +1,11 @@
 //! Encode images, decode them back with jxl-oxide and report size and
 //! fidelity.
 //!
-//!   cargo run --release --example eval -- [-q QUALITY | -l] [-e EFFORT] [-t THREADS] FILE...
+//!   cargo run --release --example eval -- [-q QUALITY | -l] [-e EFFORT] [-t THREADS] [--encode-only] FILE...
+//!
+//! `--encode-only` skips decoding and fidelity metrics, allowing external peak-RSS
+//! measurements to isolate the encoder (plus input loading). It prints an output
+//! hash to check bit-exactness between implementations.
 
 use std::time::Instant;
 
@@ -86,9 +90,11 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut enc = jxl_mini_encoder::Encoder::new();
     let mut lossless = false;
+    let mut encode_only = false;
     let mut files = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--encode-only" => encode_only = true,
             "-q" => enc = enc.quality(args.next().unwrap().parse().unwrap()),
             "-d" => enc = enc.distance(args.next().unwrap().parse().unwrap()),
             "-l" => {
@@ -137,6 +143,13 @@ fn main() {
             let name = f.rsplit('/').next().unwrap();
             std::fs::write(format!("{dir}/{name}.jxl"), &jxl).unwrap();
         }
+        if encode_only {
+            let hash = jxl.iter().fold(0xcbf29ce484222325u64, |h, &b| {
+                (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+            });
+            println!("{f}: {} B {ms:.3} ms hash={hash:016x}", jxl.len());
+            continue;
+        }
         let out = decode(&jxl, ch);
         if let Ok(dir) = std::env::var("DUMP") {
             let name = f.rsplit('/').next().unwrap();
@@ -173,6 +186,9 @@ fn main() {
         tot_bytes += jxl.len();
         tot_px += (w * h) as usize;
         tot_ms += ms;
+    }
+    if encode_only {
+        return;
     }
     println!(
         "total {tot_bytes} B, {:.3} bpp, {tot_ms:.0} ms, mean ssim2 {:.2}",
