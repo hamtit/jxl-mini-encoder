@@ -649,7 +649,7 @@ fn quant_stage(
     let (mut nz, mut acc) = (0u32, [0f32; 8]);
     for i in 0..n {
         let v = (c0[i] - k * c1[i]) * wt[i] * quant;
-        let r = (v + 12_582_912.0) - 12_582_912.0;
+        let r = v.round_ties_even();
         e[i] = (v - r) * iw[i];
         let q = r.abs();
         acc[i % 8] += q.sqrt();
