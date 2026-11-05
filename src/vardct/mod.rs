@@ -12,7 +12,7 @@ pub(crate) mod xyb;
 
 use crate::bit_writer::BitWriter;
 use crate::bit_writer::U32Dist::{Bits, Val};
-use crate::bit_writer::ceil_log2;
+use crate::bit_writer::{ceil_log2, pack_f16, unpack_f16};
 use crate::entropy::{CodeOptions, EntropyCode, Token, pack_signed};
 use crate::headers::{Encoding, FrameInfo, GROUP_DIM, Layout, write_frame_header, write_sections};
 use crate::modular::{Channel, GlobalTree, ModularOptions, write_header, write_standalone};
@@ -244,7 +244,7 @@ struct GroupOut {
     /// (block index in the whole image, new raw quantiser value)
     raw_updates: Vec<(usize, u8)>,
     /// Decoded X, Y, B of the group before the loop filters (gbw*8 wide).
-    recon: [Vec<f32>; 3],
+    recon: [Vec<u16>; 3],
 }
 
 impl Ctx<'_> {
@@ -361,8 +361,8 @@ impl Ctx<'_> {
         }
         // Pass 3: quantise X and B and emit tokens in block order.
         let rstride = gbw * 8;
-        let mut recon: [Vec<f32>; 3] = if self.recon {
-            std::array::from_fn(|_| vec![0f32; rstride * gbh * 8])
+        let mut recon: [Vec<u16>; 3] = if self.recon {
+            std::array::from_fn(|_| vec![0u16; rstride * gbh * 8])
         } else {
             Default::default()
         };
@@ -434,7 +434,12 @@ impl Ctx<'_> {
                     acs::inverse_block(self.dct, blk.acs, &rc[c][..n], &mut pix[..n]);
                     for y in 0..ph {
                         let dst = (blk.by * 8 + y) * rstride + blk.bx * 8;
-                        recon[c][dst..dst + pw].copy_from_slice(&pix[y * pw..(y + 1) * pw]);
+                        for (o, &v) in recon[c][dst..dst + pw]
+                            .iter_mut()
+                            .zip(&pix[y * pw..(y + 1) * pw])
+                        {
+                            *o = pack_f16(v);
+                        }
                     }
                 }
             }
@@ -1047,7 +1052,12 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
                 let (gx, gy, gw, _) = layout.group_rect(g);
                 let rw = gw.div_ceil(8) * 8;
                 let ly = y - gy;
-                dst[gx..gx + rw].copy_from_slice(&groups[g].recon[c][ly * rw..(ly + 1) * rw]);
+                for (o, &v) in dst[gx..gx + rw]
+                    .iter_mut()
+                    .zip(&groups[g].recon[c][ly * rw..(ly + 1) * rw])
+                {
+                    *o = unpack_f16(v);
+                }
             }
         };
         let orig_rows = |by0: usize, by1: usize| -> [Vec<f32>; 3] {
