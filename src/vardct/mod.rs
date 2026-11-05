@@ -947,10 +947,6 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
         && d >= 0.5
         && !mask1x1.is_empty()
         && std::env::var_os("MINI_NO_DYNAMIC_EPF").is_none();
-    let epf_orig: Option<[Vec<f32>; 3]> = dynamic_epf.then(|| {
-        let mut planes = par_map(3, opts.threads, |c| xyb.planes[c].clone()).into_iter();
-        std::array::from_fn(|_| planes.next().unwrap())
-    });
     if gaborish {
         xyb::gaborish_inverse(&mut xyb, opts.threads);
     }
@@ -1039,40 +1035,38 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
             quantizer.raw[i] = r;
         }
     }
-    let epf_map: Option<Vec<u8>> = epf_orig.map(|orig| {
-        let mut rec = epf::Planes {
-            w: xyb_w,
-            h: xyb_h,
-            p: std::array::from_fn(|_| vec![0f32; xyb_w * xyb_h]),
-        };
-        // Stitch the group reconstructions into full planes: one task per
-        // channel and group row, each owning its rows of the plane.
-        let recons: Vec<[Vec<f32>; 3]> = groups
-            .iter_mut()
-            .map(|g| std::mem::take(&mut g.recon))
-            .collect();
-        let tasks: Vec<(usize, usize, &mut [f32])> = rec
-            .p
-            .iter_mut()
-            .enumerate()
-            .flat_map(|(c, plane)| {
-                plane
-                    .chunks_mut(GROUP_DIM * xyb_w)
-                    .enumerate()
-                    .map(move |(r, rows)| (c, r, rows))
-            })
-            .collect();
-        crate::parallel::par_tasks(tasks, opts.threads, |(c, r, rows)| {
-            for g in (0..ng).filter(|&g| layout.group_rect(g).1 == r * GROUP_DIM) {
-                let (gx, _, gw, gh) = layout.group_rect(g);
-                let (rw, rh) = (gw.div_ceil(8) * 8, gh.div_ceil(8) * 8);
-                for y in 0..rh {
-                    let dst = y * xyb_w + gx;
-                    rows[dst..dst + rw].copy_from_slice(&recons[g][c][y * rw..(y + 1) * rw]);
-                }
+    let epf_map: Option<Vec<u8>> = dynamic_epf.then(|| {
+        // The decoded image is read straight from the group reconstructions,
+        // one row at a time, and the original XYB of each strip is
+        // recomputed from the input pixels, so neither is held as a
+        // full-size plane.
+        let recon_row = |c: usize, y: usize, dst: &mut [f32]| {
+            let gr = y / GROUP_DIM;
+            for gxi in 0..layout.groups_x {
+                let g = gr * layout.groups_x + gxi;
+                let (gx, gy, gw, _) = layout.group_rect(g);
+                let rw = gw.div_ceil(8) * 8;
+                let ly = y - gy;
+                dst[gx..gx + rw].copy_from_slice(&groups[g].recon[c][ly * rw..(ly + 1) * rw]);
             }
-        });
-        drop(recons);
+        };
+        let orig_rows = |by0: usize, by1: usize| -> [Vec<f32>; 3] {
+            let (y0, y1) = (by0 * 8, (by1 * 8).min(h));
+            let ch = img.channels();
+            let mut x = Xyb::from_srgb8(
+                &img.data[y0 * w * ch..y1 * w * ch],
+                ch,
+                w,
+                y1 - y0,
+                xyb_w,
+                (by1 - by0) * 8,
+                1,
+            );
+            if let Some(p) = &patches {
+                p.subtract_rows(&mut x.planes, xyb_w, y0, (by1 - by0) * 8);
+            }
+            x.planes
+        };
         let scale = quantizer.scale();
         let quant: Vec<f32> = (0..bw * bh)
             .map(|i| {
@@ -1082,7 +1076,7 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
             })
             .collect();
         let input = epf::Input {
-            orig: [&orig[0], &orig[1], &orig[2]],
+            orig: &orig_rows,
             mask1x1: &mask1x1,
             quant: &quant,
             w: xyb_w,
@@ -1091,8 +1085,11 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
             iters: params.epf_iters,
             gaborish,
         };
-        epf::choose(&input, &rec, opts.threads)
+        epf::choose(&input, &recon_row, opts.threads)
     });
+    for g in &mut groups {
+        g.recon = Default::default();
+    }
     drop(mask1x1);
 
     // Colour-correlation maps, one entry per 64x64 tile.
