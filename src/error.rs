@@ -3,9 +3,21 @@ use std::fmt;
 /// Encoding errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    InvalidDimensions { width: u32, height: u32 },
-    BufferSize { expected: usize, actual: usize },
+    InvalidDimensions {
+        width: u32,
+        height: u32,
+    },
+    BufferSize {
+        expected: usize,
+        actual: usize,
+    },
     Unsupported(&'static str),
+    /// An animation without frames.
+    NoFrames,
+    /// Frames differ in size or in having alpha.
+    FrameMismatch,
+    /// Ticks per second numerator or denominator is zero or too large.
+    InvalidAnimation,
 }
 
 impl fmt::Display for Error {
@@ -18,6 +30,9 @@ impl fmt::Display for Error {
                 write!(f, "pixel buffer has {actual} bytes, expected {expected}")
             }
             Error::Unsupported(what) => write!(f, "unsupported: {what}"),
+            Error::NoFrames => write!(f, "animation has no frames"),
+            Error::FrameMismatch => write!(f, "animation frames differ in size or alpha"),
+            Error::InvalidAnimation => write!(f, "animation tick rate is out of range"),
         }
     }
 }

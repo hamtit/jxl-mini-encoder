@@ -10,7 +10,7 @@ libjxl のエンコード処理・ヒューリスティクス・定数を元に�
 - 非可逆: VarDCT（XYB、適応量子化、DCT8〜DCT64 の可変ブロック、EPF、パッチ）
 - 可逆（品質 100）: Modular（RCT 選択、MA 木学習、重み付き予測器）
 - effort 1–10、スレッド数指定
-- 出力: 裸のコードストリーム（`FF 0A`）。ICC・アニメーション・プログレッシブ・デコーダは対象外
+- 出力: 裸のコードストリーム（`FF 0A`）。アニメーション（全面フレーム）に対応。ICC・プログレッシブ・デコーダは対象外
 
 ## 使い方
 
@@ -22,6 +22,29 @@ let jxl = jxl_mini_encoder::Encoder::new()
     .threads(4)
     .encode(&image)?;
 ```
+
+## アニメーション
+
+デコード済みの GIF などのフレーム列を、アニメーション対応 JXL にエンコードできます。各フレームは合成済みのキャンバス全体（同じサイズ・同じアルファ有無）で渡してください。フレームは互いに独立して符号化し（置換ブレンド、切り出し・フレーム間予測なし）、非可逆・可逆は距離の指定で全フレーム共通に決まります。
+
+```rust
+use jxl_mini_encoder::{AnimationFrame, AnimationOptions, Encoder, ImageRef};
+
+let frames: Vec<AnimationFrame> = decoded_gif_frames
+    .iter()
+    .map(|f| AnimationFrame {
+        image: ImageRef::rgba8(width, height, &f.rgba).unwrap(),
+        duration: f.delay_cs, // 既定は 100 tick/秒なので GIF の遅延（1/100 秒）をそのまま指定
+    })
+    .collect();
+let jxl = Encoder::new()
+    .quality(80.0)
+    .encode_animation(&frames, &AnimationOptions::default())?; // num_loops: 0 = 無限ループ
+```
+
+PNG 連番から試すには `cargo run --release --example anim -- -q 80 -e 7 --delay 6 -o out.jxl frames/*.png` を使います（復号して SSIMULACRA2 も表示します）。
+
+`duration` が 0 のフレームは次のフレームと同時に表示されるレイヤになり、デコーダは単独の表示フレームとして扱いません。GIF の遅延 0 は、ブラウザと同様に 10（1/10 秒）などへ置き換えてから渡してください。
 
 ## パラメータの扱い
 
