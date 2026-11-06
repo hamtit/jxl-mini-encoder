@@ -240,7 +240,8 @@ pub struct AnimationFrame<'a> {
 /// Timing and looping of an animation.
 #[derive(Clone, Copy, Debug)]
 pub struct AnimationOptions {
-    /// Ticks per second is `tps_numerator / tps_denominator`.
+    /// Ticks per second is `tps_numerator / tps_denominator`. The numerator
+    /// must be in 1..=2^30 and the denominator in 1..=1024.
     pub tps_numerator: u32,
     pub tps_denominator: u32,
     /// Number of loops; 0 repeats forever.
@@ -271,7 +272,8 @@ pub fn encode_animation(
     opts: &EncoderOptions,
 ) -> Result<Vec<u8>, Error> {
     let first = frames.first().ok_or(Error::NoFrames)?;
-    if anim.tps_numerator == 0 || anim.tps_denominator == 0 {
+    // The header can store a numerator up to 2^30 and a denominator up to 1024.
+    if !(1..=1 << 30).contains(&anim.tps_numerator) || !(1..=1024).contains(&anim.tps_denominator) {
         return Err(Error::InvalidAnimation);
     }
     for f in frames {

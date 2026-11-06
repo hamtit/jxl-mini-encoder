@@ -524,3 +524,37 @@ fn animation_zero_duration_frame_is_not_a_keyframe() {
     assert!(image.render_frame(1).is_ok());
     assert!(image.render_frame(2).is_err());
 }
+
+#[test]
+fn animation_rejects_unrepresentable_tick_rate() {
+    let a = vec![0u8; 3];
+    let frames = [jxl_mini_encoder::AnimationFrame {
+        image: jxl_mini_encoder::ImageRef::rgb8(1, 1, &a).unwrap(),
+        duration: 1,
+    }];
+    let opts = jxl_mini_encoder::EncoderOptions::default();
+    for (num, den) in [
+        (0, 1),
+        (1, 0),
+        (100, 2000),
+        (u32::MAX, 1),
+        ((1 << 30) + 1, 1),
+    ] {
+        let anim = jxl_mini_encoder::AnimationOptions {
+            tps_numerator: num,
+            tps_denominator: den,
+            num_loops: 0,
+        };
+        assert_eq!(
+            jxl_mini_encoder::encode_animation(&frames, &anim, &opts),
+            Err(jxl_mini_encoder::Error::InvalidAnimation),
+            "{num}/{den}"
+        );
+    }
+    let max = jxl_mini_encoder::AnimationOptions {
+        tps_numerator: 1 << 30,
+        tps_denominator: 1024,
+        num_loops: u32::MAX,
+    };
+    assert!(jxl_mini_encoder::encode_animation(&frames, &max, &opts).is_ok());
+}

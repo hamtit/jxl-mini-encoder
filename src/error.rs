@@ -16,7 +16,7 @@ pub enum Error {
     NoFrames,
     /// Frames differ in size or in having alpha.
     FrameMismatch,
-    /// Ticks per second numerator or denominator is zero.
+    /// Ticks per second numerator or denominator is zero or too large.
     InvalidAnimation,
 }
 
@@ -32,7 +32,7 @@ impl fmt::Display for Error {
             Error::Unsupported(what) => write!(f, "unsupported: {what}"),
             Error::NoFrames => write!(f, "animation has no frames"),
             Error::FrameMismatch => write!(f, "animation frames differ in size or alpha"),
-            Error::InvalidAnimation => write!(f, "animation tick rate must be non-zero"),
+            Error::InvalidAnimation => write!(f, "animation tick rate is out of range"),
         }
     }
 }
