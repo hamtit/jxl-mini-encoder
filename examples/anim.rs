@@ -117,9 +117,13 @@ fn main() {
         let k = starts.partition_point(|&s| s <= i as u32 * delay) - 1;
         if cache.as_ref().is_none_or(|c| c.0 != k) {
             let fb = image.render_frame(k).expect("render").image_all_channels();
+            // Blended animations carry an alpha channel even for RGB input;
+            // keep only the channels of the source.
+            let dch = fb.channels();
             let px: Vec<u8> = fb
                 .buf()
-                .iter()
+                .chunks_exact(dch)
+                .flat_map(|p| p[..ch].iter())
                 .map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
                 .collect();
             cache = Some((k, px));
