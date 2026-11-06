@@ -30,12 +30,19 @@ pub struct FramePlacement {
     /// Display time in ticks; `None` for a still image.
     pub duration: Option<u32>,
     pub is_last: bool,
+    /// Save the blended canvas in slot 1 for the next frame to build on.
+    pub save: bool,
+    /// The frame covers only this canvas rectangle (x0, y0) and replaces it
+    /// on top of the canvas saved in slot 1. Its size is the image's size.
+    pub crop: Option<(u32, u32)>,
 }
 
 impl FramePlacement {
     pub const STILL: FramePlacement = FramePlacement {
         duration: None,
         is_last: true,
+        save: false,
+        crop: None,
     };
 }
 
@@ -141,6 +148,8 @@ pub struct FrameInfo {
     pub skip_lf_smoothing: bool,
     /// The frame carries a patch dictionary.
     pub patches: bool,
+    /// Noise synthesis LUT (10 bit entries); the parameters follow in LfGlobal.
+    pub noise: Option<[u16; 8]>,
     /// A patch reference frame of this size, saved in slot 3 and not shown.
     pub reference: Option<(u32, u32)>,
     pub placement: FramePlacement,
@@ -150,14 +159,18 @@ pub const GROUP_DIM: usize = 256;
 /// Group size shift for modular frames (128 << 1 = 256).
 const GROUP_SIZE_SHIFT: u32 = 1;
 
-pub fn write_frame_header(w: &mut BitWriter, f: &FrameInfo) {
+pub fn write_frame_header(w: &mut BitWriter, f: &FrameInfo, size: (u32, u32)) {
     w.write_bool(false); // all_default
     let is_ref = f.reference.is_some();
     w.write(2, if is_ref { 2 } else { 0 }); // reference only / regular frame
     let modular = matches!(f.encoding, Encoding::Modular);
     w.write(1, u64::from(modular));
     // flags: kPatches = 2, kSkipAdaptiveDCSmoothing = 128
-    w.write_u64(u64::from(f.patches) * 2 + if f.skip_lf_smoothing { 128 } else { 0 });
+    w.write_u64(
+        u64::from(f.noise.is_some())
+            + u64::from(f.patches) * 2
+            + if f.skip_lf_smoothing { 128 } else { 0 },
+    );
     if !f.xyb {
         w.write_bool(false); // do_ycbcr
     }
@@ -191,19 +204,38 @@ pub fn write_frame_header(w: &mut BitWriter, f: &FrameInfo) {
             w.write_bool(true); // save_before_color_transform
         }
         None => {
-            w.write_bool(false); // have_crop
+            let place = f.placement;
+            let coord = [Bits(8, 0), Bits(11, 256), Bits(14, 2304), Bits(30, 18688)];
+            w.write_bool(place.crop.is_some()); // have_crop
+            if let Some((x0, y0)) = place.crop {
+                // x0 / y0 are signed (zig-zag packed); width / height are not.
+                w.write_u32(x0 * 2, coord);
+                w.write_u32(y0 * 2, coord);
+                w.write_u32(size.0, coord);
+                w.write_u32(size.1, coord);
+            }
             let blend_mode = [Val(0), Val(1), Val(2), Bits(2, 3)];
-            w.write_u32(0, blend_mode); // replace
+            // Replace blending; a cropped frame is drawn onto slot 1, which
+            // then also needs its source written.
+            let source = if place.crop.is_some() { 1 } else { 0 };
+            w.write_u32(0, blend_mode);
+            if place.crop.is_some() {
+                w.write(2, source);
+            }
             for _ in 0..f.num_extra {
                 w.write_u32(0, blend_mode);
+                if place.crop.is_some() {
+                    w.write(2, source);
+                }
             }
-            if let Some(d) = f.placement.duration {
+            if let Some(d) = place.duration {
                 w.write_u32(d, [Val(0), Val(1), Bits(8, 0), Bits(32, 0)]);
             }
-            w.write_bool(f.placement.is_last);
-            if !f.placement.is_last {
-                w.write_u32(0, [Val(0), Val(1), Val(2), Val(3)]); // save_as_reference
-                if f.placement.duration == Some(0) {
+            w.write_bool(place.is_last);
+            if !place.is_last {
+                w.write_u32(u32::from(place.save), [Val(0), Val(1), Val(2), Val(3)]); // save_as_reference
+                // Only a frame that replaces the whole canvas carries this flag.
+                if place.crop.is_none() && (place.duration == Some(0) || place.save) {
                     w.write_bool(false); // save_before_color_transform
                 }
             }

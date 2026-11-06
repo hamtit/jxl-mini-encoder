@@ -105,6 +105,11 @@ pub struct EncoderOptions {
     pub effort: u32,
     /// Worker threads (1 = encode on the calling thread).
     pub threads: usize,
+    /// Strength of decoder-side noise synthesis for lossy coding: 0 turns it
+    /// off, 1 restores the noise that coding is estimated to remove. It makes
+    /// noisy sources (video, dithered GIFs) look less smooth, but the added
+    /// noise is not the source's noise, so SSIMULACRA2 drops.
+    pub noise: f32,
 }
 
 impl Default for EncoderOptions {
@@ -113,6 +118,7 @@ impl Default for EncoderOptions {
             distance: 1.0,
             effort: 7,
             threads: 1,
+            noise: 0.0,
         }
     }
 }
@@ -159,6 +165,12 @@ impl Encoder {
     /// Worker thread count; zero is normalized to one.
     pub fn threads(mut self, threads: usize) -> Self {
         self.opts.threads = threads.max(1);
+        self
+    }
+
+    /// Noise synthesis strength (see [`EncoderOptions::noise`]); 0 = off.
+    pub fn noise(mut self, strength: f32) -> Self {
+        self.opts.noise = strength.clamp(0.0, 4.0);
         self
     }
 
@@ -303,19 +315,146 @@ pub fn encode_animation(
     // Decide the noise-dependent tools once for the whole animation so that
     // frames near the threshold do not flip between settings (visible flicker).
     let noise = (!lossless).then(|| {
-        let mut levels: Vec<u32> = frames.iter().map(|f| vardct::noise_level(&f.image)).collect();
+        let mut levels: Vec<u32> = frames
+            .iter()
+            .map(|f| vardct::noise_level(&f.image))
+            .collect();
         levels.sort_unstable();
         levels[levels.len() / 2]
     });
-    for (i, f) in frames.iter().enumerate() {
+    let plan = plan_frames(frames, if lossless { 0 } else { INTERFRAME_TOLERANCE });
+    let last = plan.len() - 1;
+    let mut crop_buf = Vec::new();
+    for (k, step) in plan.iter().enumerate() {
+        let src = &frames[step.index].image;
         let placement = FramePlacement {
-            duration: Some(f.duration),
-            is_last: i + 1 == frames.len(),
+            duration: Some(step.duration),
+            is_last: k == last,
+            save: k != last,
+            crop: step.rect.map(|(x, y, _, _)| (x, y)),
         };
-        encode_frame(&f.image, &opts, placement, noise, &mut w);
+        match step.rect {
+            None => encode_frame(src, &opts, placement, noise, &mut w),
+            Some((x, y, rw, rh)) => {
+                let ch = src.channels();
+                crop_buf.clear();
+                for row in y..y + rh {
+                    let o = (row as usize * src.width as usize + x as usize) * ch;
+                    crop_buf.extend_from_slice(&src.data[o..o + rw as usize * ch]);
+                }
+                let part = ImageRef {
+                    width: rw,
+                    height: rh,
+                    alpha: src.alpha,
+                    data: &crop_buf,
+                };
+                encode_frame(&part, &opts, placement, noise, &mut w);
+            }
+        }
     }
     Ok(w.finish())
 }
 
 /// Version of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Largest per-channel difference (8 bit) to the pixel last coded at the same
+/// place that lossy inter-frame prediction still reuses unchanged. Lossless
+/// coding reuses only identical pixels.
+const INTERFRAME_TOLERANCE: u8 = 2;
+
+/// One coded frame of an animation: which input it comes from, how long it is
+/// shown, and the canvas rectangle (x, y, w, h) it covers (`None`: all of it).
+struct PlannedFrame {
+    index: usize,
+    duration: u32,
+    rect: Option<(u32, u32, u32, u32)>,
+}
+
+/// Inter-frame prediction: a frame that differs from the canvas only in a
+/// part is coded as that part alone (blocks of 8x8), replacing it on top of
+/// the previous canvas. Pixels are compared with what was last coded at the
+/// same place, so small changes cannot add up. A frame without any change
+/// only extends the display time of the previous one.
+fn plan_frames(frames: &[AnimationFrame], tolerance: u8) -> Vec<PlannedFrame> {
+    let full = |index: usize| PlannedFrame {
+        index,
+        duration: frames[index].duration,
+        rect: None,
+    };
+    // Zero-duration frames are layers of the next frame; keep them as given.
+    if frames.iter().any(|f| f.duration == 0) || std::env::var_os("MINI_NO_INTERFRAME").is_some() {
+        return (0..frames.len()).map(full).collect();
+    }
+    let first = &frames[0].image;
+    let (w, h, ch) = (
+        first.width as usize,
+        first.height as usize,
+        first.channels(),
+    );
+    let mut canvas = first.data.to_vec();
+    let mut plan = vec![full(0)];
+    for (index, f) in frames.iter().enumerate().skip(1) {
+        let data = f.image.data;
+        let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
+        for y in 0..h {
+            let row = y * w * ch;
+            let (a, b) = (&canvas[row..row + w * ch], &data[row..row + w * ch]);
+            if a == b {
+                continue;
+            }
+            // Alpha is coded losslessly, so it is compared exactly.
+            let changed = |x: usize| {
+                (0..ch).any(|c| {
+                    let tol = if ch == 4 && c == 3 { 0 } else { tolerance };
+                    a[x * ch + c].abs_diff(b[x * ch + c]) > tol
+                })
+            };
+            if let Some(l) = (0..w).find(|&x| changed(x)) {
+                let r = (0..w).rfind(|&x| changed(x)).unwrap_or(l);
+                x0 = x0.min(l);
+                x1 = x1.max(r + 1);
+                y0 = y0.min(y);
+                y1 = y1.max(y + 1);
+            }
+        }
+        if x1 == 0 {
+            let prev = plan.last_mut().unwrap();
+            if let Some(sum) = prev.duration.checked_add(f.duration) {
+                prev.duration = sum;
+                continue;
+            }
+            // The merged time would not fit the header: show this frame on
+            // its own, coded as a single block (or whole, if that is all of it).
+            let (bw, bh) = (w.min(8), h.min(8));
+            let rect = (bw < w || bh < h).then_some((0, 0, bw as u32, bh as u32));
+            for y in 0..bh {
+                canvas[y * w * ch..(y * w + bw) * ch]
+                    .copy_from_slice(&data[y * w * ch..(y * w + bw) * ch]);
+            }
+            plan.push(PlannedFrame {
+                index,
+                duration: f.duration,
+                rect,
+            });
+            continue;
+        }
+        let (x0, y0) = (x0 & !7, y0 & !7);
+        let (x1, y1) = (x1.next_multiple_of(8).min(w), y1.next_multiple_of(8).min(h));
+        let rect = (x1 - x0) * (y1 - y0) * 10 < w * h * 9;
+        if rect {
+            for y in y0..y1 {
+                let o = (y * w + x0) * ch;
+                canvas[o..o + (x1 - x0) * ch].copy_from_slice(&data[o..o + (x1 - x0) * ch]);
+            }
+        } else {
+            canvas.copy_from_slice(data);
+        }
+        plan.push(PlannedFrame {
+            index,
+            duration: f.duration,
+            rect: rect.then_some((x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)),
+        });
+    }
+    plan
+}

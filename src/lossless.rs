@@ -156,10 +156,11 @@ pub fn encode(
         epf_iters: 0,
         skip_lf_smoothing: false,
         patches: false,
+        noise: None,
         reference: None,
         placement,
     };
-    write_frame_header(out, &frame);
+    write_frame_header(out, &frame, (w as u32, h as u32));
     let layout = Layout::new(w, h);
     if w <= GROUP_DIM && h <= GROUP_DIM {
         let channels = load_group(img, (0, 0, w, h), rct);

@@ -2,7 +2,7 @@
 //! decode it back with jxl-oxide and report size, time and SSIMULACRA2.
 //!
 //!   cargo run --release --example anim -- [-q QUALITY | -d DIST | -l] [-e EFFORT] [-t THREADS]
-//!       [--delay CS] [-o OUT.jxl] [--no-decode] [--dump DIR] FRAME.png...
+//!       [--noise STRENGTH] [--delay CS] [-o OUT.jxl] [--no-decode] [--dump DIR] FRAME.png...
 //!
 //! `--delay` is the display time of every frame in 1/100 s (default 10, minimum 1).
 //! `--dump DIR` writes the decoded frames as PNG files for visual inspection.
@@ -54,6 +54,7 @@ fn main() {
             "-d" => enc = enc.distance(args.next().unwrap().parse().unwrap()),
             "-l" => enc = enc.lossless(),
             "-e" => enc = enc.effort(args.next().unwrap().parse().unwrap()),
+            "--noise" => enc = enc.noise(args.next().unwrap().parse().unwrap()),
             "-t" => enc = enc.threads(args.next().unwrap().parse().unwrap()),
             "--delay" => delay = args.next().unwrap().parse().unwrap(),
             "-o" => out = args.next(),
@@ -101,24 +102,46 @@ fn main() {
         .expect("parse");
     let ch = if *alpha { 4 } else { 3 };
     let (mut tot, mut min) = (0.0, f64::MAX);
+    // Inter-frame prediction merges unchanged frames into the previous
+    // one, so map each input frame (shown at i * delay) to the displayed
+    // frame that covers that time.
+    let mut starts = Vec::new();
+    let mut t = 0u32;
+    for k in 0..image.num_loaded_keyframes() {
+        starts.push(t);
+        t += image.render_frame(k).expect("render").duration();
+    }
+    println!("{} displayed frames", starts.len());
+    let mut cache: Option<(usize, Vec<u8>)> = None;
     for (i, (_, _, _, src)) in loaded.iter().enumerate() {
-        let fb = image.render_frame(i).expect("render").image_all_channels();
-        let px: Vec<u8> = fb
-            .buf()
-            .iter()
-            .map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
-            .collect();
+        let k = starts.partition_point(|&s| s <= i as u32 * delay) - 1;
+        if cache.as_ref().is_none_or(|c| c.0 != k) {
+            let fb = image.render_frame(k).expect("render").image_all_channels();
+            let px: Vec<u8> = fb
+                .buf()
+                .iter()
+                .map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+                .collect();
+            cache = Some((k, px));
+        }
+        let px = cache.as_ref().unwrap().1.clone();
         let s = ssim2(*w, *h, src, &px, ch);
         tot += s;
         min = min.min(s);
         if let Some(dir) = &dump {
             std::fs::create_dir_all(dir).unwrap();
             let mut enc = png::Encoder::new(
-                std::io::BufWriter::new(std::fs::File::create(format!("{dir}/d{i:03}.png")).unwrap()),
+                std::io::BufWriter::new(
+                    std::fs::File::create(format!("{dir}/d{i:03}.png")).unwrap(),
+                ),
                 *w,
                 *h,
             );
-            enc.set_color(if *alpha { png::ColorType::Rgba } else { png::ColorType::Rgb });
+            enc.set_color(if *alpha {
+                png::ColorType::Rgba
+            } else {
+                png::ColorType::Rgb
+            });
             enc.set_depth(png::BitDepth::Eight);
             enc.write_header().unwrap().write_image_data(&px).unwrap();
         }
