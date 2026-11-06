@@ -868,10 +868,55 @@ enum AlphaJob {
     Inline(Vec<(u32, Vec<Channel>)>, ModularOptions),
 }
 
+/// Median absolute 4-neighbour Laplacian of the luma, in 8-bit levels (a
+/// noise estimate: sensor/video noise and GIF dithering score above ~8, clean
+/// photographs and rendered images around 2). Samples at most ~250k pixels.
+pub(crate) fn noise_level(img: &ImageRef) -> u32 {
+    let (w, h) = (img.width as usize, img.height as usize);
+    if w < 3 || h < 3 {
+        return 0;
+    }
+    let stride = img.channels();
+    let luma = |x: usize, y: usize| {
+        let p = (y * w + x) * stride;
+        let d = img.data;
+        (77 * u32::from(d[p]) + 150 * u32::from(d[p + 1]) + 29 * u32::from(d[p + 2]) + 128) >> 8
+    };
+    let step = ((w * h) / 250_000).max(1).isqrt().max(1);
+    let mut hist = [0u32; 1021];
+    let mut n = 0u32;
+    for y in (1..h - 1).step_by(step) {
+        for x in (1..w - 1).step_by(step) {
+            let l = 4 * luma(x, y) as i32
+                - luma(x - 1, y) as i32
+                - luma(x + 1, y) as i32
+                - luma(x, y - 1) as i32
+                - luma(x, y + 1) as i32;
+            hist[l.unsigned_abs() as usize] += 1;
+            n += 1;
+        }
+    }
+    let mut acc = 0;
+    for (v, c) in hist.iter().enumerate() {
+        acc += c;
+        if acc * 2 >= n {
+            return v as u32;
+        }
+    }
+    0
+}
+
+/// Noise estimate above which inverse Gaborish costs more than it saves.
+/// Sharpening before quantization amplifies noise and dithering, which then
+/// has to be coded; on video frames and GIFs that is 5-6% larger at equal
+/// SSIMULACRA2, while clean photographs gain 5-12% from it.
+pub(crate) const NOISY_LEVEL: u32 = 8;
+
 pub fn encode(
     img: &ImageRef,
     opts: &EncoderOptions,
     placement: FramePlacement,
+    noise: Option<u32>,
     out: &mut BitWriter,
 ) {
     let (w, h) = (img.width as usize, img.height as usize);
@@ -941,7 +986,8 @@ pub fn encode(
     let gaborish = params.adaptive_quant
         && d > 0.5
         && std::env::var_os("MINI_NO_GABORISH").is_none()
-        && !flat_graphics(img);
+        && !flat_graphics(img)
+        && noise.unwrap_or_else(|| noise_level(img)) < NOISY_LEVEL;
     let (mut field, mask1x1, q_median) = if params.adaptive_quant {
         // Without Gaborish, scale the AQ target as libjxl does. Flat
         // graphics avoid the sharpening overshoot and extra edge coefficients.

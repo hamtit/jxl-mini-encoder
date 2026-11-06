@@ -210,7 +210,7 @@ pub fn encode(image: &ImageRef, opts: &EncoderOptions) -> Result<Vec<u8>, Error>
         animation: None,
     };
     write_image_header(&mut w, &info);
-    encode_frame(image, &opts, FramePlacement::STILL, &mut w);
+    encode_frame(image, &opts, FramePlacement::STILL, None, &mut w);
     Ok(w.finish())
 }
 
@@ -218,12 +218,13 @@ fn encode_frame(
     image: &ImageRef,
     opts: &EncoderOptions,
     placement: FramePlacement,
+    noise: Option<u32>,
     w: &mut BitWriter,
 ) {
     if opts.distance <= 0.0 {
         lossless::encode(image, opts, placement, w);
     } else {
-        vardct::encode(image, opts, placement, w);
+        vardct::encode(image, opts, placement, noise, w);
     }
 }
 
@@ -299,12 +300,19 @@ pub fn encode_animation(
         }),
     };
     write_image_header(&mut w, &info);
+    // Decide the noise-dependent tools once for the whole animation so that
+    // frames near the threshold do not flip between settings (visible flicker).
+    let noise = (!lossless).then(|| {
+        let mut levels: Vec<u32> = frames.iter().map(|f| vardct::noise_level(&f.image)).collect();
+        levels.sort_unstable();
+        levels[levels.len() / 2]
+    });
     for (i, f) in frames.iter().enumerate() {
         let placement = FramePlacement {
             duration: Some(f.duration),
             is_last: i + 1 == frames.len(),
         };
-        encode_frame(&f.image, &opts, placement, &mut w);
+        encode_frame(&f.image, &opts, placement, noise, &mut w);
     }
     Ok(w.finish())
 }
