@@ -42,6 +42,8 @@ let jxl = Encoder::new()
     .encode_animation(&frames, &AnimationOptions::default())?; // num_loops: 0 = 無限ループ
 ```
 
+PNG 連番から試すには `cargo run --release --example anim -- -q 80 -e 7 --delay 6 -o out.jxl frames/*.png` を使います（復号して SSIMULACRA2 も表示します）。
+
 `duration` が 0 のフレームは次のフレームと同時に表示されるレイヤになり、デコーダは単独の表示フレームとして扱いません。GIF の遅延 0 は、ブラウザと同様に 10（1/10 秒）などへ置き換えてから渡してください。
 
 ## パラメータの扱い
