@@ -4,7 +4,7 @@
 //!   cargo run --release --example anim -- [-q QUALITY | -d DIST | -l] [-e EFFORT] [-t THREADS]
 //!       [--delay CS] [-o OUT.jxl] [--no-decode] FRAME.png...
 //!
-//! `--delay` is the display time of every frame in 1/100 s (default 10).
+//! `--delay` is the display time of every frame in 1/100 s (default 10, minimum 1).
 
 use std::time::Instant;
 
@@ -59,6 +59,9 @@ fn main() {
             _ => files.push(a),
         }
     }
+    // A zero-duration frame is a layer shown with the next frame, so decoders
+    // report fewer displayed frames than inputs and the scores would not line up.
+    assert!(delay >= 1, "--delay must be at least 1");
     let loaded: Vec<_> = files.iter().map(|f| load(f)).collect();
     let (w, h, alpha, _) = &loaded[0];
     let frames: Vec<_> = loaded
