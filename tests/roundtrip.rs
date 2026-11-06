@@ -413,6 +413,7 @@ fn animation(w: u32, h: u32, ch: usize, n: usize, distance: f32, effort: u32) {
         distance,
         effort,
         threads: 2,
+        noise: 0.0,
     };
     let anim = jxl_mini_encoder::AnimationOptions {
         num_loops: 3,
@@ -516,6 +517,7 @@ fn animation_zero_duration_frame_is_not_a_keyframe() {
         distance: 0.0,
         effort: 3,
         threads: 1,
+        noise: 0.0,
     };
     let jxl = jxl_mini_encoder::encode_animation(&frames, &Default::default(), &opts).unwrap();
     let image = jxl_oxide::JxlImage::builder()
@@ -557,4 +559,91 @@ fn animation_rejects_unrepresentable_tick_rate() {
         num_loops: u32::MAX,
     };
     assert!(jxl_mini_encoder::encode_animation(&frames, &max, &opts).is_ok());
+}
+
+/// Frames that share a static background and move a small sprite: only the
+/// changed part is coded (inter-frame prediction), unchanged frames extend the
+/// previous one, and every displayed frame still decodes to the right pixels.
+fn interframe(w: u32, h: u32, ch: usize, distance: f32) {
+    let bg = synth(w, h, ch, 99);
+    let mut px: Vec<Vec<u8>> = Vec::new();
+    // (sprite x, sprite y, duration); the repeated position gives a frame
+    // without any change.
+    let steps = [(3u32, 5u32), (3, 5), (20, 9), (21, 40), (21, 40), (60, 33)];
+    for &(sx, sy) in &steps {
+        let mut f = bg.clone();
+        for y in sy..(sy + 12).min(h) {
+            for x in sx..(sx + 12).min(w) {
+                let o = (y as usize * w as usize + x as usize) * ch;
+                f[o..o + 3].copy_from_slice(&[250, 20, 40]);
+            }
+        }
+        px.push(f);
+    }
+    let frames: Vec<_> = px
+        .iter()
+        .enumerate()
+        .map(|(i, p)| jxl_mini_encoder::AnimationFrame {
+            image: if ch == 4 {
+                jxl_mini_encoder::ImageRef::rgba8(w, h, p)
+            } else {
+                jxl_mini_encoder::ImageRef::rgb8(w, h, p)
+            }
+            .unwrap(),
+            duration: 3 + i as u32,
+        })
+        .collect();
+    let opts = jxl_mini_encoder::EncoderOptions {
+        distance,
+        effort: 5,
+        threads: 2,
+        noise: 0.0,
+    };
+    let anim = Default::default();
+    let jxl = jxl_mini_encoder::encode_animation(&frames, &anim, &opts).unwrap();
+    let whole = std::env::var_os("MINI_NO_INTERFRAME").is_some();
+    let image = jxl_oxide::JxlImage::builder()
+        .read(std::io::Cursor::new(&jxl))
+        .expect("parse");
+    // Identical neighbours (steps 0/1 and 3/4) are merged.
+    let shown = if whole { px.len() } else { px.len() - 2 };
+    assert_eq!(image.num_loaded_keyframes(), shown);
+    let mut t = 0u32;
+    let mut starts = Vec::new();
+    for k in 0..shown {
+        starts.push(t);
+        t += image.render_frame(k).expect("render").duration();
+    }
+    assert_eq!(t, frames.iter().map(|f| f.duration).sum::<u32>());
+    let mut at = 0u32;
+    for (i, p) in px.iter().enumerate() {
+        let k = starts.partition_point(|&s| s <= at) - 1;
+        at += frames[i].duration;
+        let fb = image.render_frame(k).expect("render").image_all_channels();
+        let data: Vec<u8> = fb
+            .buf()
+            .iter()
+            .map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+            .collect();
+        if distance == 0.0 {
+            assert!(&data == p, "{w}x{h}x{ch} frame {i}: pixels differ");
+        } else {
+            let err: u64 = data
+                .iter()
+                .zip(p)
+                .map(|(&a, &b)| u64::from(a.abs_diff(b)))
+                .sum();
+            assert!(err / (data.len() as u64) < 12, "frame {i}: error too large");
+        }
+    }
+}
+
+#[test]
+fn animation_interframe() {
+    for ch in [3, 4] {
+        interframe(96, 72, ch, 0.0);
+        interframe(300, 140, ch, 0.0);
+        interframe(96, 72, ch, 1.0);
+        interframe(300, 140, ch, 1.0);
+    }
 }

@@ -4,6 +4,7 @@ mod acs;
 mod aq;
 mod dct;
 mod epf;
+mod noise;
 mod quant;
 mod small;
 #[cfg(test)]
@@ -968,6 +969,7 @@ pub fn encode(
         params.b_qm_scale = b;
     }
     let d = params.distance;
+    let noise_lut = noise::params(&xyb, w, h, d, opts.noise);
     // Patches (effort >= 7): repeated glyph-like shapes are coded once in a
     // reference frame and removed from the image.
     let mut xyb = xyb;
@@ -1283,17 +1285,23 @@ pub fn encode(
         epf_iters: params.epf_iters,
         skip_lf_smoothing: false,
         patches: patches.is_some(),
+        noise: noise_lut,
         reference: None,
         placement,
     };
     if let Some(p) = &patches {
         p.write_reference_frame(frame.num_extra, opts.effort, opts.threads, out);
     }
-    write_frame_header(out, &frame);
+    write_frame_header(out, &frame, (w as u32, h as u32));
 
     let mut lf_global = BitWriter::new();
     if let Some(p) = &patches {
         p.write_dictionary(frame.num_extra, &mut lf_global);
+    }
+    if let Some(lut) = &noise_lut {
+        for &v in lut {
+            lf_global.write(10, u64::from(v));
+        }
     }
     lf_global.write_bool(true); // default LF dequantisation
     lf_global.write_u32(

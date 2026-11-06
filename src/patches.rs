@@ -570,9 +570,11 @@ impl Patches {
                 epf_iters: 0,
                 skip_lf_smoothing: false,
                 patches: false,
+                noise: None,
                 reference: Some((w as u32, h as u32)),
                 placement: FramePlacement::STILL,
             },
+            (w as u32, h as u32),
         );
         let write_dc_quant = |s: &mut BitWriter| {
             s.write_bool(false); // custom DC dequantisation

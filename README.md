@@ -25,7 +25,7 @@ let jxl = jxl_mini_encoder::Encoder::new()
 
 ## アニメーション
 
-デコード済みの GIF などのフレーム列を、アニメーション対応 JXL にエンコードできます。各フレームは合成済みのキャンバス全体（同じサイズ・同じアルファ有無）で渡してください。フレームは互いに独立して符号化し（置換ブレンド、切り出し・フレーム間予測なし）、非可逆・可逆は距離の指定で全フレーム共通に決まります。
+デコード済みの GIF などのフレーム列を、アニメーション対応 JXL にエンコードできます。各フレームは合成済みのキャンバス全体（同じサイズ・同じアルファ有無）で渡してください。非可逆・可逆は距離の指定で全フレーム共通に決まります。直前のキャンバスから変わっていない領域は符号化せず、変化した矩形だけを切り出しフレームとして前フレームに重ね（フレーム間予測）、変化のないフレームは前フレームの表示時間に加算します（`MINI_NO_INTERFRAME=1` で無効化）。背景が固定の素材ではサイズが大きく減り、画素が毎フレーム変わる素材では従来と同じ出力です。評価は `docs/animation-quality.md` です。
 
 ```rust
 use jxl_mini_encoder::{AnimationFrame, AnimationOptions, Encoder, ImageRef};
@@ -65,7 +65,8 @@ PNG 連番から試すには `cargo run --release --example anim -- -q 80 -e 7 -
 - effort 7 以上では libjxl と同様に、画素統計から X / B チャンネルの量子化スケール（x_qm_scale / b_qm_scale）を引き上げます。`MINI_NO_CHROMA_ADJUST=1` で無効化できます。
 - 適応量子化の係数には、libjxl と同じ品質・effort での SSIMULACRA2 を揃えるための較正係数（`aq_calibration`）を掛けています。effort 6–7 で最大 +5%（低品質ほど大きい）、effort 8 以上で −4% です。libjxl は effort 8 以上で Butteraugli 反復量子化を使うため、出力サイズ・スコアの動作点が異なります。
 - パッチは effort 7 以上で有効です。テキストや UI の繰り返し図形を参照フレームに符号化します。`MINI_NO_PATCHES=1` で無効化できます。
-- AFV、ノイズ合成、スプライン、butteraugli による反復量子化は未実装です。
+- ノイズ合成は `Encoder::noise(強度)` で有効にできます（既定は無効。SSIMULACRA2 は下がります。`docs/animation-quality.md`）。
+- AFV、スプライン、butteraugli による反復量子化は未実装です。
 
 ## 構成
 
