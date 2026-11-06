@@ -4,7 +4,9 @@
 
 use crate::bit_writer::{BitWriter, round_to_f16};
 use crate::entropy::{CodeOptions, Token, pack_signed, write_stream};
-use crate::headers::{Encoding, FrameInfo, GROUP_DIM, Layout, write_frame_header, write_sections};
+use crate::headers::{
+    Encoding, FrameInfo, FramePlacement, GROUP_DIM, Layout, write_frame_header, write_sections,
+};
 use crate::modular::{Channel, GlobalTree, ModularOptions, write_header, write_standalone};
 use crate::parallel::par_map;
 use crate::vardct::xyb::Xyb;
@@ -569,6 +571,7 @@ impl Patches {
                 skip_lf_smoothing: false,
                 patches: false,
                 reference: Some((w as u32, h as u32)),
+                placement: FramePlacement::STILL,
             },
         );
         let write_dc_quant = |s: &mut BitWriter| {

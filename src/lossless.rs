@@ -2,7 +2,9 @@
 
 use crate::bit_writer::BitWriter;
 use crate::entropy::{HybridUint, pack_signed};
-use crate::headers::{Encoding, FrameInfo, GROUP_DIM, Layout, write_frame_header, write_sections};
+use crate::headers::{
+    Encoding, FrameInfo, FramePlacement, GROUP_DIM, Layout, write_frame_header, write_sections,
+};
 use crate::modular::predict::grad_clamped;
 use crate::modular::{
     Channel, GlobalTree, ModularOptions, Transform, forward_rct, write_header, write_standalone,
@@ -134,7 +136,12 @@ fn load_group(
     ch
 }
 
-pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
+pub fn encode(
+    img: &ImageRef,
+    opts: &EncoderOptions,
+    placement: FramePlacement,
+    out: &mut BitWriter,
+) {
     let (w, h) = (img.width as usize, img.height as usize);
     let nc = img.channels();
     let effort = opts.effort;
@@ -150,6 +157,7 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
         skip_lf_smoothing: false,
         patches: false,
         reference: None,
+        placement,
     };
     write_frame_header(out, &frame);
     let layout = Layout::new(w, h);

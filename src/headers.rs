@@ -11,6 +11,32 @@ pub struct ImageInfo {
     pub has_alpha: bool,
     /// Lossy (XYB) or lossless (original RGB).
     pub xyb: bool,
+    /// Animation header, if the image is animated.
+    pub animation: Option<AnimationInfo>,
+}
+
+/// Animation parameters stored in the image metadata.
+#[derive(Clone, Copy, Debug)]
+pub struct AnimationInfo {
+    pub tps_numerator: u32,
+    pub tps_denominator: u32,
+    /// 0 loops forever.
+    pub num_loops: u32,
+}
+
+/// Position of a frame in the codestream, for animations.
+#[derive(Clone, Copy, Debug)]
+pub struct FramePlacement {
+    /// Display time in ticks; `None` for a still image.
+    pub duration: Option<u32>,
+    pub is_last: bool,
+}
+
+impl FramePlacement {
+    pub const STILL: FramePlacement = FramePlacement {
+        duration: None,
+        is_last: true,
+    };
 }
 
 fn write_size(w: &mut BitWriter, width: u32, height: u32) {
@@ -57,11 +83,27 @@ pub fn write_image_header(w: &mut BitWriter, info: &ImageInfo) {
     w.write(8, 0xff);
     w.write(8, 0x0a);
     write_size(w, info.width, info.height);
-    if info.xyb && !info.has_alpha {
+    if info.xyb && !info.has_alpha && info.animation.is_none() {
         w.write_bool(true); // all_default: 8-bit sRGB, XYB
     } else {
         w.write_bool(false); // all_default
-        w.write_bool(false); // extra_fields
+        w.write_bool(info.animation.is_some()); // extra_fields
+        if let Some(a) = info.animation {
+            w.write(3, 0); // orientation - 1
+            w.write_bool(false); // have_intrinsic_size
+            w.write_bool(false); // have_preview
+            w.write_bool(true); // have_animation
+            w.write_u32(
+                a.tps_numerator,
+                [Val(100), Val(1000), Bits(10, 1), Bits(30, 1)],
+            );
+            w.write_u32(
+                a.tps_denominator,
+                [Val(1), Val(1001), Bits(8, 1), Bits(10, 1)],
+            );
+            w.write_u32(a.num_loops, [Val(0), Bits(3, 0), Bits(16, 0), Bits(32, 0)]);
+            w.write_bool(false); // have_timecodes
+        }
         w.write_bool(false); // float_sample
         w.write_u32(8, [Val(8), Val(10), Val(12), Bits(6, 1)]);
         w.write_bool(true); // modular_16bit_buffers
@@ -72,6 +114,9 @@ pub fn write_image_header(w: &mut BitWriter, info: &ImageInfo) {
         }
         w.write_bool(info.xyb);
         w.write_bool(true); // colour_encoding all_default: sRGB
+        if info.animation.is_some() {
+            w.write_bool(true); // tone_mapping all_default (read when extra_fields)
+        }
         w.write_u64(0); // extensions
     }
     w.write_bool(true); // default_m (default opsin matrix and upsampling weights)
@@ -98,6 +143,7 @@ pub struct FrameInfo {
     pub patches: bool,
     /// A patch reference frame of this size, saved in slot 3 and not shown.
     pub reference: Option<(u32, u32)>,
+    pub placement: FramePlacement,
 }
 
 pub const GROUP_DIM: usize = 256;
@@ -151,7 +197,16 @@ pub fn write_frame_header(w: &mut BitWriter, f: &FrameInfo) {
             for _ in 0..f.num_extra {
                 w.write_u32(0, blend_mode);
             }
-            w.write_bool(true); // is_last
+            if let Some(d) = f.placement.duration {
+                w.write_u32(d, [Val(0), Val(1), Bits(8, 0), Bits(32, 0)]);
+            }
+            w.write_bool(f.placement.is_last);
+            if !f.placement.is_last {
+                w.write_u32(0, [Val(0), Val(1), Val(2), Val(3)]); // save_as_reference
+                if f.placement.duration == Some(0) {
+                    w.write_bool(false); // save_before_color_transform
+                }
+            }
         }
     }
     w.write_u32(0, [Val(0), Bits(4, 0), Bits(5, 16), Bits(10, 48)]); // name length

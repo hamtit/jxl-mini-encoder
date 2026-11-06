@@ -14,7 +14,9 @@ use crate::bit_writer::BitWriter;
 use crate::bit_writer::U32Dist::{Bits, Val};
 use crate::bit_writer::{ceil_log2, pack_f16, unpack_f16};
 use crate::entropy::{CodeOptions, EntropyCode, Token, pack_signed};
-use crate::headers::{Encoding, FrameInfo, GROUP_DIM, Layout, write_frame_header, write_sections};
+use crate::headers::{
+    Encoding, FrameInfo, FramePlacement, GROUP_DIM, Layout, write_frame_header, write_sections,
+};
 use crate::modular::{Channel, GlobalTree, ModularOptions, write_header, write_standalone};
 use crate::parallel::par_map;
 use crate::{EncoderOptions, ImageRef};
@@ -866,7 +868,12 @@ enum AlphaJob {
     Inline(Vec<(u32, Vec<Channel>)>, ModularOptions),
 }
 
-pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
+pub fn encode(
+    img: &ImageRef,
+    opts: &EncoderOptions,
+    placement: FramePlacement,
+    out: &mut BitWriter,
+) {
     let (w, h) = (img.width as usize, img.height as usize);
     let (bw, bh) = (w.div_ceil(8), h.div_ceil(8));
     let mut params = Params::new(opts.distance, opts.effort);
@@ -1231,6 +1238,7 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, out: &mut BitWriter) {
         skip_lf_smoothing: false,
         patches: patches.is_some(),
         reference: None,
+        placement,
     };
     if let Some(p) = &patches {
         p.write_reference_frame(frame.num_extra, opts.effort, opts.threads, out);

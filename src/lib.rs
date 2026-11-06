@@ -32,7 +32,7 @@ mod vardct;
 pub use error::Error;
 
 use bit_writer::BitWriter;
-use headers::{ImageInfo, write_image_header};
+use headers::{AnimationInfo, FramePlacement, ImageInfo, write_image_header};
 
 /// Borrowed 8-bit sRGB pixels, interleaved, without row padding.
 #[derive(Clone, Copy, Debug)]
@@ -166,6 +166,15 @@ impl Encoder {
         &self.opts
     }
 
+    /// Encode an animation to a bare JPEG XL codestream.
+    pub fn encode_animation(
+        &self,
+        frames: &[AnimationFrame],
+        anim: &AnimationOptions,
+    ) -> Result<Vec<u8>, Error> {
+        encode_animation(frames, anim, &self.opts)
+    }
+
     /// Encode to a bare JPEG XL codestream.
     pub fn encode(&self, image: &ImageRef) -> Result<Vec<u8>, Error> {
         encode(image, &self.opts)
@@ -198,12 +207,102 @@ pub fn encode(image: &ImageRef, opts: &EncoderOptions) -> Result<Vec<u8>, Error>
         height: image.height,
         has_alpha: image.alpha,
         xyb: !lossless,
+        animation: None,
     };
     write_image_header(&mut w, &info);
-    if lossless {
-        lossless::encode(image, &opts, &mut w);
+    encode_frame(image, &opts, FramePlacement::STILL, &mut w);
+    Ok(w.finish())
+}
+
+fn encode_frame(
+    image: &ImageRef,
+    opts: &EncoderOptions,
+    placement: FramePlacement,
+    w: &mut BitWriter,
+) {
+    if opts.distance <= 0.0 {
+        lossless::encode(image, opts, placement, w);
     } else {
-        vardct::encode(image, &opts, &mut w);
+        vardct::encode(image, opts, placement, w);
+    }
+}
+
+/// One frame of an animation: full-canvas pixels and a display time.
+#[derive(Clone, Copy, Debug)]
+pub struct AnimationFrame<'a> {
+    /// Fully composited canvas for this frame. Every frame must have the same
+    /// size and channel layout.
+    pub image: ImageRef<'a>,
+    /// Display time in ticks (see [`AnimationOptions`]).
+    pub duration: u32,
+}
+
+/// Timing and looping of an animation.
+#[derive(Clone, Copy, Debug)]
+pub struct AnimationOptions {
+    /// Ticks per second is `tps_numerator / tps_denominator`.
+    pub tps_numerator: u32,
+    pub tps_denominator: u32,
+    /// Number of loops; 0 repeats forever.
+    pub num_loops: u32,
+}
+
+impl Default for AnimationOptions {
+    /// 100 ticks per second, so a GIF delay (in centiseconds) is a duration
+    /// as is. Loops forever.
+    fn default() -> Self {
+        AnimationOptions {
+            tps_numerator: 100,
+            tps_denominator: 1,
+            num_loops: 0,
+        }
+    }
+}
+
+/// Encode full-canvas frames as an animated bare JPEG XL codestream.
+///
+/// Each frame is coded independently (replace blending, no cropping or
+/// inter-frame prediction), so frames that were decoded from a GIF must
+/// already be composited onto the canvas. Lossy and lossless coding follow
+/// `opts.distance` for all frames.
+pub fn encode_animation(
+    frames: &[AnimationFrame],
+    anim: &AnimationOptions,
+    opts: &EncoderOptions,
+) -> Result<Vec<u8>, Error> {
+    let first = frames.first().ok_or(Error::NoFrames)?;
+    if anim.tps_numerator == 0 || anim.tps_denominator == 0 {
+        return Err(Error::InvalidAnimation);
+    }
+    for f in frames {
+        let (a, b) = (&f.image, &first.image);
+        if (a.width, a.height, a.alpha) != (b.width, b.height, b.alpha) {
+            return Err(Error::FrameMismatch);
+        }
+    }
+    let lossless = opts.distance <= 0.0;
+    let mut opts = opts.clone();
+    opts.effort = opts.effort.clamp(1, 10);
+    opts.threads = opts.threads.max(1);
+    let mut w = BitWriter::with_capacity(first.image.data.len() * frames.len() / 8);
+    let info = ImageInfo {
+        width: first.image.width,
+        height: first.image.height,
+        has_alpha: first.image.alpha,
+        xyb: !lossless,
+        animation: Some(AnimationInfo {
+            tps_numerator: anim.tps_numerator,
+            tps_denominator: anim.tps_denominator,
+            num_loops: anim.num_loops,
+        }),
+    };
+    write_image_header(&mut w, &info);
+    for (i, f) in frames.iter().enumerate() {
+        let placement = FramePlacement {
+            duration: Some(f.duration),
+            is_last: i + 1 == frames.len(),
+        };
+        encode_frame(&f.image, &opts, placement, &mut w);
     }
     Ok(w.finish())
 }
