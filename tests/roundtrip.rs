@@ -686,3 +686,42 @@ fn animation_merge_keeps_total_duration() {
         assert!(data == px, "{w}x{h}: pixels differ");
     }
 }
+
+/// A small alpha-only change is still coded in lossy animations (alpha is
+/// lossless), even though RGB changes of that size are reused.
+#[test]
+fn animation_lossy_alpha_change_is_kept() {
+    let (w, h) = (40u32, 24u32);
+    let a = synth(w, h, 4, 3);
+    let mut b = a.clone();
+    for p in b.chunks_mut(4) {
+        p[3] = p[3].wrapping_add(1);
+    }
+    let frames: Vec<_> = [&a, &b]
+        .iter()
+        .map(|p| jxl_mini_encoder::AnimationFrame {
+            image: jxl_mini_encoder::ImageRef::rgba8(w, h, p).unwrap(),
+            duration: 5,
+        })
+        .collect();
+    let opts = jxl_mini_encoder::EncoderOptions {
+        distance: 1.0,
+        effort: 3,
+        threads: 1,
+        noise: 0.0,
+    };
+    let jxl = jxl_mini_encoder::encode_animation(&frames, &Default::default(), &opts).unwrap();
+    let image = jxl_oxide::JxlImage::builder()
+        .read(std::io::Cursor::new(&jxl))
+        .expect("parse");
+    assert_eq!(image.num_loaded_keyframes(), 2);
+    let alpha = |k: usize| -> Vec<u8> {
+        let fb = image.render_frame(k).unwrap().image_all_channels();
+        fb.buf()
+            .chunks(4)
+            .map(|p| (p[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+            .collect()
+    };
+    let want = |p: &Vec<u8>| p.chunks(4).map(|c| c[3]).collect::<Vec<u8>>();
+    assert!(alpha(0) == want(&a) && alpha(1) == want(&b));
+}

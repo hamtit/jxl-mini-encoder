@@ -403,8 +403,13 @@ fn plan_frames(frames: &[AnimationFrame], tolerance: u8) -> Vec<PlannedFrame> {
             if a == b {
                 continue;
             }
-            let changed =
-                |x: usize| (0..ch).any(|c| a[x * ch + c].abs_diff(b[x * ch + c]) > tolerance);
+            // Alpha is coded losslessly, so it is compared exactly.
+            let changed = |x: usize| {
+                (0..ch).any(|c| {
+                    let tol = if ch == 4 && c == 3 { 0 } else { tolerance };
+                    a[x * ch + c].abs_diff(b[x * ch + c]) > tol
+                })
+            };
             if let Some(l) = (0..w).find(|&x| changed(x)) {
                 let r = (0..w).rfind(|&x| changed(x)).unwrap_or(l);
                 x0 = x0.min(l);
