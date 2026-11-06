@@ -48,6 +48,7 @@ fn main() {
     let mut enc = jxl_mini_encoder::Encoder::new();
     let (mut files, mut out, mut delay, mut decode) = (Vec::new(), None, 10u32, true);
     let mut dump: Option<String> = None;
+    let mut auto = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-q" => enc = enc.quality(args.next().unwrap().parse().unwrap()),
@@ -59,6 +60,7 @@ fn main() {
             "--delay" => delay = args.next().unwrap().parse().unwrap(),
             "-o" => out = args.next(),
             "--no-decode" => decode = false,
+            "--auto" => auto = true,
             "--dump" => dump = args.next(),
             _ => files.push(a),
         }
@@ -80,6 +82,10 @@ fn main() {
             duration: delay,
         })
         .collect();
+    if auto && jxl_mini_encoder::animation_prefers_lossless(&frames) {
+        eprintln!("auto: lossless");
+        enc = enc.lossless();
+    }
     let t = Instant::now();
     let jxl = enc
         .encode_animation(&frames, &jxl_mini_encoder::AnimationOptions::default())

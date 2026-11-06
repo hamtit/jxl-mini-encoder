@@ -841,3 +841,46 @@ fn animation_lossless_sparse_changes() {
         }
     }
 }
+
+#[test]
+fn lossless_hint_for_palette_animation_with_sparse_changes() {
+    let (w, h) = (64u32, 48u32);
+    let make = |n: u32, noisy: bool| -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|f| {
+                let mut px = vec![30u8; (w * h * 3) as usize];
+                for i in 0..(w * h) as usize {
+                    // Few changing pixels, or a different texture in every frame.
+                    let on = if noisy { (i as u32 * 7 + f) % 3 == 0 } else { i as u32 == f * 5 };
+                    if on {
+                        px[i * 3..i * 3 + 3].copy_from_slice(&[200, 40, 40]);
+                    }
+                }
+                px
+            })
+            .collect()
+    };
+    for (noisy, expect) in [(false, true), (true, false)] {
+        let px = make(6, noisy);
+        let frames: Vec<_> = px
+            .iter()
+            .map(|p| jxl_mini_encoder::AnimationFrame {
+                image: jxl_mini_encoder::ImageRef::rgb8(w, h, p).unwrap(),
+                duration: 10,
+            })
+            .collect();
+        assert_eq!(jxl_mini_encoder::animation_prefers_lossless(&frames), expect);
+    }
+    // Photos with many colours are not palette animations.
+    let photo = synth(w, h, 3, 1);
+    let frames = [photo.clone(), photo].map(|p| p);
+    let frames: Vec<_> = frames
+        .iter()
+        .map(|p| jxl_mini_encoder::AnimationFrame {
+            image: jxl_mini_encoder::ImageRef::rgb8(w, h, p).unwrap(),
+            duration: 10,
+        })
+        .collect();
+    assert!(!jxl_mini_encoder::animation_prefers_lossless(&frames));
+    assert!(!jxl_mini_encoder::animation_prefers_lossless(&[]));
+}

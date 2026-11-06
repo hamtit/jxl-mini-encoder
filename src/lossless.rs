@@ -137,7 +137,7 @@ fn load_group(
 }
 
 /// An exact palette of at most 256 colours (RGB or RGBA tuples).
-struct Palette {
+pub(crate) struct Palette {
     /// Colours in index order, each `channels` bytes.
     colors: Vec<[u8; 4]>,
     /// Open-addressing table of (packed colour + 1, index); size is a power of two.
@@ -159,7 +159,7 @@ fn slot(key: u32) -> usize {
 
 impl Palette {
     /// The palette of the image, if it has at most 256 distinct colours.
-    fn of(img: &ImageRef) -> Option<Palette> {
+    pub(crate) fn of(img: &ImageRef) -> Option<Palette> {
         let ch = img.channels();
         let mut keys: Vec<u32> = Vec::new();
         let mut seen = vec![u64::MAX; PALETTE_TABLE];

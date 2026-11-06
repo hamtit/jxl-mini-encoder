@@ -392,6 +392,50 @@ pub fn encode_animation(
     Ok(w.finish())
 }
 
+/// Whether lossless coding is likely to beat lossy coding for these frames.
+///
+/// True for animations made of flat-colour frames (each with at most 256
+/// distinct colours, as decoded from a GIF) in which on average less than
+/// 10% of the pixels change from frame to frame, such as screen recordings
+/// and simple games. Palette coding of the sparse changes is then both exact
+/// and smaller than VarDCT. Frames with gradients or with much motion are
+/// better coded lossy. The frames must have the same size and channel layout.
+pub fn animation_prefers_lossless(frames: &[AnimationFrame]) -> bool {
+    let Some(first) = frames.first() else {
+        return false;
+    };
+    if frames.len() < 2 {
+        return false;
+    }
+    // Colour counts on a few frames are enough to tell a palette animation.
+    let step = (frames.len() / 8).max(1);
+    if !frames
+        .iter()
+        .step_by(step)
+        .all(|f| lossless::Palette::of(&f.image).is_some())
+    {
+        return false;
+    }
+    let (w, h, ch) = (
+        first.image.width as usize,
+        first.image.height as usize,
+        first.image.channels(),
+    );
+    let mut changed = 0usize;
+    for pair in frames.windows(2) {
+        let (a, b) = (pair[0].image.data, pair[1].image.data);
+        if a.len() != b.len() || a.len() != w * h * ch {
+            return false;
+        }
+        changed += a
+            .chunks_exact(ch)
+            .zip(b.chunks_exact(ch))
+            .filter(|(p, q)| p != q)
+            .count();
+    }
+    changed * 10 < w * h * (frames.len() - 1)
+}
+
 /// Version of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
