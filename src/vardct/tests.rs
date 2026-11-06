@@ -45,3 +45,38 @@ fn flat_graphics_detection_ignores_alpha_but_not_rgb_gradients() {
         assert!(!flat_graphics(&image));
     }
 }
+
+fn pattern_image(w: usize, h: usize, mut f: impl FnMut(usize, usize) -> u8) -> Vec<u8> {
+    (0..w * h)
+        .flat_map(|i| {
+            let v = f(i % w, i / w);
+            [v, v, v]
+        })
+        .collect()
+}
+
+#[test]
+fn noise_level_separates_smooth_images_from_noisy_ones() {
+    let (w, h) = (64, 48);
+    let smooth = pattern_image(w, h, |x, y| (x * 2 + y) as u8);
+    let flat = pattern_image(w, h, |_, _| 90);
+    // Ordered dithering and pseudo-random noise of a few levels.
+    let dither = pattern_image(w, h, |x, y| 100 + ((x ^ y) & 1) as u8 * 24);
+    let mut s = 1u32;
+    let noisy = pattern_image(w, h, |_, _| {
+        s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+        (100 + (s >> 28)) as u8
+    });
+    let level = |d: &[u8]| noise_level(&ImageRef::rgb8(w as u32, h as u32, d).unwrap());
+    assert_eq!(level(&flat), 0);
+    assert!(level(&smooth) < NOISY_LEVEL);
+    assert!(level(&dither) >= NOISY_LEVEL);
+    assert!(level(&noisy) >= NOISY_LEVEL);
+}
+
+#[test]
+fn noise_level_handles_tiny_images() {
+    let px = [0u8; 12];
+    assert_eq!(noise_level(&ImageRef::rgb8(2, 2, &px).unwrap()), 0);
+    assert_eq!(noise_level(&ImageRef::rgb8(1, 4, &px).unwrap()), 0);
+}

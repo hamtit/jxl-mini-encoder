@@ -59,7 +59,7 @@ PNG 連番から試すには `cargo run --release --example anim -- -q 80 -e 7 -
 
 ## エンコード機能
 
-- 逆 Gaborish と量子化のブロック別調整（AdjustQuantBlockAC）は effort 5 以上で有効です。逆 Gaborish は距離 0.5 超で、平坦な図形画像と判定されない場合に有効です（最大1024個の8×8領域を標本化し、85%以上がRGB一定なら無効化）。無効時はAQの目標値も調整します。`MINI_NO_GABORISH=1` / `MINI_NO_ADJUST_QUANT=1` でも無効化できます。
+- 逆 Gaborish と量子化のブロック別調整（AdjustQuantBlockAC）は effort 5 以上で有効です。逆 Gaborish は距離 0.5 超で、平坦な図形画像と判定されない場合に有効です（最大1024個の8×8領域を標本化し、85%以上がRGB一定なら無効化）、かつノイズが少ない場合に有効です（輝度のラプラシアン絶対値の中央値が8以上、つまりビデオ・GIFのディザ・センサノイズが強い画像では、鮮鋭化がノイズを増幅してサイズが増えるため無効化。アニメーションでは全フレームの中央値で1回だけ決めます。評価は `docs/animation-quality.md`）。無効時はAQの目標値も調整します。`MINI_NO_GABORISH=1` / `MINI_NO_ADJUST_QUANT=1` でも無効化できます。
 - effort 6 以上（距離 0.5 以上）では libjxl と同様に、ブロックごとの EPF 強度をエンコーダ内でデコード（逆量子化・逆 DCT・Gaborish・EPF）して選びます。候補（距離 4.5 以下は {0, 2, 7}、超は {0, 4}）ごとに輝度マスク付き誤差を比べ、最小の強度を採用します。処理は 16 ブロック行の帯ごとに行うため、作業メモリは画像全体に比例しません。`MINI_NO_DYNAMIC_EPF=1` で無効化できます。
 - effort 5 以下、または上記を無効にした場合は定数強度です。逆Gaborish使用時の距離1.5以上ではEPFの平滑化を少し弱めて写真の細部を保持します（高品質域・逆Gaborish無効時は変更していません）。
 - effort 7 以上では libjxl と同様に、画素統計から X / B チャンネルの量子化スケール（x_qm_scale / b_qm_scale）を引き上げます。`MINI_NO_CHROMA_ADJUST=1` で無効化できます。

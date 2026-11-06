@@ -2,9 +2,10 @@
 //! decode it back with jxl-oxide and report size, time and SSIMULACRA2.
 //!
 //!   cargo run --release --example anim -- [-q QUALITY | -d DIST | -l] [-e EFFORT] [-t THREADS]
-//!       [--delay CS] [-o OUT.jxl] [--no-decode] FRAME.png...
+//!       [--delay CS] [-o OUT.jxl] [--no-decode] [--dump DIR] FRAME.png...
 //!
 //! `--delay` is the display time of every frame in 1/100 s (default 10, minimum 1).
+//! `--dump DIR` writes the decoded frames as PNG files for visual inspection.
 
 use std::time::Instant;
 
@@ -46,6 +47,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut enc = jxl_mini_encoder::Encoder::new();
     let (mut files, mut out, mut delay, mut decode) = (Vec::new(), None, 10u32, true);
+    let mut dump: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-q" => enc = enc.quality(args.next().unwrap().parse().unwrap()),
@@ -56,6 +58,7 @@ fn main() {
             "--delay" => delay = args.next().unwrap().parse().unwrap(),
             "-o" => out = args.next(),
             "--no-decode" => decode = false,
+            "--dump" => dump = args.next(),
             _ => files.push(a),
         }
     }
@@ -97,7 +100,7 @@ fn main() {
         .read(std::io::Cursor::new(&jxl))
         .expect("parse");
     let ch = if *alpha { 4 } else { 3 };
-    let mut tot = 0.0;
+    let (mut tot, mut min) = (0.0, f64::MAX);
     for (i, (_, _, _, src)) in loaded.iter().enumerate() {
         let fb = image.render_frame(i).expect("render").image_all_channels();
         let px: Vec<u8> = fb
@@ -105,7 +108,24 @@ fn main() {
             .iter()
             .map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
             .collect();
-        tot += ssim2(*w, *h, src, &px, ch);
+        let s = ssim2(*w, *h, src, &px, ch);
+        tot += s;
+        min = min.min(s);
+        if let Some(dir) = &dump {
+            std::fs::create_dir_all(dir).unwrap();
+            let mut enc = png::Encoder::new(
+                std::io::BufWriter::new(std::fs::File::create(format!("{dir}/d{i:03}.png")).unwrap()),
+                *w,
+                *h,
+            );
+            enc.set_color(if *alpha { png::ColorType::Rgba } else { png::ColorType::Rgb });
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&px).unwrap();
+        }
     }
-    println!(", mean ssim2 {:.2}", tot / loaded.len() as f64);
+    println!(
+        ", mean ssim2 {:.2}, min {:.2}",
+        tot / loaded.len() as f64,
+        min
+    );
 }
