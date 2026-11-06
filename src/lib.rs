@@ -482,9 +482,11 @@ fn plan_frames(frames: &[AnimationFrame], tolerance: u8) -> Vec<PlannedFrame> {
     for (index, f) in frames.iter().enumerate().skip(1) {
         let data = f.image.data;
         let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
-        // Changed pixels, and whether every one of them is opaque (a blended
-        // frame cannot make a pixel transparent).
-        let (mut count, mut opaque) = (0usize, true);
+        // Changed pixels, and whether the frame is fully opaque. A blended
+        // frame cannot make a pixel transparent, and it does not keep the
+        // hidden colour of a transparent pixel that stays unchanged.
+        let mut count = 0usize;
+        let opaque = ch == 3 || data.chunks_exact(4).all(|p| p[3] == 255);
         for y in 0..h {
             let row = y * w * ch;
             let (a, b) = (&canvas[row..row + w * ch], &data[row..row + w * ch]);
@@ -502,7 +504,6 @@ fn plan_frames(frames: &[AnimationFrame], tolerance: u8) -> Vec<PlannedFrame> {
                 for x in 0..w {
                     if changed(x) {
                         count += 1;
-                        opaque &= ch == 3 || b[x * ch + 3] == 255;
                     }
                 }
             }

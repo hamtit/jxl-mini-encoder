@@ -884,3 +884,36 @@ fn lossless_hint_for_palette_animation_with_sparse_changes() {
     assert!(!jxl_mini_encoder::animation_prefers_lossless(&frames));
     assert!(!jxl_mini_encoder::animation_prefers_lossless(&[]));
 }
+
+/// Blending must not lose the hidden colour of unchanged transparent pixels.
+#[test]
+fn animation_lossless_keeps_hidden_rgb_of_transparent_pixels() {
+    let (w, h) = (16u32, 8u32);
+    let mut f0 = Vec::new();
+    for _ in 0..w * h {
+        f0.extend_from_slice(&[10u8, 20, 30, 0]);
+    }
+    let mut f1 = f0.clone();
+    f1[0..4].copy_from_slice(&[200, 100, 50, 255]);
+    let frames: Vec<_> = [&f0, &f1]
+        .iter()
+        .map(|p| jxl_mini_encoder::AnimationFrame {
+            image: jxl_mini_encoder::ImageRef::rgba8(w, h, p).unwrap(),
+            duration: 5,
+        })
+        .collect();
+    let opts = jxl_mini_encoder::EncoderOptions { distance: 0.0, effort: 5, threads: 2, noise: 0.0 };
+    let jxl = jxl_mini_encoder::encode_animation(&frames, &Default::default(), &opts).unwrap();
+    let image = jxl_oxide::JxlImage::builder().read(std::io::Cursor::new(&jxl)).expect("parse");
+    // The decoder may premultiply or drop hidden colours of fully transparent
+    // pixels, so compare against what a replace-coded frame decodes to.
+    let direct = |p: &Vec<u8>| {
+        let img = jxl_mini_encoder::ImageRef::rgba8(w, h, p).unwrap();
+        decode(&jxl_mini_encoder::Encoder::new().lossless().encode(&img).unwrap()).3
+    };
+    for (i, p) in [&f0, &f1].iter().enumerate() {
+        let fb = image.render_frame(i).expect("render").image_all_channels();
+        let data: Vec<u8> = fb.buf().iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect();
+        assert!(data == direct(p), "frame {i} differs from replace coding");
+    }
+}
