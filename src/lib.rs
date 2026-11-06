@@ -324,8 +324,14 @@ pub fn encode_animation(
     });
     let plan = plan_frames(frames, if lossless { 0 } else { INTERFRAME_TOLERANCE });
     let last = plan.len() - 1;
-    let mut crop_buf = Vec::new();
-    for (k, step) in plan.iter().enumerate() {
+    // Frames are independent once planned (each starts and ends on a byte
+    // boundary), so they are coded in parallel into separate buffers. Threads
+    // not needed across frames are left to the frame-internal parallelism.
+    let outer = opts.threads.min(plan.len());
+    let mut inner_opts = opts.clone();
+    inner_opts.threads = (opts.threads / outer).max(1);
+    let parts = parallel::par_map(plan.len(), outer, |k| {
+        let step = &plan[k];
         let src = &frames[step.index].image;
         let placement = FramePlacement {
             duration: Some(step.duration),
@@ -333,11 +339,12 @@ pub fn encode_animation(
             save: k != last,
             crop: step.rect.map(|(x, y, _, _)| (x, y)),
         };
+        let mut fw = BitWriter::new();
         match step.rect {
-            None => encode_frame(src, &opts, placement, noise, &mut w),
+            None => encode_frame(src, &inner_opts, placement, noise, &mut fw),
             Some((x, y, rw, rh)) => {
                 let ch = src.channels();
-                crop_buf.clear();
+                let mut crop_buf = Vec::with_capacity(rw as usize * rh as usize * ch);
                 for row in y..y + rh {
                     let o = (row as usize * src.width as usize + x as usize) * ch;
                     crop_buf.extend_from_slice(&src.data[o..o + rw as usize * ch]);
@@ -348,9 +355,13 @@ pub fn encode_animation(
                     alpha: src.alpha,
                     data: &crop_buf,
                 };
-                encode_frame(&part, &opts, placement, noise, &mut w);
+                encode_frame(&part, &inner_opts, placement, noise, &mut fw);
             }
         }
+        fw.finish()
+    });
+    for part in parts {
+        w.append_bytes(&part);
     }
     Ok(w.finish())
 }
