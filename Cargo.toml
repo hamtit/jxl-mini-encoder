@@ -1,6 +1,6 @@
 [package]
 name = "jxl-mini-encoder"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A small pure-Rust JPEG XL encoder for 8-bit sRGB RGB/RGBA, with lossy (VarDCT) and lossless (Modular) encoding"
 license = "BSD-3-Clause"
