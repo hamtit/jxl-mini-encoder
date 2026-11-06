@@ -299,11 +299,15 @@ pub fn encode_animation(
     let mut opts = opts.clone();
     opts.effort = opts.effort.clamp(1, 10);
     opts.threads = opts.threads.max(1);
+    let plan = plan_frames(frames, if lossless { 0 } else { INTERFRAME_TOLERANCE });
+    // Sparse lossless frames are blended: unchanged pixels are transparent,
+    // which needs an alpha channel even if the input has none.
+    let blending = plan.iter().any(|p| p.blend);
     let mut w = BitWriter::with_capacity(first.image.data.len() * frames.len() / 8);
     let info = ImageInfo {
         width: first.image.width,
         height: first.image.height,
-        has_alpha: first.image.alpha,
+        has_alpha: first.image.alpha || blending,
         xyb: !lossless,
         animation: Some(AnimationInfo {
             tps_numerator: anim.tps_numerator,
@@ -322,37 +326,114 @@ pub fn encode_animation(
         levels.sort_unstable();
         levels[levels.len() / 2]
     });
-    let plan = plan_frames(frames, if lossless { 0 } else { INTERFRAME_TOLERANCE });
     let last = plan.len() - 1;
-    let mut crop_buf = Vec::new();
-    for (k, step) in plan.iter().enumerate() {
+    // Frames are independent once planned (each starts and ends on a byte
+    // boundary), so they are coded in parallel into separate buffers. Threads
+    // not needed across frames are left to the frame-internal parallelism.
+    let outer = opts.threads.min(plan.len());
+    let mut inner_opts = opts.clone();
+    inner_opts.threads = (opts.threads / outer).max(1);
+    let parts = parallel::par_map(plan.len(), outer, |k| {
+        let step = &plan[k];
         let src = &frames[step.index].image;
         let placement = FramePlacement {
             duration: Some(step.duration),
             is_last: k == last,
             save: k != last,
             crop: step.rect.map(|(x, y, _, _)| (x, y)),
+            blend: step.blend,
         };
-        match step.rect {
-            None => encode_frame(src, &opts, placement, noise, &mut w),
-            Some((x, y, rw, rh)) => {
-                let ch = src.channels();
-                crop_buf.clear();
-                for row in y..y + rh {
-                    let o = (row as usize * src.width as usize + x as usize) * ch;
-                    crop_buf.extend_from_slice(&src.data[o..o + rw as usize * ch]);
+        let mut fw = BitWriter::new();
+        let sch = src.channels();
+        // In a blended animation every frame carries alpha.
+        let och = if blending { 4 } else { sch };
+        let (x, y, rw, rh) = step.rect.unwrap_or((0, 0, src.width, src.height));
+        let whole = step.rect.is_none() && och == sch;
+        let mut buf = Vec::new();
+        if !whole {
+            buf.reserve(rw as usize * rh as usize * och);
+            // The canvas before this frame is the previous coded frame.
+            let prev = (step.blend && k > 0).then(|| frames[plan[k - 1].index].image.data);
+            for row in y..y + rh {
+                let o = (row as usize * src.width as usize + x as usize) * sch;
+                let line = &src.data[o..o + rw as usize * sch];
+                for (i, px) in line.chunks_exact(sch).enumerate() {
+                    if och == 4 && sch == 3 {
+                        buf.extend_from_slice(px);
+                        buf.push(255);
+                    } else {
+                        buf.extend_from_slice(px);
+                    }
+                    if let Some(prev) = prev {
+                        if prev[o + i * sch..o + (i + 1) * sch] == *px {
+                            let n = buf.len();
+                            buf[n - och..].fill(0); // transparent: keep the canvas
+                        }
+                    }
                 }
-                let part = ImageRef {
-                    width: rw,
-                    height: rh,
-                    alpha: src.alpha,
-                    data: &crop_buf,
-                };
-                encode_frame(&part, &opts, placement, noise, &mut w);
             }
         }
+        let part = if whole {
+            *src
+        } else {
+            ImageRef {
+                width: rw,
+                height: rh,
+                alpha: och == 4,
+                data: &buf,
+            }
+        };
+        encode_frame(&part, &inner_opts, placement, noise, &mut fw);
+        fw.finish()
+    });
+    for part in parts {
+        w.append_bytes(&part);
     }
     Ok(w.finish())
+}
+
+/// Whether lossless coding is likely to beat lossy coding for these frames.
+///
+/// True for animations made of flat-colour frames (each with at most 256
+/// distinct colours, as decoded from a GIF) in which on average less than
+/// 10% of the pixels change from frame to frame, such as screen recordings
+/// and simple games. Palette coding of the sparse changes is then both exact
+/// and smaller than VarDCT. Frames with gradients or with much motion are
+/// better coded lossy. The frames must have the same size and channel layout.
+pub fn animation_prefers_lossless(frames: &[AnimationFrame]) -> bool {
+    let Some(first) = frames.first() else {
+        return false;
+    };
+    if frames.len() < 2 {
+        return false;
+    }
+    // Colour counts on a few frames are enough to tell a palette animation.
+    let step = (frames.len() / 8).max(1);
+    if !frames
+        .iter()
+        .step_by(step)
+        .all(|f| lossless::Palette::of(&f.image).is_some())
+    {
+        return false;
+    }
+    let (w, h, ch) = (
+        first.image.width as usize,
+        first.image.height as usize,
+        first.image.channels(),
+    );
+    let mut changed = 0usize;
+    for pair in frames.windows(2) {
+        let (a, b) = (pair[0].image.data, pair[1].image.data);
+        if a.len() != b.len() || a.len() != w * h * ch {
+            return false;
+        }
+        changed += a
+            .chunks_exact(ch)
+            .zip(b.chunks_exact(ch))
+            .filter(|(p, q)| p != q)
+            .count();
+    }
+    changed * 10 < w * h * (frames.len() - 1)
 }
 
 /// Version of this crate.
@@ -369,6 +450,9 @@ struct PlannedFrame {
     index: usize,
     duration: u32,
     rect: Option<(u32, u32, u32, u32)>,
+    /// Blend the cropped frame (lossless only): pixels equal to the canvas
+    /// are made transparent.
+    blend: bool,
 }
 
 /// Inter-frame prediction: a frame that differs from the canvas only in a
@@ -381,6 +465,7 @@ fn plan_frames(frames: &[AnimationFrame], tolerance: u8) -> Vec<PlannedFrame> {
         index,
         duration: frames[index].duration,
         rect: None,
+        blend: false,
     };
     // Zero-duration frames are layers of the next frame; keep them as given.
     if frames.iter().any(|f| f.duration == 0) || std::env::var_os("MINI_NO_INTERFRAME").is_some() {
@@ -397,6 +482,11 @@ fn plan_frames(frames: &[AnimationFrame], tolerance: u8) -> Vec<PlannedFrame> {
     for (index, f) in frames.iter().enumerate().skip(1) {
         let data = f.image.data;
         let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
+        // Changed pixels, and whether the frame is fully opaque. A blended
+        // frame cannot make a pixel transparent, and it does not keep the
+        // hidden colour of a transparent pixel that stays unchanged.
+        let mut count = 0usize;
+        let opaque = ch == 3 || data.chunks_exact(4).all(|p| p[3] == 255);
         for y in 0..h {
             let row = y * w * ch;
             let (a, b) = (&canvas[row..row + w * ch], &data[row..row + w * ch]);
@@ -410,6 +500,13 @@ fn plan_frames(frames: &[AnimationFrame], tolerance: u8) -> Vec<PlannedFrame> {
                     a[x * ch + c].abs_diff(b[x * ch + c]) > tol
                 })
             };
+            if tolerance == 0 {
+                for x in 0..w {
+                    if changed(x) {
+                        count += 1;
+                    }
+                }
+            }
             if let Some(l) = (0..w).find(|&x| changed(x)) {
                 let r = (0..w).rfind(|&x| changed(x)).unwrap_or(l);
                 x0 = x0.min(l);
@@ -436,12 +533,21 @@ fn plan_frames(frames: &[AnimationFrame], tolerance: u8) -> Vec<PlannedFrame> {
                 index,
                 duration: f.duration,
                 rect,
+                blend: false,
             });
             continue;
         }
         let (x0, y0) = (x0 & !7, y0 & !7);
         let (x1, y1) = (x1.next_multiple_of(8).min(w), y1.next_multiple_of(8).min(h));
-        let rect = (x1 - x0) * (y1 - y0) * 10 < w * h * 9;
+        let area = (x1 - x0) * (y1 - y0);
+        // Lossless frames in which most of the rectangle is unchanged are
+        // blended, leaving the unchanged pixels transparent. That is cheap
+        // however large the rectangle is.
+        let blend = tolerance == 0
+            && opaque
+            && count * 10 < area * 8
+            && std::env::var_os("MINI_NO_BLEND").is_none();
+        let rect = blend || area * 10 < w * h * 9;
         if rect {
             for y in y0..y1 {
                 let o = (y * w + x0) * ch;
@@ -454,6 +560,7 @@ fn plan_frames(frames: &[AnimationFrame], tolerance: u8) -> Vec<PlannedFrame> {
             index,
             duration: f.duration,
             rect: rect.then_some((x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)),
+            blend,
         });
     }
     plan

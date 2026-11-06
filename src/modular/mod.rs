@@ -57,6 +57,14 @@ pub enum Transform {
         permutation: u32,
         kind: u32,
     },
+    /// Palette of `nb_colors` colours (no delta entries) for `num_c` channels
+    /// starting at `begin_c`; the channels become one index channel and a
+    /// meta channel holding the palette is put in front.
+    Palette {
+        begin_c: u32,
+        num_c: u32,
+        nb_colors: u32,
+    },
 }
 
 impl Transform {
@@ -76,6 +84,24 @@ impl Transform {
                     permutation * 7 + kind,
                     [Val(6), Bits(2, 0), Bits(4, 2), Bits(6, 10)],
                 );
+            }
+            Transform::Palette {
+                begin_c,
+                num_c,
+                nb_colors,
+            } => {
+                w.write(2, 1);
+                w.write_u32(
+                    begin_c,
+                    [Bits(3, 0), Bits(6, 8), Bits(10, 72), Bits(13, 1096)],
+                );
+                w.write_u32(num_c, [Val(1), Val(3), Val(4), Bits(13, 1)]);
+                w.write_u32(
+                    nb_colors,
+                    [Bits(8, 0), Bits(10, 256), Bits(12, 1280), Bits(16, 5376)],
+                );
+                w.write_u32(0, [Val(0), Bits(8, 1), Bits(10, 257), Bits(16, 1281)]); // nb_deltas
+                w.write(4, 0); // d_pred (unused without deltas)
             }
         }
     }
@@ -189,6 +215,27 @@ impl ModularOptions {
                 threads: 1,
             },
         }
+    }
+
+    /// Settings for palette index channels, where neighbouring indices are
+    /// categories rather than intensities: constant and neighbour predictors,
+    /// and splits on the neighbouring indices.
+    pub fn for_palette(mut self, effort: u32) -> Self {
+        if let Some(l) = &mut self.learn {
+            l.predictors = vec![Predictor::Zero, Predictor::West, Predictor::North];
+            if effort >= 8 {
+                l.predictors.push(Predictor::Gradient);
+            }
+            // W, N, then the gradient-like differences and the channel.
+            l.props = vec![7, 6, 10, 11, 12, 0];
+            if effort >= 5 {
+                l.props.extend([13, 14]);
+            }
+            if effort >= 7 {
+                l.props.extend([2, 3]);
+            }
+        }
+        self
     }
 
     /// Do not split on properties of more than one previous channel.

@@ -277,6 +277,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jxl-mini-encoder"
+version = "0.4.0"
+dependencies = [
+ "jpeg-decoder",
+ "jxl-oxide",
+ "png",
+ "ssimulacra2",
+]
+
+[[package]]
 name = "jxl-modular"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -362,16 +372,6 @@ dependencies = [
  "jxl-oxide-common",
  "jxl-threadpool",
  "tracing",
-]
-
-[[package]]
-name = "jxl-mini-encoder"
-version = "0.3.0"
-dependencies = [
- "jpeg-decoder",
- "jxl-oxide",
- "png",
- "ssimulacra2",
 ]
 
 [[package]]

@@ -35,6 +35,9 @@ pub struct FramePlacement {
     /// The frame covers only this canvas rectangle (x0, y0) and replaces it
     /// on top of the canvas saved in slot 1. Its size is the image's size.
     pub crop: Option<(u32, u32)>,
+    /// Alpha-blend a cropped frame onto the canvas instead of replacing it
+    /// (needs an alpha channel; transparent pixels leave the canvas as is).
+    pub blend: bool,
 }
 
 impl FramePlacement {
@@ -43,6 +46,7 @@ impl FramePlacement {
         is_last: true,
         save: false,
         crop: None,
+        blend: false,
     };
 }
 
@@ -215,15 +219,17 @@ pub fn write_frame_header(w: &mut BitWriter, f: &FrameInfo, size: (u32, u32)) {
                 w.write_u32(size.1, coord);
             }
             let blend_mode = [Val(0), Val(1), Val(2), Bits(2, 3)];
-            // Replace blending; a cropped frame is drawn onto slot 1, which
-            // then also needs its source written.
+            // A cropped frame is drawn onto slot 1, which then also needs its
+            // source written. Blending uses the first extra channel as alpha.
             let source = if place.crop.is_some() { 1 } else { 0 };
-            w.write_u32(0, blend_mode);
-            if place.crop.is_some() {
-                w.write(2, source);
-            }
-            for _ in 0..f.num_extra {
-                w.write_u32(0, blend_mode);
+            let blend = place.blend && place.crop.is_some() && f.num_extra > 0;
+            let mode = if blend { 2 } else { 0 };
+            for _ in 0..=f.num_extra {
+                w.write_u32(mode, blend_mode);
+                if blend {
+                    w.write_u32(0, [Val(0), Val(1), Val(2), Bits(3, 3)]); // alpha channel
+                    w.write_bool(false); // clamp
+                }
                 if place.crop.is_some() {
                     w.write(2, source);
                 }
