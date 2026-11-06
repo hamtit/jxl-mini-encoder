@@ -647,3 +647,42 @@ fn animation_interframe() {
         interframe(300, 140, ch, 1.0);
     }
 }
+
+/// Unchanged frames are merged into the previous one only while the summed
+/// display time fits the header; the total time must never shrink.
+#[test]
+fn animation_merge_keeps_total_duration() {
+    for (w, h) in [(40u32, 24u32), (8, 8)] {
+        let px = synth(w, h, 3, 5);
+        let img = jxl_mini_encoder::ImageRef::rgb8(w, h, &px).unwrap();
+        let frame = jxl_mini_encoder::AnimationFrame {
+            image: img,
+            duration: 3_000_000_000,
+        };
+        let anim = jxl_mini_encoder::AnimationOptions {
+            tps_numerator: 1_000_000_000,
+            ..Default::default()
+        };
+        let opts = jxl_mini_encoder::EncoderOptions {
+            distance: 0.0,
+            effort: 3,
+            threads: 1,
+            noise: 0.0,
+        };
+        let jxl = jxl_mini_encoder::encode_animation(&[frame; 3], &anim, &opts).unwrap();
+        let image = jxl_oxide::JxlImage::builder()
+            .read(std::io::Cursor::new(&jxl))
+            .expect("parse");
+        let total: u64 = (0..image.num_loaded_keyframes())
+            .map(|k| u64::from(image.render_frame(k).expect("render").duration()))
+            .sum();
+        assert_eq!(total, 9_000_000_000, "{w}x{h}");
+        let fb = image.render_frame(1).unwrap().image_all_channels();
+        let data: Vec<u8> = fb
+            .buf()
+            .iter()
+            .map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+            .collect();
+        assert!(data == px, "{w}x{h}: pixels differ");
+    }
+}

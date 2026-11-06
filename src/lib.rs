@@ -414,8 +414,24 @@ fn plan_frames(frames: &[AnimationFrame], tolerance: u8) -> Vec<PlannedFrame> {
             }
         }
         if x1 == 0 {
-            plan.last_mut().unwrap().duration =
-                plan.last().unwrap().duration.saturating_add(f.duration);
+            let prev = plan.last_mut().unwrap();
+            if let Some(sum) = prev.duration.checked_add(f.duration) {
+                prev.duration = sum;
+                continue;
+            }
+            // The merged time would not fit the header: show this frame on
+            // its own, coded as a single block (or whole, if that is all of it).
+            let (bw, bh) = (w.min(8), h.min(8));
+            let rect = (bw < w || bh < h).then_some((0, 0, bw as u32, bh as u32));
+            for y in 0..bh {
+                canvas[y * w * ch..(y * w + bw) * ch]
+                    .copy_from_slice(&data[y * w * ch..(y * w + bw) * ch]);
+            }
+            plan.push(PlannedFrame {
+                index,
+                duration: f.duration,
+                rect,
+            });
             continue;
         }
         let (x0, y0) = (x0 & !7, y0 & !7);
