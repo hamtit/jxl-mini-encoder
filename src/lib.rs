@@ -494,7 +494,15 @@ fn plan_frames(frames: &[AnimationFrame], tolerance: u8) -> Vec<PlannedFrame> {
         }
         let (x0, y0) = (x0 & !7, y0 & !7);
         let (x1, y1) = (x1.next_multiple_of(8).min(w), y1.next_multiple_of(8).min(h));
-        let rect = (x1 - x0) * (y1 - y0) * 10 < w * h * 9;
+        let area = (x1 - x0) * (y1 - y0);
+        // Lossless frames in which most of the rectangle is unchanged are
+        // blended, leaving the unchanged pixels transparent. That is cheap
+        // however large the rectangle is.
+        let blend = tolerance == 0
+            && opaque
+            && count * 10 < area * 8
+            && std::env::var_os("MINI_NO_BLEND").is_none();
+        let rect = blend || area * 10 < w * h * 9;
         if rect {
             for y in y0..y1 {
                 let o = (y * w + x0) * ch;
@@ -503,13 +511,6 @@ fn plan_frames(frames: &[AnimationFrame], tolerance: u8) -> Vec<PlannedFrame> {
         } else {
             canvas.copy_from_slice(data);
         }
-        // Lossless frames in which most of the rectangle is unchanged are
-        // blended, leaving the unchanged pixels transparent.
-        let blend = rect
-            && tolerance == 0
-            && opaque
-            && count * 10 < (x1 - x0) * (y1 - y0) * 8
-            && std::env::var_os("MINI_NO_BLEND").is_none();
         plan.push(PlannedFrame {
             index,
             duration: f.duration,

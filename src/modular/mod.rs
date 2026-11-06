@@ -217,6 +217,27 @@ impl ModularOptions {
         }
     }
 
+    /// Settings for palette index channels, where neighbouring indices are
+    /// categories rather than intensities: constant and neighbour predictors,
+    /// and splits on the neighbouring indices.
+    pub fn for_palette(mut self, effort: u32) -> Self {
+        if let Some(l) = &mut self.learn {
+            l.predictors = vec![Predictor::Zero, Predictor::West, Predictor::North];
+            if effort >= 8 {
+                l.predictors.push(Predictor::Gradient);
+            }
+            // W, N, then the gradient-like differences and the channel.
+            l.props = vec![7, 6, 10, 11, 12, 0];
+            if effort >= 5 {
+                l.props.extend([13, 14]);
+            }
+            if effort >= 7 {
+                l.props.extend([2, 3]);
+            }
+        }
+        self
+    }
+
     /// Do not split on properties of more than one previous channel.
     ///
     /// jxl-oxide fails to decode the (XYB, mostly empty) patch reference

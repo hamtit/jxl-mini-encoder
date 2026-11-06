@@ -387,6 +387,17 @@ fn patches_reference_frame_in_several_groups() {
     assert!(jxl.len() < 90_000, "{} B", jxl.len());
 }
 
+/// RGB input may come back with an opaque alpha channel (blended frames of a
+/// lossless animation need one); drop it after checking that it is opaque.
+fn strip_opaque_alpha(data: Vec<u8>, dch: usize, ch: usize) -> Vec<u8> {
+    if dch == ch {
+        return data;
+    }
+    assert_eq!((dch, ch), (4, 3), "unexpected channel count");
+    assert!(data.chunks_exact(4).all(|p| p[3] == 255), "alpha not opaque");
+    data.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect()
+}
+
 fn animation(w: u32, h: u32, ch: usize, n: usize, distance: f32, effort: u32) {
     let px: Vec<Vec<u8>> = (0..n).map(|i| synth(w, h, ch, 7 + i as u32)).collect();
     let imgs: Vec<_> = px
@@ -437,10 +448,8 @@ fn animation(w: u32, h: u32, ch: usize, n: usize, distance: f32, effort: u32) {
             .iter()
             .map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
             .collect();
-        assert_eq!(
-            (fb.width() as u32, fb.height() as u32, fb.channels()),
-            (w, h, ch)
-        );
+        assert_eq!((fb.width() as u32, fb.height() as u32), (w, h));
+        let data = strip_opaque_alpha(data, fb.channels(), ch);
         if distance == 0.0 {
             assert!(&data == p, "{w}x{h}x{ch} frame {i}: pixels differ");
         } else {
@@ -625,6 +634,7 @@ fn interframe(w: u32, h: u32, ch: usize, distance: f32) {
             .iter()
             .map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
             .collect();
+        let data = strip_opaque_alpha(data, fb.channels(), ch);
         if distance == 0.0 {
             assert!(&data == p, "{w}x{h}x{ch} frame {i}: pixels differ");
         } else {
@@ -724,4 +734,110 @@ fn animation_lossy_alpha_change_is_kept() {
     };
     let want = |p: &Vec<u8>| p.chunks(4).map(|c| c[3]).collect::<Vec<u8>>();
     assert!(alpha(0) == want(&a) && alpha(1) == want(&b));
+}
+
+/// A palette image (few colours, flat areas) round-trips exactly, with and
+/// without alpha, in one group and in several, including colours at the
+/// extremes (white is the largest packed colour).
+#[test]
+fn lossless_palette() {
+    for (w, h) in [(5, 3), (100, 80), (257, 40), (300, 300)] {
+        for ch in [3, 4] {
+            let colors: [[u8; 4]; 5] = [
+                [0, 0, 0, 255],
+                [255, 255, 255, 255],
+                [10, 200, 30, 255],
+                [255, 0, 0, 128],
+                [7, 7, 7, 0],
+            ];
+            let mut px = Vec::new();
+            for y in 0..h {
+                for x in 0..w {
+                    let k = if (x / 7 + y / 5) % 4 == 0 { (x + y) % 5 } else { 1 };
+                    px.extend_from_slice(&colors[k as usize][..ch]);
+                }
+            }
+            let img = if ch == 4 {
+                jxl_mini_encoder::ImageRef::rgba8(w as u32, h as u32, &px)
+            } else {
+                jxl_mini_encoder::ImageRef::rgb8(w as u32, h as u32, &px)
+            }
+            .unwrap();
+            for effort in [1, 4, 7, 9] {
+                let jxl = jxl_mini_encoder::Encoder::new()
+                    .lossless()
+                    .effort(effort)
+                    .threads(2)
+                    .encode(&img)
+                    .unwrap();
+                let (_, _, dc, data) = decode(&jxl);
+                assert_eq!(dc, ch);
+                assert!(data == px, "{w}x{h}x{ch} e{effort}: palette pixels differ");
+            }
+        }
+    }
+}
+
+/// More than 256 colours falls back to the colour transform.
+#[test]
+fn lossless_many_colors_not_palette() {
+    let (w, h) = (64u32, 64u32);
+    let mut px = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            px.extend_from_slice(&[(x * 4) as u8, (y * 4) as u8, ((x + y) * 2) as u8]);
+        }
+    }
+    let img = jxl_mini_encoder::ImageRef::rgb8(w, h, &px).unwrap();
+    let jxl = jxl_mini_encoder::Encoder::new().lossless().encode(&img).unwrap();
+    assert!(decode(&jxl).3 == px);
+}
+
+/// Sparse changes of a palette animation are blended; scattered pixels all
+/// over the frame (a large rectangle) must still decode exactly.
+#[test]
+fn animation_lossless_sparse_changes() {
+    for ch in [3, 4] {
+        let (w, h) = (300u32, 200u32);
+        let palette = [[20u8, 30, 40, 255], [250, 250, 250, 255], [200, 10, 10, 255], [10, 200, 10, 255]];
+        let mut frames_px: Vec<Vec<u8>> = Vec::new();
+        for f in 0..6u32 {
+            let mut px = Vec::new();
+            for y in 0..h {
+                for x in 0..w {
+                    let sparkle = (x * 7 + y * 13 + f * 31) % 97 == 0;
+                    let k = if sparkle { 1 + (f as usize + x as usize) % 3 } else { 0 };
+                    px.extend_from_slice(&palette[k][..ch]);
+                }
+            }
+            frames_px.push(px);
+        }
+        let frames: Vec<_> = frames_px
+            .iter()
+            .map(|p| jxl_mini_encoder::AnimationFrame {
+                image: if ch == 4 {
+                    jxl_mini_encoder::ImageRef::rgba8(w, h, p)
+                } else {
+                    jxl_mini_encoder::ImageRef::rgb8(w, h, p)
+                }
+                .unwrap(),
+                duration: 5,
+            })
+            .collect();
+        let opts = jxl_mini_encoder::EncoderOptions {
+            distance: 0.0,
+            effort: 5,
+            threads: 3,
+            noise: 0.0,
+        };
+        let jxl = jxl_mini_encoder::encode_animation(&frames, &Default::default(), &opts).unwrap();
+        let image = jxl_oxide::JxlImage::builder().read(std::io::Cursor::new(&jxl)).expect("parse");
+        assert_eq!(image.num_loaded_keyframes(), frames_px.len());
+        for (i, p) in frames_px.iter().enumerate() {
+            let fb = image.render_frame(i).expect("render").image_all_channels();
+            let data: Vec<u8> = fb.buf().iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect();
+            let data = strip_opaque_alpha(data, fb.channels(), ch);
+            assert!(&data == p, "ch{ch} frame {i}: pixels differ");
+        }
+    }
 }

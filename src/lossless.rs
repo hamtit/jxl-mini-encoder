@@ -289,6 +289,7 @@ pub fn encode(
         None => rct.into_iter().collect(),
     };
     let mopts = ModularOptions::for_effort(effort, w * h * nc).with_threads(opts.threads);
+    let mopts = if palette.is_some() { mopts.for_palette(effort) } else { mopts };
     let frame = FrameInfo {
         encoding: Encoding::Modular,
         num_extra: (nc - 3) as u32,
