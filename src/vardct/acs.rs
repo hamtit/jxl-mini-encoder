@@ -4,6 +4,7 @@
 use super::dct::Dct;
 use super::quant::dct_quant_weights;
 use super::small::{self, Small};
+use crate::tune::k as tk;
 
 /// The DCT transforms this encoder uses (numbered as in the bitstream).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1152,30 +1153,30 @@ impl<'a> Search<'a> {
             return;
         }
         self.select_8x8(&mut tile, self.small);
-        const MUL_16X8: f32 = 1.21;
-        const MUL_16X16: f32 = 1.34;
-        const MUL_16X32: f32 = 1.49;
-        const MUL_32X32: f32 = 1.48;
-        const MUL_64: f32 = 2.25;
+        let mul_16x8: f32 = 1.21 * tk(20);
+        let mul_16x16: f32 = 1.34 * tk(20);
+        let mul_16x32: f32 = 1.49 * tk(20);
+        let mul_32x32: f32 = 1.48 * tk(20);
+        let mul_64: f32 = 2.25 * tk(20);
         // 16x8 / 8x16 / 16x16 on aligned 2x2 squares, rectangles at the edges.
         for cy in (0..h).step_by(2) {
             for cx in (0..w).step_by(2) {
                 if cy + 1 < h && cx + 1 < w {
-                    self.divide_square(&mut tile, 2, cx, cy, MUL_16X8, MUL_16X16);
+                    self.divide_square(&mut tile, 2, cx, cy, mul_16x8, mul_16x16);
                 }
             }
         }
         for cy in (0..h.saturating_sub(1)).step_by(2) {
             for cx in 0..w {
                 if !(cx + 1 < w) && tile.is_first(cx, cy) {
-                    self.try_merge(&mut tile, Acs::Dct16x8, cx, cy, MUL_16X8, 2);
+                    self.try_merge(&mut tile, Acs::Dct16x8, cx, cy, mul_16x8, 2);
                 }
             }
         }
         for cy in 0..h {
             for cx in (0..w.saturating_sub(1)).step_by(2) {
                 if !(cy + 1 < h) && tile.is_first(cx, cy) {
-                    self.try_merge(&mut tile, Acs::Dct8x16, cx, cy, MUL_16X8, 2);
+                    self.try_merge(&mut tile, Acs::Dct8x16, cx, cy, mul_16x8, 2);
                 }
             }
         }
@@ -1183,7 +1184,7 @@ impl<'a> Search<'a> {
         for cy in (0..h).step_by(4) {
             for cx in (0..w).step_by(4) {
                 if cy + 3 < h && cx + 3 < w {
-                    self.divide_square(&mut tile, 4, cx, cy, MUL_16X32, MUL_32X32);
+                    self.divide_square(&mut tile, 4, cx, cy, mul_16x32, mul_32x32);
                 }
             }
         }
@@ -1191,13 +1192,13 @@ impl<'a> Search<'a> {
         // Below effort 8 the 64-sample transforms are not searched: on photos
         // they are rarely chosen and cost ~9% of encode time at equal quality.
         if w == 8 && h == 8 && inp.effort >= 8 {
-            self.divide_square(&mut tile, 8, 0, 0, MUL_64, MUL_64);
+            self.divide_square(&mut tile, 8, 0, 0, mul_64, mul_64);
         }
         if inp.effort >= 8 {
             for cy in 0..h.saturating_sub(1) {
                 for cx in 0..w.saturating_sub(1) {
                     if (cy | cx) % 2 != 0 {
-                        self.divide_square(&mut tile, 2, cx, cy, MUL_16X8, MUL_16X16);
+                        self.divide_square(&mut tile, 2, cx, cy, mul_16x8, mul_16x16);
                     }
                 }
             }
@@ -1205,7 +1206,7 @@ impl<'a> Search<'a> {
             for cy in (0..h.saturating_sub(3)).step_by(step) {
                 for cx in (0..w.saturating_sub(3)).step_by(step) {
                     if (cy | cx) % 4 != 0 {
-                        self.divide_square(&mut tile, 4, cx, cy, MUL_16X32, MUL_32X32);
+                        self.divide_square(&mut tile, 4, cx, cy, mul_16x32, mul_32x32);
                     }
                 }
             }

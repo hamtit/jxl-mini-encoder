@@ -18,6 +18,7 @@ use crate::entropy::{CodeOptions, EntropyCode, Token, pack_signed};
 use crate::headers::{Encoding, FrameInfo, FramePlacement, GROUP_DIM, Layout, write_frame_header, write_sections};
 use crate::modular::{Channel, GlobalTree, ModularOptions, write_header, write_standalone};
 use crate::parallel::par_map;
+use crate::tune::k as tk;
 use crate::{EncoderOptions, ImageRef};
 use acs::{Acs, BlockAcs, SearchInput, Tables};
 use dct::Dct;
@@ -69,7 +70,7 @@ impl Params {
             epf_iters,
             adaptive_quant: effort >= 5,
             choose_transforms: effort >= 5,
-            quant_dc: initial_quant_dc(distance) * 1.284,
+            quant_dc: initial_quant_dc(distance) * 1.284 * tk(9),
         }
     }
 }
@@ -288,12 +289,12 @@ impl Ctx<'_> {
                     }
                 }
                 let mut hf_mul = i32::from(self.quantizer.raw[aby * self.bw + abx]) + 1;
-                let mut thres_y = [0.546, 0.696, 0.696, 0.696];
+                let mut thres_y = [0.546 * tk(0), 0.696 * tk(1), 0.696 * tk(1), 0.696 * tk(1)];
                 if self.adjust && acs.small().is_none() {
                     let orig = hf_mul;
                     let mut best = 0;
                     for c in [1usize, 0, 2] {
-                        let mut th = [0.570, 0.618, 0.618, 0.618];
+                        let mut th = [0.570 * tk(4), 0.618 * tk(5), 0.618 * tk(5), 0.618 * tk(5)];
                         let mut qn = orig;
                         self.adjust_quant(&coeffs[c][..n], t, c, acs, &mut th, &mut qn);
                         if c == 1 {
@@ -360,8 +361,24 @@ impl Ctx<'_> {
                 coeffs[2][i] = b_all[blk.off + i] - rb * yr[i];
             }
             q[1][..n].copy_from_slice(&qy_all[blk.off..blk.off + n]);
-            self.quantize(&coeffs[0][..n], t, 0, nb, blk.qac, [0.588, 0.584, 0.584, 0.584], &mut q[0]);
-            self.quantize(&coeffs[2][..n], t, 2, nb, blk.qac, [0.588, 0.584, 0.584, 0.584], &mut q[2]);
+            self.quantize(
+                &coeffs[0][..n],
+                t,
+                0,
+                nb,
+                blk.qac,
+                [0.588 * tk(2), 0.584 * tk(3), 0.584 * tk(3), 0.584 * tk(3)],
+                &mut q[0],
+            );
+            self.quantize(
+                &coeffs[2][..n],
+                t,
+                2,
+                nb,
+                blk.qac,
+                [0.588 * tk(2), 0.584 * tk(3), 0.584 * tk(3), 0.584 * tk(3)],
+                &mut q[2],
+            );
             self.tokenize(blk.bx, blk.by, blk.acs, &q, &mut nz_row, &mut tokens);
             if self.recon {
                 let (nbx, nby) = blk.acs.blocks();
@@ -456,7 +473,7 @@ impl Ctx<'_> {
         if xs > 1 || ys > 1 {
             for th in thres.iter_mut() {
                 *th -= (0.003 * area).clamp(0.0, 0.08);
-                if *th < 0.530 {
+                if *th < 0.530 * tk(10) {
                     *th = 0.530;
                 }
             }
@@ -496,24 +513,24 @@ impl Ctx<'_> {
             }
         }
         if c == 1 && sum_vals * 8.0 < area {
-            const LIMIT: f32 = 0.46;
+            let limit: f32 = 0.46 * tk(21);
             const MUL: f32 = 0.9999;
             let orig = *quant;
             let mut new_q = *quant;
             for i in 1..4 {
-                if hf_nz[i] == 0.0 && hf_max_err[i] > LIMIT {
+                if hf_nz[i] == 0.0 && hf_max_err[i] > limit {
                     new_q = orig + 1;
                     break;
                 }
             }
             *quant = new_q;
             let r = new_q as f32 / orig as f32;
-            if hf_nz[3] == 0.0 && hf_max_err[3] > LIMIT {
+            if hf_nz[3] == 0.0 && hf_max_err[3] > limit {
                 thres[3] = MUL * hf_max_err[3] * r;
-            } else if (hf_nz[1] == 0.0 && hf_max_err[1] > LIMIT) || (hf_nz[2] == 0.0 && hf_max_err[2] > LIMIT) {
+            } else if (hf_nz[1] == 0.0 && hf_max_err[1] > limit) || (hf_nz[2] == 0.0 && hf_max_err[2] > limit) {
                 thres[1] = MUL * hf_max_err[1].max(hf_max_err[2]) * r;
                 thres[2] = thres[1];
-            } else if hf_nz[0] == 0.0 && hf_max_err[0] > LIMIT {
+            } else if hf_nz[0] == 0.0 && hf_max_err[0] > limit {
                 thres[0] = MUL * hf_max_err[0] * r;
             }
         }
@@ -632,7 +649,7 @@ impl Ctx<'_> {
                 }
             }
         }
-        if best.0 + CFL_MIN_GAIN < zero { best.1 } else { 0 }
+        if best.0 + CFL_MIN_GAIN * tk(12) < zero { best.1 } else { 0 }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -648,7 +665,7 @@ impl Ctx<'_> {
     ) {
         if c != 1 && nb >= 4 {
             for v in &mut thres {
-                *v = (*v - 0.00719 * nb as f32).max(0.5);
+                *v = (*v - 0.00719 * tk(6) * nb as f32).max(0.5);
             }
         }
         let m = qac * self.qm_mult[c];
@@ -889,8 +906,8 @@ pub fn encode(
     let (mut field, mask1x1, q_median) = if params.adaptive_quant {
         // Without Gaborish, scale the AQ target as libjxl does. Flat
         // graphics avoid the sharpening overshoot and extra edge coefficients.
-        let d_iqf = if gaborish { d } else { d * 0.631 };
-        let maps = aq::initial_quant_field(d_iqf, &xyb, 0.606 / d_iqf, opts.threads);
+        let d_iqf = if gaborish { d } else { d * 0.631 * tk(8) };
+        let maps = aq::initial_quant_field(d_iqf, &xyb, 0.606 * tk(11) / d_iqf, opts.threads);
         (maps.quant_field, maps.mask1x1, 0.39 / d)
     } else {
         let q = 0.79 / d;
@@ -906,7 +923,7 @@ pub fn encode(
     if gaborish {
         xyb::gaborish_inverse(&mut xyb, opts.threads);
     }
-    let qk = if params.adaptive_quant { aq_calibration(d, opts.effort) * AQ_TUNE } else { 1.0 };
+    let qk = if params.adaptive_quant { aq_calibration(d, opts.effort) * AQ_TUNE * tk(7) } else { 1.0 };
     field.iter_mut().for_each(|v| *v *= qk);
     let q_median = q_median * qk;
     let dct = Dct::new();

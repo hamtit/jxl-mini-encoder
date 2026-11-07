@@ -45,6 +45,7 @@ mod lossless;
 mod modular;
 mod parallel;
 mod patches;
+mod tune;
 mod vardct;
 
 pub use error::Error;
