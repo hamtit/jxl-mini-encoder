@@ -3,6 +3,7 @@
 use crate::bit_writer::BitWriter;
 use crate::entropy::{HybridUint, pack_signed};
 use crate::headers::{Encoding, FrameInfo, FramePlacement, GROUP_DIM, Layout, write_frame_header, write_sections};
+use crate::modular::predict::WP_LOSSLESS;
 use crate::modular::predict::grad_clamped;
 use crate::modular::{Channel, GlobalTree, ModularOptions, Transform, forward_rct, write_header, write_standalone};
 use crate::parallel::par_map;
@@ -236,7 +237,7 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, placement: FramePlacement, 
         None => rct.into_iter().collect(),
     };
     let mopts = ModularOptions::for_effort(effort, w * h * nc).with_threads(opts.threads);
-    let mopts = if palette.is_some() { mopts.for_palette(effort) } else { mopts };
+    let mopts = if palette.is_some() { mopts.for_palette(effort) } else { mopts.with_wp(&WP_LOSSLESS) };
     let frame = FrameInfo {
         encoding: Encoding::Modular,
         num_extra: (nc - 3) as u32,
@@ -283,7 +284,7 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, placement: FramePlacement, 
     lf_global.write_bool(true); // default LF dequantisation
     lf_global.write_bool(true); // global tree
     global.write(&mut lf_global);
-    write_header(&mut lf_global, true, &transforms);
+    write_header(&mut lf_global, true, &transforms, mopts.wp);
     if palette.is_some() {
         global.write_stream(0, &mut lf_global);
     } else {
@@ -295,7 +296,7 @@ pub fn encode(img: &ImageRef, opts: &EncoderOptions, placement: FramePlacement, 
     sections.push(BitWriter::new()); // HF global
     sections.extend(par_map(ng, opts.threads, |g| {
         let mut s = BitWriter::new();
-        write_header(&mut s, true, &[]);
+        write_header(&mut s, true, &[], mopts.wp);
         global.write_stream(first_group + g, &mut s);
         s
     }));

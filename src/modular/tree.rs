@@ -2,7 +2,9 @@
 //! tree serialisation and a greedy entropy-driven tree learner.
 
 use super::Channel;
-use super::predict::{MAX_PREV_CHANNELS, NUM_PROPS, Neighbors, Predictor, Weighted, base_props, prev_channel_props};
+use super::predict::{
+    MAX_PREV_CHANNELS, NUM_PROPS, Neighbors, Predictor, WP_DEFAULT, Weighted, WpParams, base_props, prev_channel_props,
+};
 use crate::bit_writer::BitWriter;
 use crate::entropy::{CodeOptions, HybridUint, Token, pack_signed, write_stream};
 use crate::parallel::{par_map, par_tasks};
@@ -31,6 +33,8 @@ pub struct Tree {
     num_leaves: u32,
     uses_wp: bool,
     max_prev: usize,
+    /// Parameters of the weighted predictor, if the tree uses it.
+    wp: &'static WpParams,
 }
 
 /// Recursive form used while building.
@@ -77,7 +81,12 @@ impl Tree {
                 }
             }
         }
-        Tree { nodes, num_leaves, uses_wp, max_prev }
+        Tree { nodes, num_leaves, uses_wp, max_prev, wp: &WP_DEFAULT }
+    }
+
+    pub fn with_wp(mut self, wp: &'static WpParams) -> Self {
+        self.wp = wp;
+        self
     }
 
     pub fn num_leaves(&self) -> usize {
@@ -135,7 +144,7 @@ impl Tree {
             })
             .max()
             .unwrap_or(0);
-        std::borrow::Cow::Owned(Self { nodes, num_leaves: self.num_leaves, uses_wp, max_prev })
+        std::borrow::Cow::Owned(Self { nodes, num_leaves: self.num_leaves, uses_wp, max_prev, wp: self.wp })
     }
 
     /// Serialise the tree with its own entropy code.
@@ -191,7 +200,7 @@ impl Tree {
         }
         let tree = self.specialize(i as i32, stream as i32);
         let prev = previous_same_size(channels, i, tree.max_prev);
-        visit(ch, i as i32, stream as i32, &prev, tree.uses_wp, |props, nb, wp, v| {
+        visit(ch, i as i32, stream as i32, &prev, tree.uses_wp.then_some(tree.wp), |props, nb, wp, v| {
             let (pred, ctx) = tree.leaf(props);
             let p = pred.predict(nb, wp);
             out.push(Token::new(ctx, pack_signed(v.wrapping_sub(p))));
@@ -212,11 +221,11 @@ fn visit(
     index: i32,
     stream: i32,
     prev: &[&Channel],
-    use_wp: bool,
+    use_wp: Option<&'static WpParams>,
     mut f: impl FnMut(&[i32; NUM_PROPS], &Neighbors, i64, i32),
 ) {
     let w = ch.w;
-    let mut wp = use_wp.then(|| Weighted::new(w));
+    let mut wp = use_wp.map(|params| Weighted::new(w, params));
     let mut props = [0i32; NUM_PROPS];
     for y in 0..ch.h {
         let cur = &ch.data[y * w..(y + 1) * w];
@@ -278,7 +287,7 @@ mod tests {
                 let mut expected = Vec::new();
                 for (i, ch) in channels.iter().enumerate() {
                     let prev = previous_same_size(&refs, i, tree.max_prev);
-                    visit(ch, i as i32, stream as i32, &prev, tree.uses_wp, |props, nb, wp, v| {
+                    visit(ch, i as i32, stream as i32, &prev, tree.uses_wp.then_some(tree.wp), |props, nb, wp, v| {
                         let (pred, ctx) = tree.leaf(props);
                         expected.push(Token::new(ctx, pack_signed(v.wrapping_sub(pred.predict(nb, wp)))));
                     });
@@ -320,6 +329,8 @@ pub struct LearnOptions {
     /// Bits a split must save to be kept.
     pub split_cost: f64,
     pub max_leaves: usize,
+    /// Weighted-predictor parameters the learned tree will be coded with.
+    pub wp: &'static WpParams,
     /// Worker threads for sampling and split search.
     pub threads: usize,
 }
@@ -493,7 +504,7 @@ fn learn_sized<const N: usize>(streams: &[(u32, Vec<&Channel>)], opts: &LearnOpt
         let mut counter = start;
         let mut k = 0;
         let prev = previous_same_size(chans, i, if uses_prev { MAX_PREV_CHANNELS } else { 0 });
-        visit(ch, i as i32, *stream as i32, &prev, need_wp, |props, nb, wp, v| {
+        visit(ch, i as i32, *stream as i32, &prev, need_wp.then_some(opts.wp), |props, nb, wp, v| {
             counter += 1;
             if !counter.is_multiple_of(stride) {
                 return;

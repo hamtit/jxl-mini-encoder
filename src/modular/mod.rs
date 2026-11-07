@@ -7,7 +7,7 @@ use crate::bit_writer::BitWriter;
 use crate::bit_writer::U32Dist::{Bits, Val};
 use crate::entropy::{CodeOptions, EntropyCode, Token};
 use crate::parallel::par_tasks;
-use predict::Predictor;
+use predict::{Predictor, WP_DEFAULT, WpParams};
 use tree::{LearnOptions, Tree};
 
 /// One channel of integer samples.
@@ -116,9 +116,21 @@ pub fn forward_rct(ch: &mut [Channel], permutation: u32, kind: u32) {
 }
 
 /// Write a modular sub-bitstream header.
-pub fn write_header(w: &mut BitWriter, use_global_tree: bool, transforms: &[Transform]) {
+pub fn write_header(w: &mut BitWriter, use_global_tree: bool, transforms: &[Transform], wp: &WpParams) {
     w.write_bool(use_global_tree);
-    w.write_bool(true); // default weighted-predictor parameters
+    if *wp == WP_DEFAULT {
+        w.write_bool(true); // default weighted-predictor parameters
+    } else {
+        w.write_bool(false);
+        for v in [wp.p1, wp.p2, wp.p3[0], wp.p3[1], wp.p3[2], wp.p3[3], wp.p3[4]] {
+            debug_assert!((0..32).contains(&v));
+            w.write(5, v as u64);
+        }
+        for v in wp.weights {
+            debug_assert!(v < 16);
+            w.write(4, u64::from(v));
+        }
+    }
     w.write_u32(transforms.len() as u32, [Val(0), Val(1), Bits(4, 2), Bits(8, 18)]);
     for t in transforms {
         t.write(w);
@@ -128,6 +140,8 @@ pub fn write_header(w: &mut BitWriter, use_global_tree: bool, transforms: &[Tran
 /// Effort-dependent choices for modular coding.
 #[derive(Clone, Debug)]
 pub struct ModularOptions {
+    /// Weighted-predictor parameters; the stream headers written for this tree must carry them.
+    pub wp: &'static WpParams,
     pub learn: Option<LearnOptions>,
     pub fixed_predictor: Predictor,
     pub code: CodeOptions,
@@ -168,10 +182,12 @@ impl ModularOptions {
                 },
                 split_cost: 150.0,
                 max_leaves: (total_px / 512).clamp(16, 4096),
+                wp: &WP_DEFAULT,
                 threads: 1,
             }
         });
         ModularOptions {
+            wp: &WP_DEFAULT,
             learn,
             fixed_predictor: Predictor::Gradient,
             code: CodeOptions {
@@ -218,6 +234,15 @@ impl ModularOptions {
     }
 
     /// Use up to `threads` worker threads.
+    /// Use other weighted-predictor parameters (the caller writes them in the stream headers).
+    pub fn with_wp(mut self, wp: &'static WpParams) -> Self {
+        self.wp = wp;
+        if let Some(l) = &mut self.learn {
+            l.wp = wp;
+        }
+        self
+    }
+
     pub fn with_threads(mut self, threads: usize) -> Self {
         let threads = threads.max(1);
         self.code.threads = threads;
@@ -228,10 +253,11 @@ impl ModularOptions {
     }
 
     fn tree(&self, streams: &[(u32, Vec<&Channel>)]) -> Tree {
-        match &self.learn {
+        let tree = match &self.learn {
             Some(opts) => tree::learn(streams, opts),
             None => Tree::single(self.fixed_predictor),
-        }
+        };
+        tree.with_wp(self.wp)
     }
 }
 
@@ -244,7 +270,7 @@ pub fn write_standalone(
     transforms: &[Transform],
     opts: &ModularOptions,
 ) {
-    write_header(w, false, transforms);
+    write_header(w, false, transforms, opts.wp);
     let streams = [(stream, channels.to_vec())];
     let tree = opts.tree(&streams);
     tree.write(w);

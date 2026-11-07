@@ -5,6 +5,7 @@
 use crate::bit_writer::{BitWriter, round_to_f16};
 use crate::entropy::{CodeOptions, Token, pack_signed, write_stream};
 use crate::headers::{Encoding, FrameInfo, FramePlacement, GROUP_DIM, Layout, write_frame_header, write_sections};
+use crate::modular::predict::WP_DEFAULT;
 use crate::modular::{Channel, GlobalTree, ModularOptions, write_header, write_standalone};
 use crate::parallel::par_map;
 use crate::vardct::xyb::Xyb;
@@ -549,14 +550,14 @@ impl Patches {
         write_dc_quant(&mut lf_global);
         lf_global.write_bool(true); // global tree
         global.write(&mut lf_global);
-        write_header(&mut lf_global, true, &[]);
+        write_header(&mut lf_global, true, &[], &WP_DEFAULT);
         global.write_empty_stream(&mut lf_global);
         let mut sections = vec![lf_global];
         sections.extend((0..nlf).map(|_| BitWriter::new()));
         sections.push(BitWriter::new()); // HF global
         sections.extend(par_map(ng, threads, |g| {
             let mut s = BitWriter::new();
-            write_header(&mut s, true, &[]);
+            write_header(&mut s, true, &[], &WP_DEFAULT);
             global.write_stream(g, &mut s);
             s
         }));

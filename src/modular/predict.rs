@@ -119,11 +119,22 @@ const fn div_lookup() -> [u32; 65] {
 }
 const DIV_LOOKUP: [u32; 65] = div_lookup();
 
-/// Default weighted-predictor parameters.
-const P1: i64 = 16;
-const P2: i64 = 10;
-const P3: [i64; 5] = [7, 7, 7, 0, 0];
-const WEIGHTS: [u32; 4] = [13, 12, 12, 12];
+/// Parameters of the self-correcting predictor (the WPHeader of the Modular header). Fields are the
+/// bit-stream values: `p1` and `p2` in 0..32 (5 bits), `p3` in 0..32 each, `weights` in 0..16 (4 bits).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WpParams {
+    pub p1: i64,
+    pub p2: i64,
+    pub p3: [i64; 5],
+    pub weights: [u32; 4],
+}
+
+/// The parameters every decoder assumes when the header says "default".
+pub static WP_DEFAULT: WpParams = WpParams { p1: 16, p2: 10, p3: [7, 7, 7, 0, 0], weights: [13, 12, 12, 12] };
+
+/// Parameters for lossless photographic coding, found by coordinate descent on the total size of
+/// lossless Kodak images (held-out images improve by about 0.5% in total).
+pub static WP_LOSSLESS: WpParams = WpParams { p1: 0, p2: 6, p3: [2, 7, 3, 5, 1], weights: [9, 12, 12, 12] };
 
 #[derive(Clone, Copy, Debug)]
 pub struct WpPrediction {
@@ -134,6 +145,7 @@ pub struct WpPrediction {
 
 /// The self-correcting predictor with default parameters.
 pub struct Weighted {
+    params: &'static WpParams,
     width: usize,
     x: usize,
     y: usize,
@@ -149,8 +161,9 @@ pub struct Weighted {
 }
 
 impl Weighted {
-    pub fn new(width: usize) -> Self {
+    pub fn new(width: usize, params: &'static WpParams) -> Self {
         Weighted {
+            params,
             width,
             x: 0,
             y: 0,
@@ -174,6 +187,7 @@ impl Weighted {
             i64::from(self.true_err_n),
             i64::from(self.true_err_ne),
         );
+        let WpParams { p1, p2, p3, weights } = *self.params;
         let n3 = i64::from(nb.n) << 3;
         let nw3 = i64::from(nb.nw) << 3;
         let ne3 = i64::from(nb.ne) << 3;
@@ -181,15 +195,15 @@ impl Weighted {
         let nn3 = i64::from(nb.nn) << 3;
         let subpred = [
             w3 + ne3 - n3,
-            n3 - (((te_w + te_n + te_ne) * P1) >> 5),
-            w3 - (((te_w + te_n + te_nw) * P2) >> 5),
-            n3 - ((te_nw * P3[0] + te_n * P3[1] + te_ne * P3[2] + (nn3 - n3) * P3[3] + (nw3 - w3) * P3[4]) >> 5),
+            n3 - (((te_w + te_n + te_ne) * p1) >> 5),
+            w3 - (((te_w + te_n + te_nw) * p2) >> 5),
+            n3 - ((te_nw * p3[0] + te_n * p3[1] + te_ne * p3[2] + (nn3 - n3) * p3[3] + (nw3 - w3) * p3[4]) >> 5),
         ];
         let mut weight = [0u32; 4];
         for i in 0..4 {
             let err_sum = self.sub_nw_ww[i].wrapping_add(self.sub_n_w[i]).wrapping_add(self.sub_ne[i]);
             let shift = ((u64::from(err_sum) + 1) >> 5).checked_ilog2().unwrap_or(0);
-            weight[i] = 4 + ((WEIGHTS[i] * DIV_LOOKUP[(err_sum >> shift) as usize + 1]) >> shift);
+            weight[i] = 4 + ((weights[i] * DIV_LOOKUP[(err_sum >> shift) as usize + 1]) >> shift);
         }
         let sum: u32 = weight.iter().sum();
         let log_weight = (u64::from(sum) >> 4).ilog2();

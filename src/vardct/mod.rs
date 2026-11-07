@@ -16,6 +16,7 @@ use crate::bit_writer::U32Dist::{Bits, Val};
 use crate::bit_writer::{ceil_log2, pack_f16, unpack_f16};
 use crate::entropy::{CodeOptions, EntropyCode, Token, pack_signed};
 use crate::headers::{Encoding, FrameInfo, FramePlacement, GROUP_DIM, Layout, write_frame_header, write_sections};
+use crate::modular::predict::WP_DEFAULT;
 use crate::modular::{Channel, GlobalTree, ModularOptions, write_header, write_standalone};
 use crate::parallel::par_map;
 use crate::{EncoderOptions, ImageRef};
@@ -1173,7 +1174,7 @@ pub fn encode(
         (_, Some(t)) => {
             lf_global.write_bool(true);
             t.write(&mut lf_global);
-            write_header(&mut lf_global, true, &[]);
+            write_header(&mut lf_global, true, &[], &WP_DEFAULT);
             t.write_empty_stream(&mut lf_global);
         }
     }
@@ -1188,7 +1189,7 @@ pub fn encode(
         let mut s = BitWriter::new();
         hf_code.write_tokens(&groups[g].tokens, &mut s);
         if let Some(t) = &alpha_tree {
-            write_header(&mut s, true, &[]);
+            write_header(&mut s, true, &[], &WP_DEFAULT);
             t.write_stream(g, &mut s);
         }
         s
