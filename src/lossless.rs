@@ -2,13 +2,9 @@
 
 use crate::bit_writer::BitWriter;
 use crate::entropy::{HybridUint, pack_signed};
-use crate::headers::{
-    Encoding, FrameInfo, FramePlacement, GROUP_DIM, Layout, write_frame_header, write_sections,
-};
+use crate::headers::{Encoding, FrameInfo, FramePlacement, GROUP_DIM, Layout, write_frame_header, write_sections};
 use crate::modular::predict::grad_clamped;
-use crate::modular::{
-    Channel, GlobalTree, ModularOptions, Transform, forward_rct, write_header, write_standalone,
-};
+use crate::modular::{Channel, GlobalTree, ModularOptions, Transform, forward_rct, write_header, write_standalone};
 use crate::parallel::par_map;
 use crate::{EncoderOptions, ImageRef};
 
@@ -22,11 +18,7 @@ struct GradientCost {
 
 impl GradientCost {
     fn new() -> Self {
-        GradientCost {
-            hist: [0; 64],
-            extra: 0,
-            n: 0,
-        }
+        GradientCost { hist: [0; 64], extra: 0, n: 0 }
     }
 
     /// Add row `y` of `ch` (rows `y - 1` and `y` must be present).
@@ -42,11 +34,7 @@ impl GradientCost {
 
     fn cost(&self) -> f64 {
         let t = f64::from(self.n.max(1));
-        self.hist
-            .iter()
-            .filter(|&&c| c > 0)
-            .map(|&c| f64::from(c) * (t / f64::from(c)).log2())
-            .sum::<f64>()
+        self.hist.iter().filter(|&&c| c > 0).map(|&c| f64::from(c) * (t / f64::from(c)).log2()).sum::<f64>()
             + self.extra as f64
     }
 }
@@ -60,12 +48,7 @@ fn load_rect(img: &ImageRef, nc: usize, x: usize, y: usize, w: usize, h: usize) 
             let mut data = Vec::with_capacity(w * h);
             for row in y..y + h {
                 let base = (row * width + x) * stride + c;
-                data.extend(
-                    img.data[base..base + (w - 1) * stride + 1]
-                        .iter()
-                        .step_by(stride)
-                        .map(|&v| i32::from(v)),
-                );
+                data.extend(img.data[base..base + (w - 1) * stride + 1].iter().step_by(stride).map(|&v| i32::from(v)));
             }
             Channel { w, h, data }
         })
@@ -78,22 +61,14 @@ fn load_rect(img: &ImageRef, nc: usize, x: usize, y: usize, w: usize, h: usize) 
 fn choose_rct(img: &ImageRef, effort: u32) -> Option<Transform> {
     const YCOCG: (u32, u32) = (0, 6);
     if effort < 4 {
-        return Some(Transform::Rct {
-            begin_c: 0,
-            permutation: YCOCG.0,
-            kind: YCOCG.1,
-        });
+        return Some(Transform::Rct { begin_c: 0, permutation: YCOCG.0, kind: YCOCG.1 });
     }
     let candidates = &[YCOCG, (1, 3), (1, 5), (0, 0), (1, 2)];
     let (w, h) = (img.width as usize, img.height as usize);
     let step = ((h * w) / (1 << 18)).max(1);
     let mut best: Option<(f64, (u32, u32))> = None;
     for &(perm, kind) in candidates {
-        let mut acc = [
-            GradientCost::new(),
-            GradientCost::new(),
-            GradientCost::new(),
-        ];
+        let mut acc = [GradientCost::new(), GradientCost::new(), GradientCost::new()];
         for y in (1..h).step_by(step) {
             // Two rows are enough: the predictor looks at y - 1 and y only.
             let mut rows = load_rect(img, 3, 0, y - 1, w, 2);
@@ -113,11 +88,7 @@ fn choose_rct(img: &ImageRef, effort: u32) -> Option<Transform> {
     if (perm, kind) == (0, 0) {
         return None;
     }
-    Some(Transform::Rct {
-        begin_c: 0,
-        permutation: perm,
-        kind,
-    })
+    Some(Transform::Rct { begin_c: 0, permutation: perm, kind })
 }
 
 /// Channels of a rectangle with the colour transform applied.
@@ -127,10 +98,7 @@ fn load_group(
     transform: Option<Transform>,
 ) -> Vec<Channel> {
     let mut ch = load_rect(img, img.channels(), x, y, w, h);
-    if let Some(Transform::Rct {
-        permutation, kind, ..
-    }) = transform
-    {
+    if let Some(Transform::Rct { permutation, kind, .. }) = transform {
         forward_rct(&mut ch[..3], permutation, kind);
     }
     ch
@@ -189,11 +157,7 @@ impl Palette {
         // Order by luma so that smooth ramps stay smooth in index space.
         keys.sort_by_key(|&k| {
             let [r, g, b, a] = k.to_le_bytes();
-            (
-                u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114,
-                a,
-                k,
-            )
+            (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114, a, k)
         });
         let mut table = vec![(0u64, 0u16); PALETTE_TABLE];
         let mut colors = Vec::with_capacity(keys.len());
@@ -232,20 +196,12 @@ impl Palette {
     }
 
     fn transform(&self, nc: usize) -> Transform {
-        Transform::Palette {
-            begin_c: 0,
-            num_c: nc as u32,
-            nb_colors: self.colors.len() as u32,
-        }
+        Transform::Palette { begin_c: 0, num_c: nc as u32, nb_colors: self.colors.len() as u32 }
     }
 }
 
 /// The index channel of the rectangle (x, y, w, h).
-fn load_indices(
-    img: &ImageRef,
-    pal: &Palette,
-    (x, y, w, h): (usize, usize, usize, usize),
-) -> Channel {
+fn load_indices(img: &ImageRef, pal: &Palette, (x, y, w, h): (usize, usize, usize, usize)) -> Channel {
     let ch = img.channels();
     let width = img.width as usize;
     let mut out = Channel::new(w, h);
@@ -269,21 +225,12 @@ fn load_indices(
     out
 }
 
-pub fn encode(
-    img: &ImageRef,
-    opts: &EncoderOptions,
-    placement: FramePlacement,
-    out: &mut BitWriter,
-) {
+pub fn encode(img: &ImageRef, opts: &EncoderOptions, placement: FramePlacement, out: &mut BitWriter) {
     let (w, h) = (img.width as usize, img.height as usize);
     let nc = img.channels();
     let effort = opts.effort;
     let palette = Palette::of(img);
-    let rct = if palette.is_some() {
-        None
-    } else {
-        choose_rct(img, effort)
-    };
+    let rct = if palette.is_some() { None } else { choose_rct(img, effort) };
     let transforms: Vec<Transform> = match &palette {
         Some(p) => vec![p.transform(nc)],
         None => rct.into_iter().collect(),
@@ -319,11 +266,9 @@ pub fn encode(
     }
     let ng = layout.num_groups();
     let nlf = layout.num_lf_groups();
-    let crops: Vec<Vec<Channel>> = par_map(ng, opts.threads, |g| {
-        match &palette {
-            Some(p) => vec![load_indices(img, p, layout.group_rect(g))],
-            None => load_group(img, layout.group_rect(g), rct),
-        }
+    let crops: Vec<Vec<Channel>> = par_map(ng, opts.threads, |g| match &palette {
+        Some(p) => vec![load_indices(img, p, layout.group_rect(g))],
+        None => load_group(img, layout.group_rect(g), rct),
     });
     // The palette is a small meta channel, coded in the global stream (id 0).
     let mut streams: Vec<(u32, Vec<Channel>)> = Vec::new();
@@ -331,12 +276,7 @@ pub fn encode(
         streams.push((0, vec![p.meta(nc)]));
     }
     let first_group = streams.len();
-    streams.extend(
-        crops
-            .into_iter()
-            .enumerate()
-            .map(|(g, c)| ((1 + 3 * nlf + 17 + g) as u32, c)),
-    );
+    streams.extend(crops.into_iter().enumerate().map(|(g, c)| ((1 + 3 * nlf + 17 + g) as u32, c)));
     let global = GlobalTree::build_owned(streams, &mopts);
     let mut sections = Vec::with_capacity(2 + nlf + ng);
     let mut lf_global = BitWriter::new();

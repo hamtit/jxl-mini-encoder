@@ -24,20 +24,14 @@ impl BitWriter {
     }
 
     pub fn with_capacity(bytes: usize) -> Self {
-        Self {
-            buf: Vec::with_capacity(bytes),
-            ..Self::default()
-        }
+        Self { buf: Vec::with_capacity(bytes), ..Self::default() }
     }
 
     /// Write the low `n` bits of `v` (n <= 32).
     #[inline]
     pub fn write(&mut self, n: u32, v: u64) {
         debug_assert!(n <= 32);
-        debug_assert!(
-            n == 32 || v < (1u64 << n),
-            "value {v} does not fit in {n} bits"
-        );
+        debug_assert!(n == 32 || v < (1u64 << n), "value {v} does not fit in {n} bits");
         self.acc |= v << self.nbits;
         self.nbits += n;
         while self.nbits >= 8 {
@@ -221,9 +215,7 @@ mod tests {
 
     #[test]
     fn pack_f16_round_trips_within_half_ulp() {
-        for &v in &[
-            0.0f32, 1e-9, 3e-5, 6.1e-5, 0.01, -0.03, 0.5, 0.8573, -1.2, 100.0,
-        ] {
+        for &v in &[0.0f32, 1e-9, 3e-5, 6.1e-5, 0.01, -0.03, 0.5, 0.8573, -1.2, 100.0] {
             let r = unpack_f16(pack_f16(v));
             assert!((r - v).abs() <= v.abs() / 1024.0 + 3e-8, "{v} -> {r}");
         }

@@ -86,20 +86,8 @@ enum Stage {
     Two,
 }
 
-const OFF_0: [(isize, isize); 12] = [
-    (-2, 0),
-    (-1, -1),
-    (-1, 0),
-    (-1, 1),
-    (0, -2),
-    (0, -1),
-    (0, 1),
-    (0, 2),
-    (1, -1),
-    (1, 0),
-    (1, 1),
-    (2, 0),
-];
+const OFF_0: [(isize, isize); 12] =
+    [(-2, 0), (-1, -1), (-1, 0), (-1, 1), (0, -2), (0, -1), (0, 1), (0, 2), (1, -1), (1, 0), (1, 1), (2, 0)];
 const OFF_1: [(isize, isize); 4] = [(-1, 0), (0, -1), (0, 1), (1, 0)];
 
 /// One EPF pass. `inv_sigma` holds one value per 8x8 block.
@@ -124,30 +112,13 @@ fn run_stage(src: &Planes, dst: &mut Planes, inv_sigma: &[f32], stage: Stage, th
         _ => &OFF_1,
     };
     let [d0, d1, d2] = &mut dst.p;
-    let tasks: Vec<_> = d0
-        .chunks_mut(w * 8)
-        .zip(d1.chunks_mut(w * 8))
-        .zip(d2.chunks_mut(w * 8))
-        .enumerate()
-        .collect();
-    let ctx = StageCtx {
-        w,
-        bw,
-        pw,
-        padded_src: &padded_src,
-        inv_sigma,
-        stage,
-        offs,
-        sm,
-        bsm,
-    };
+    let tasks: Vec<_> = d0.chunks_mut(w * 8).zip(d1.chunks_mut(w * 8)).zip(d2.chunks_mut(w * 8)).enumerate().collect();
+    let ctx = StageCtx { w, bw, pw, padded_src: &padded_src, inv_sigma, stage, offs, sm, bsm };
     #[cfg(target_arch = "x86_64")]
     let avx2 = std::arch::is_x86_feature_detected!("avx2");
     #[cfg(not(target_arch = "x86_64"))]
     let avx2 = false;
-    par_tasks(tasks, threads, |(band, ((o0, o1), o2))| {
-        run_band(&ctx, band, o0, o1, o2, avx2)
-    });
+    par_tasks(tasks, threads, |(band, ((o0, o1), o2))| run_band(&ctx, band, o0, o1, o2, avx2));
 }
 
 /// Everything `run_band` reads besides its output band.
@@ -163,14 +134,7 @@ struct StageCtx<'a> {
     bsm: f32,
 }
 
-fn run_band(
-    ctx: &StageCtx,
-    band: usize,
-    o0: &mut [f32],
-    o1: &mut [f32],
-    o2: &mut [f32],
-    avx2: bool,
-) {
+fn run_band(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2: &mut [f32], avx2: bool) {
     #[cfg(target_arch = "x86_64")]
     if avx2 {
         // SAFETY: AVX2 support was detected at runtime.
@@ -182,29 +146,13 @@ fn run_band(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn run_band_avx2(
-    ctx: &StageCtx,
-    band: usize,
-    o0: &mut [f32],
-    o1: &mut [f32],
-    o2: &mut [f32],
-) {
+unsafe fn run_band_avx2(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2: &mut [f32]) {
     run_band_impl(ctx, band, o0, o1, o2)
 }
 
 #[inline(always)]
 fn run_band_impl(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2: &mut [f32]) {
-    let StageCtx {
-        w,
-        bw,
-        pw,
-        padded_src,
-        inv_sigma,
-        stage,
-        offs,
-        sm,
-        bsm,
-    } = *ctx;
+    let StageCtx { w, bw, pw, padded_src, inv_sigma, stage, offs, sm, bsm } = *ctx;
     let y0 = band * 8;
     let rows = o0.len() / w;
     let sigmas = &inv_sigma[band * bw..(band + 1) * bw];
@@ -268,8 +216,10 @@ fn run_band_impl(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2
             let y = y0 + r;
             let border_row = r == 0 || r == 7;
             for (k, (ip, ac)) in isig_px[xs..xe]
-                .chunks_exact_mut(8)
-                .zip(active[xs..xe].chunks_exact_mut(8))
+                .as_chunks_mut::<8>()
+                .0
+                .iter_mut()
+                .zip(active[xs..xe].as_chunks_mut::<8>().0.iter_mut())
                 .enumerate()
             {
                 let isig = sigmas[rb0 + k];
@@ -299,11 +249,8 @@ fn run_band_impl(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2
                 let (ws, a0, a1, a2) = (&mut ws[..tw], &mut a0[..tw], &mut a1[..tw], &mut a2[..tw]);
                 for (k, &(dy, dx)) in offs.iter().enumerate() {
                     let nb = (row as isize + dy * pw as isize + dx) as usize + x0;
-                    let (p0, p1, p2) = (
-                        &padded_src[0][nb..nb + tw],
-                        &padded_src[1][nb..nb + tw],
-                        &padded_src[2][nb..nb + tw],
-                    );
+                    let (p0, p1, p2) =
+                        (&padded_src[0][nb..nb + tw], &padded_src[1][nb..nb + tw], &padded_src[2][nb..nb + tw]);
                     if matches!(stage, Stage::Two) {
                         let (m0, m1, m2) = (
                             &padded_src[0][row + x0..row + x0 + tw],
@@ -324,8 +271,7 @@ fn run_band_impl(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2
                     } else {
                         // Plus-shaped sum of the difference plane around the pixel.
                         let d = &diff[k * drows * dw..(k + 1) * drows * dw];
-                        let line =
-                            |l: usize, off: usize| &d[l * dw + off + x0..l * dw + off + x0 + tw];
+                        let line = |l: usize, off: usize| &d[l * dw + off + x0..l * dw + off + x0 + tw];
                         let (c, up, down) = (line(r + 1, 1), line(r, 1), line(r + 2, 1));
                         let (left, right) = (line(r + 1, 0), line(r + 1, 2));
                         for x in 0..tw {
@@ -409,10 +355,7 @@ fn block_errors(
                 }
             }
         }
-        out.extend(
-            err.iter()
-                .map(|e| KW[0] * e[0] + KW[1] * e[1] + KW[2] * e[2]),
-        );
+        out.extend(err.iter().map(|e| KW[0] * e[0] + KW[1] * e[1] + KW[2] * e[2]));
     }
     out
 }
@@ -426,22 +369,12 @@ const MIN_STRIP_BLOCK_ROWS: usize = 4;
 
 /// Decode block rows `by0..by1` under every candidate strength and return the
 /// masked error of each block, one vector per candidate.
-fn strip_errors(
-    inp: &Input,
-    rec: &RecRows,
-    steps: &[usize],
-    by0: usize,
-    by1: usize,
-) -> Vec<Vec<f32>> {
+fn strip_errors(inp: &Input, rec: &RecRows, steps: &[usize], by0: usize, by1: usize) -> Vec<Vec<f32>> {
     let (w, h, bw, bh) = (inp.w, inp.h, inp.w / 8, inp.h / 8);
     // Local rows cover block rows by0-1 .. by1+1, mirrored at the image edges.
     let lo = by0 as isize - 1;
     let local_bh = by1 - by0 + 2;
-    let mut strip = Planes {
-        w,
-        h: local_bh * 8,
-        p: std::array::from_fn(|_| vec![0f32; w * local_bh * 8]),
-    };
+    let mut strip = Planes { w, h: local_bh * 8, p: std::array::from_fn(|_| vec![0f32; w * local_bh * 8]) };
     for c in 0..3 {
         for ly in 0..local_bh * 8 {
             let gy = mirror(lo * 8 + ly as isize, h);
@@ -472,28 +405,13 @@ fn strip_errors(
     if inp.iters >= 2 {
         stages.push(Stage::Two);
     }
-    let mut cur = Planes {
-        w,
-        h: strip.h,
-        p: std::array::from_fn(|_| vec![0f32; w * strip.h]),
-    };
-    let mut tmp = Planes {
-        w,
-        h: strip.h,
-        p: std::array::from_fn(|_| vec![0f32; w * strip.h]),
-    };
+    let mut cur = Planes { w, h: strip.h, p: std::array::from_fn(|_| vec![0f32; w * strip.h]) };
+    let mut tmp = Planes { w, h: strip.h, p: std::array::from_fn(|_| vec![0f32; w * strip.h]) };
     let mut result = Vec::with_capacity(steps.len());
     for &val in steps {
         if val == 0 {
             // Zero strength leaves every block unfiltered.
-            result.push(block_errors(
-                inp,
-                &strip,
-                &orig,
-                y_off,
-                orig_y0,
-                interior.clone(),
-            ));
+            result.push(block_errors(inp, &strip, &orig, y_off, orig_y0, interior.clone()));
             continue;
         }
         let inv_sigma: Vec<f32> = quant
@@ -559,9 +477,8 @@ fn flat_neighbourhoods(strip: &Planes, bh: usize, bw: usize) -> Vec<bool> {
                 continue;
             };
             skip[by * bw + bx] = (by - 1..=by + 1).all(|y| {
-                (bx.saturating_sub(1)..=(bx + 1).min(bw - 1)).all(|x| {
-                    colour[y * bw + x].is_some_and(|n| (0..3).all(|k| (n[k] - c[k]).abs() <= EPS))
-                })
+                (bx.saturating_sub(1)..=(bx + 1).min(bw - 1))
+                    .all(|x| colour[y * bw + x].is_some_and(|n| (0..3).all(|k| (n[k] - c[k]).abs() <= EPS)))
             });
         }
     }
@@ -572,11 +489,7 @@ fn flat_neighbourhoods(strip: &Planes, bh: usize, bw: usize) -> Vec<bool> {
 /// image before Gaborish.
 pub fn choose(inp: &Input, rec: &RecRows, threads: usize) -> Vec<u8> {
     let (bw, bh) = (inp.w / 8, inp.h / 8);
-    let steps: &[usize] = if inp.distance > 4.5 {
-        &[0, 4]
-    } else {
-        &[0, 2, 7]
-    };
+    let steps: &[usize] = if inp.distance > 4.5 { &[0, 4] } else { &[0, 2, 7] };
     let mut lut = [0usize; 8];
     for (i, &s) in steps.iter().enumerate() {
         lut[s] = i;
@@ -584,9 +497,7 @@ pub fn choose(inp: &Input, rec: &RecRows, threads: usize) -> Vec<u8> {
     // Shorter strips give small images enough of them to keep every thread
     // busy, at the price of a larger share of halo rows; the result does not
     // depend on the strip height.
-    let strip_rows = bh
-        .div_ceil(2 * threads.max(1))
-        .clamp(MIN_STRIP_BLOCK_ROWS, STRIP_BLOCK_ROWS);
+    let strip_rows = bh.div_ceil(2 * threads.max(1)).clamp(MIN_STRIP_BLOCK_ROWS, STRIP_BLOCK_ROWS);
     let strips = bh.div_ceil(strip_rows);
     let parts = par_map(strips, threads, |i| {
         let by0 = i * strip_rows;
@@ -676,11 +587,7 @@ mod tests {
     use super::*;
 
     fn flat(w: usize, h: usize, v: [f32; 3]) -> Planes {
-        Planes {
-            w,
-            h,
-            p: v.map(|x| vec![x; w * h]),
-        }
+        Planes { w, h, p: v.map(|x| vec![x; w * h]) }
     }
 
     #[test]
@@ -715,16 +622,8 @@ mod tests {
             let orig_rows = |by0: usize, by1: usize| -> [Vec<f32>; 3] {
                 std::array::from_fn(|c| orig.p[c][by0 * 8 * w..by1 * 8 * w].to_vec())
             };
-            let input = Input {
-                orig: &orig_rows,
-                mask1x1: &mask,
-                quant: &quant,
-                w,
-                h,
-                distance,
-                iters,
-                gaborish: true,
-            };
+            let input =
+                Input { orig: &orig_rows, mask1x1: &mask, quant: &quant, w, h, distance, iters, gaborish: true };
             let rec_rows = |c: usize, y: usize, dst: &mut [f32]| {
                 dst.copy_from_slice(&rec.p[c][y * w..(y + 1) * w]);
             };

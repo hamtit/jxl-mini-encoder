@@ -11,24 +11,11 @@ fn synth(w: u32, h: u32, ch: usize, seed: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity((w * h) as usize * ch);
     for y in 0..h {
         for x in 0..w {
-            let base = [
-                (x * 255 / w.max(1)) as i32,
-                (y * 255 / h.max(1)) as i32,
-                ((x + y) * 3 % 256) as i32,
-                200,
-            ];
+            let base = [(x * 255 / w.max(1)) as i32, (y * 255 / h.max(1)) as i32, ((x + y) * 3 % 256) as i32, 200];
             for (c, &b) in base.iter().enumerate().take(ch) {
                 let noise = (rnd() % 9) as i32 - 4;
-                let v = if (x / 16 + y / 16) % 3 == 0 {
-                    b + noise
-                } else {
-                    b
-                };
-                out.push(if c == 3 {
-                    ((x ^ y) & 0xff) as u8
-                } else {
-                    v.clamp(0, 255) as u8
-                });
+                let v = if (x / 16 + y / 16) % 3 == 0 { b + noise } else { b };
+                out.push(if c == 3 { ((x ^ y) & 0xff) as u8 } else { v.clamp(0, 255) as u8 });
             }
         }
     }
@@ -36,16 +23,10 @@ fn synth(w: u32, h: u32, ch: usize, seed: u32) -> Vec<u8> {
 }
 
 fn decode(jxl: &[u8]) -> (u32, u32, usize, Vec<u8>) {
-    let image = jxl_oxide::JxlImage::builder()
-        .read(std::io::Cursor::new(jxl))
-        .expect("parse");
+    let image = jxl_oxide::JxlImage::builder().read(std::io::Cursor::new(jxl)).expect("parse");
     let render = image.render_frame(0).expect("render");
     let fb = render.image_all_channels();
-    let data = fb
-        .buf()
-        .iter()
-        .map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
-        .collect();
+    let data = fb.buf().iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect();
     (fb.width() as u32, fb.height() as u32, fb.channels(), data)
 }
 
@@ -57,12 +38,7 @@ fn lossless(w: u32, h: u32, ch: usize, effort: u32) {
         jxl_mini_encoder::ImageRef::rgb8(w, h, &px)
     }
     .unwrap();
-    let jxl = jxl_mini_encoder::Encoder::new()
-        .lossless()
-        .effort(effort)
-        .threads(2)
-        .encode(&img)
-        .unwrap();
+    let jxl = jxl_mini_encoder::Encoder::new().lossless().effort(effort).threads(2).encode(&img).unwrap();
     let (dw, dh, dc, data) = decode(&jxl);
     assert_eq!((dw, dh, dc), (w, h, ch));
     assert!(data == px, "{w}x{h}x{ch} e{effort}: pixels differ");
@@ -97,13 +73,10 @@ fn constant_planes_and_binary_images() {
             let pixels: Vec<u8> = (0..w * h).flat_map(|_| [0, 127, 255, alpha]).collect();
             let image = jxl_mini_encoder::ImageRef::rgba8(w, h, &pixels).unwrap();
             for quality in [90.0, 100.0] {
-                let out = jxl_mini_encoder::Encoder::new()
-                    .quality(quality)
-                    .encode(&image)
-                    .unwrap();
+                let out = jxl_mini_encoder::Encoder::new().quality(quality).encode(&image).unwrap();
                 let (dw, dh, ch, decoded) = decode(&out);
                 assert_eq!((dw, dh, ch), (w, h, 4));
-                assert!(decoded.chunks_exact(4).all(|p| p[3] == alpha));
+                assert!(decoded.as_chunks::<4>().0.iter().all(|p| p[3] == alpha));
                 if quality == 100.0 {
                     assert_eq!(decoded, pixels);
                 }
@@ -127,12 +100,7 @@ fn constant_planes_and_binary_images() {
 }
 
 fn psnr(a: &[u8], b: &[u8]) -> f64 {
-    let mse: f64 = a
-        .iter()
-        .zip(b)
-        .map(|(&x, &y)| (f64::from(x) - f64::from(y)).powi(2))
-        .sum::<f64>()
-        / a.len() as f64;
+    let mse: f64 = a.iter().zip(b).map(|(&x, &y)| (f64::from(x) - f64::from(y)).powi(2)).sum::<f64>() / a.len() as f64;
     10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10()
 }
 
@@ -144,12 +112,7 @@ fn lossy(w: u32, h: u32, ch: usize, quality: f32, effort: u32) -> f64 {
         jxl_mini_encoder::ImageRef::rgb8(w, h, &px)
     }
     .unwrap();
-    let jxl = jxl_mini_encoder::Encoder::new()
-        .quality(quality)
-        .effort(effort)
-        .threads(3)
-        .encode(&img)
-        .unwrap();
+    let jxl = jxl_mini_encoder::Encoder::new().quality(quality).effort(effort).threads(3).encode(&img).unwrap();
     let (dw, dh, dc, data) = decode(&jxl);
     assert_eq!((dw, dh, dc), (w, h, ch));
     if ch == 4 {
@@ -196,12 +159,7 @@ fn lossy_very_wide() {
     let (w, h) = (524_296u32, 1u32);
     let px = vec![128u8; (w * h) as usize * 3];
     let img = jxl_mini_encoder::ImageRef::rgb8(w, h, &px).unwrap();
-    let jxl = jxl_mini_encoder::Encoder::new()
-        .quality(90.0)
-        .effort(1)
-        .threads(4)
-        .encode(&img)
-        .unwrap();
+    let jxl = jxl_mini_encoder::Encoder::new().quality(90.0).effort(1).threads(4).encode(&img).unwrap();
     let (dw, dh, _, data) = decode(&jxl);
     assert_eq!((dw, dh), (w, h));
     assert!(data.iter().all(|&v| v.abs_diff(128) <= 2));
@@ -224,14 +182,7 @@ fn threads_do_not_change_output() {
             jxl_mini_encoder::ImageRef::rgb8(w, h, &px)
         }
         .unwrap();
-        let enc = |t| {
-            jxl_mini_encoder::Encoder::new()
-                .quality(quality)
-                .effort(effort)
-                .threads(t)
-                .encode(&img)
-                .unwrap()
-        };
+        let enc = |t| jxl_mini_encoder::Encoder::new().quality(quality).effort(effort).threads(t).encode(&img).unwrap();
         assert_eq!(enc(1), enc(3), "{w}x{h} ch={ch} q={quality} e={effort}");
     }
 }
@@ -264,10 +215,7 @@ fn hard_edges_stay_small_at_high_fidelity() {
         assert!(bytes.len() < 5000, "d{distance} produced {} B", bytes.len());
         let (dw, dh, ch, decoded) = decode(&bytes);
         assert_eq!((dw, dh, ch), (w, h, 3));
-        assert!(
-            psnr(&px, &decoded) > 35.0,
-            "d{distance}: fidelity regression"
-        );
+        assert!(psnr(&px, &decoded) > 35.0, "d{distance}: fidelity regression");
     }
 }
 
@@ -281,9 +229,7 @@ fn glyph_page(w: u32, h: u32, ch: usize) -> Vec<u8> {
         s >> 16
     };
     // Eight 9x11 bitmaps with about half the pixels set.
-    let glyphs: Vec<Vec<bool>> = (0..8)
-        .map(|_| (0..99).map(|_| rnd() % 2 == 0).collect())
-        .collect();
+    let glyphs: Vec<Vec<bool>> = (0..8).map(|_| (0..99).map(|_| rnd() % 2 == 0).collect()).collect();
     let mut px = vec![0u8; (w * h) as usize * ch];
     for p in px.chunks_mut(ch) {
         p[..3].copy_from_slice(&[245, 245, 240]);
@@ -319,20 +265,12 @@ fn patches_roundtrip(w: u32, h: u32, ch: usize, distance: f32, max_bytes: usize)
         jxl_mini_encoder::ImageRef::rgb8(w, h, &px)
     }
     .unwrap();
-    let jxl = jxl_mini_encoder::Encoder::new()
-        .distance(distance)
-        .effort(7)
-        .encode(&img)
-        .unwrap();
+    let jxl = jxl_mini_encoder::Encoder::new().distance(distance).effort(7).encode(&img).unwrap();
     let (dw, dh, dch, out) = decode(&jxl);
     assert_eq!((dw, dh, dch), (w, h, ch));
     let p = psnr(&px, &out);
     assert!(p > 28.0, "psnr {p}");
-    assert!(
-        jxl.len() <= max_bytes,
-        "{} B for {w}x{h}x{ch} d{distance}",
-        jxl.len()
-    );
+    assert!(jxl.len() <= max_bytes, "{} B for {w}x{h}x{ch} d{distance}", jxl.len());
 }
 
 #[test]
@@ -354,9 +292,7 @@ fn patches_reference_frame_in_several_groups() {
         s = s.wrapping_mul(1664525).wrapping_add(1013904223);
         s >> 16
     };
-    let shapes: Vec<Vec<bool>> = (0..420)
-        .map(|_| (0..100).map(|_| rnd() % 2 == 0).collect())
-        .collect();
+    let shapes: Vec<Vec<bool>> = (0..420).map(|_| (0..100).map(|_| rnd() % 2 == 0).collect()).collect();
     for (k, g) in shapes.iter().enumerate() {
         for rep in 0..2 {
             let x = 6 + (k % 34) * 20 + rep * 7 % 3;
@@ -375,11 +311,7 @@ fn patches_reference_frame_in_several_groups() {
         }
     }
     let img = jxl_mini_encoder::ImageRef::rgb8(w, h, &px).unwrap();
-    let jxl = jxl_mini_encoder::Encoder::new()
-        .distance(1.0)
-        .effort(7)
-        .encode(&img)
-        .unwrap();
+    let jxl = jxl_mini_encoder::Encoder::new().distance(1.0).effort(7).encode(&img).unwrap();
     let (dw, dh, _, out) = decode(&jxl);
     assert_eq!((dw, dh), (w, h));
     assert!(psnr(&px, &out) > 25.0);
@@ -394,8 +326,8 @@ fn strip_opaque_alpha(data: Vec<u8>, dch: usize, ch: usize) -> Vec<u8> {
         return data;
     }
     assert_eq!((dch, ch), (4, 3), "unexpected channel count");
-    assert!(data.chunks_exact(4).all(|p| p[3] == 255), "alpha not opaque");
-    data.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect()
+    assert!(data.as_chunks::<4>().0.iter().all(|p| p[3] == 255), "alpha not opaque");
+    data.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect()
 }
 
 fn animation(w: u32, h: u32, ch: usize, n: usize, distance: f32, effort: u32) {
@@ -403,65 +335,34 @@ fn animation(w: u32, h: u32, ch: usize, n: usize, distance: f32, effort: u32) {
     let imgs: Vec<_> = px
         .iter()
         .map(|p| {
-            if ch == 4 {
-                jxl_mini_encoder::ImageRef::rgba8(w, h, p)
-            } else {
-                jxl_mini_encoder::ImageRef::rgb8(w, h, p)
-            }
-            .unwrap()
+            if ch == 4 { jxl_mini_encoder::ImageRef::rgba8(w, h, p) } else { jxl_mini_encoder::ImageRef::rgb8(w, h, p) }
+                .unwrap()
         })
         .collect();
     let durations = [10u32, 1, 300, 5, 7];
     let frames: Vec<_> = imgs
         .iter()
         .enumerate()
-        .map(|(i, &image)| jxl_mini_encoder::AnimationFrame {
-            image,
-            duration: durations[i % durations.len()],
-        })
+        .map(|(i, &image)| jxl_mini_encoder::AnimationFrame { image, duration: durations[i % durations.len()] })
         .collect();
-    let opts = jxl_mini_encoder::EncoderOptions {
-        distance,
-        effort,
-        threads: 2,
-        noise: 0.0,
-    };
-    let anim = jxl_mini_encoder::AnimationOptions {
-        num_loops: 3,
-        ..Default::default()
-    };
+    let opts = jxl_mini_encoder::EncoderOptions { distance, effort, threads: 2, noise: 0.0 };
+    let anim = jxl_mini_encoder::AnimationOptions { num_loops: 3, ..Default::default() };
     let jxl = jxl_mini_encoder::encode_animation(&frames, &anim, &opts).unwrap();
-    let image = jxl_oxide::JxlImage::builder()
-        .read(std::io::Cursor::new(&jxl))
-        .expect("parse");
+    let image = jxl_oxide::JxlImage::builder().read(std::io::Cursor::new(&jxl)).expect("parse");
     let header = image.image_header();
     let a = header.metadata.animation.as_ref().expect("animation");
-    assert_eq!(
-        (a.tps_numerator, a.tps_denominator, a.num_loops),
-        (100, 1, 3)
-    );
+    assert_eq!((a.tps_numerator, a.tps_denominator, a.num_loops), (100, 1, 3));
     for (i, p) in px.iter().enumerate() {
         let render = image.render_frame(i).expect("render");
         let fb = render.image_all_channels();
-        let data: Vec<u8> = fb
-            .buf()
-            .iter()
-            .map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
-            .collect();
+        let data: Vec<u8> = fb.buf().iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect();
         assert_eq!((fb.width() as u32, fb.height() as u32), (w, h));
         let data = strip_opaque_alpha(data, fb.channels(), ch);
         if distance == 0.0 {
             assert!(&data == p, "{w}x{h}x{ch} frame {i}: pixels differ");
         } else {
-            let err: u64 = data
-                .iter()
-                .zip(p)
-                .map(|(&a, &b)| u64::from(a.abs_diff(b)))
-                .sum();
-            assert!(
-                err / (data.len() as u64) < 12,
-                "frame {i}: mean error too large"
-            );
+            let err: u64 = data.iter().zip(p).map(|(&a, &b)| u64::from(a.abs_diff(b))).sum();
+            assert!(err / (data.len() as u64) < 12, "frame {i}: mean error too large");
         }
     }
     assert!(image.render_frame(n).is_err(), "unexpected extra frame");
@@ -494,19 +395,13 @@ fn animation_errors() {
     let b = vec![0u8; 8 * 16 * 3];
     let opts = jxl_mini_encoder::EncoderOptions::default();
     let anim = jxl_mini_encoder::AnimationOptions::default();
-    assert_eq!(
-        jxl_mini_encoder::encode_animation(&[], &anim, &opts),
-        Err(jxl_mini_encoder::Error::NoFrames)
-    );
+    assert_eq!(jxl_mini_encoder::encode_animation(&[], &anim, &opts), Err(jxl_mini_encoder::Error::NoFrames));
     let f = |image| jxl_mini_encoder::AnimationFrame { image, duration: 1 };
     let frames = [
         f(jxl_mini_encoder::ImageRef::rgb8(8, 8, &a).unwrap()),
         f(jxl_mini_encoder::ImageRef::rgb8(8, 16, &b).unwrap()),
     ];
-    assert_eq!(
-        jxl_mini_encoder::encode_animation(&frames, &anim, &opts),
-        Err(jxl_mini_encoder::Error::FrameMismatch)
-    );
+    assert_eq!(jxl_mini_encoder::encode_animation(&frames, &anim, &opts), Err(jxl_mini_encoder::Error::FrameMismatch));
 }
 
 #[test]
@@ -522,16 +417,9 @@ fn animation_zero_duration_frame_is_not_a_keyframe() {
             duration: if i == 1 { 0 } else { 5 },
         })
         .collect();
-    let opts = jxl_mini_encoder::EncoderOptions {
-        distance: 0.0,
-        effort: 3,
-        threads: 1,
-        noise: 0.0,
-    };
+    let opts = jxl_mini_encoder::EncoderOptions { distance: 0.0, effort: 3, threads: 1, noise: 0.0 };
     let jxl = jxl_mini_encoder::encode_animation(&frames, &Default::default(), &opts).unwrap();
-    let image = jxl_oxide::JxlImage::builder()
-        .read(std::io::Cursor::new(&jxl))
-        .expect("parse");
+    let image = jxl_oxide::JxlImage::builder().read(std::io::Cursor::new(&jxl)).expect("parse");
     assert!(image.render_frame(1).is_ok());
     assert!(image.render_frame(2).is_err());
 }
@@ -539,34 +427,18 @@ fn animation_zero_duration_frame_is_not_a_keyframe() {
 #[test]
 fn animation_rejects_unrepresentable_tick_rate() {
     let a = vec![0u8; 3];
-    let frames = [jxl_mini_encoder::AnimationFrame {
-        image: jxl_mini_encoder::ImageRef::rgb8(1, 1, &a).unwrap(),
-        duration: 1,
-    }];
+    let frames =
+        [jxl_mini_encoder::AnimationFrame { image: jxl_mini_encoder::ImageRef::rgb8(1, 1, &a).unwrap(), duration: 1 }];
     let opts = jxl_mini_encoder::EncoderOptions::default();
-    for (num, den) in [
-        (0, 1),
-        (1, 0),
-        (100, 2000),
-        (u32::MAX, 1),
-        ((1 << 30) + 1, 1),
-    ] {
-        let anim = jxl_mini_encoder::AnimationOptions {
-            tps_numerator: num,
-            tps_denominator: den,
-            num_loops: 0,
-        };
+    for (num, den) in [(0, 1), (1, 0), (100, 2000), (u32::MAX, 1), ((1 << 30) + 1, 1)] {
+        let anim = jxl_mini_encoder::AnimationOptions { tps_numerator: num, tps_denominator: den, num_loops: 0 };
         assert_eq!(
             jxl_mini_encoder::encode_animation(&frames, &anim, &opts),
             Err(jxl_mini_encoder::Error::InvalidAnimation),
             "{num}/{den}"
         );
     }
-    let max = jxl_mini_encoder::AnimationOptions {
-        tps_numerator: 1 << 30,
-        tps_denominator: 1024,
-        num_loops: u32::MAX,
-    };
+    let max = jxl_mini_encoder::AnimationOptions { tps_numerator: 1 << 30, tps_denominator: 1024, num_loops: u32::MAX };
     assert!(jxl_mini_encoder::encode_animation(&frames, &max, &opts).is_ok());
 }
 
@@ -602,18 +474,11 @@ fn interframe(w: u32, h: u32, ch: usize, distance: f32) {
             duration: 3 + i as u32,
         })
         .collect();
-    let opts = jxl_mini_encoder::EncoderOptions {
-        distance,
-        effort: 5,
-        threads: 2,
-        noise: 0.0,
-    };
+    let opts = jxl_mini_encoder::EncoderOptions { distance, effort: 5, threads: 2, noise: 0.0 };
     let anim = Default::default();
     let jxl = jxl_mini_encoder::encode_animation(&frames, &anim, &opts).unwrap();
     let whole = std::env::var_os("MINI_NO_INTERFRAME").is_some();
-    let image = jxl_oxide::JxlImage::builder()
-        .read(std::io::Cursor::new(&jxl))
-        .expect("parse");
+    let image = jxl_oxide::JxlImage::builder().read(std::io::Cursor::new(&jxl)).expect("parse");
     // Identical neighbours (steps 0/1 and 3/4) are merged.
     let shown = if whole { px.len() } else { px.len() - 2 };
     assert_eq!(image.num_loaded_keyframes(), shown);
@@ -629,20 +494,12 @@ fn interframe(w: u32, h: u32, ch: usize, distance: f32) {
         let k = starts.partition_point(|&s| s <= at) - 1;
         at += frames[i].duration;
         let fb = image.render_frame(k).expect("render").image_all_channels();
-        let data: Vec<u8> = fb
-            .buf()
-            .iter()
-            .map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
-            .collect();
+        let data: Vec<u8> = fb.buf().iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect();
         let data = strip_opaque_alpha(data, fb.channels(), ch);
         if distance == 0.0 {
             assert!(&data == p, "{w}x{h}x{ch} frame {i}: pixels differ");
         } else {
-            let err: u64 = data
-                .iter()
-                .zip(p)
-                .map(|(&a, &b)| u64::from(a.abs_diff(b)))
-                .sum();
+            let err: u64 = data.iter().zip(p).map(|(&a, &b)| u64::from(a.abs_diff(b))).sum();
             assert!(err / (data.len() as u64) < 12, "frame {i}: error too large");
         }
     }
@@ -665,34 +522,17 @@ fn animation_merge_keeps_total_duration() {
     for (w, h) in [(40u32, 24u32), (8, 8)] {
         let px = synth(w, h, 3, 5);
         let img = jxl_mini_encoder::ImageRef::rgb8(w, h, &px).unwrap();
-        let frame = jxl_mini_encoder::AnimationFrame {
-            image: img,
-            duration: 3_000_000_000,
-        };
-        let anim = jxl_mini_encoder::AnimationOptions {
-            tps_numerator: 1_000_000_000,
-            ..Default::default()
-        };
-        let opts = jxl_mini_encoder::EncoderOptions {
-            distance: 0.0,
-            effort: 3,
-            threads: 1,
-            noise: 0.0,
-        };
+        let frame = jxl_mini_encoder::AnimationFrame { image: img, duration: 3_000_000_000 };
+        let anim = jxl_mini_encoder::AnimationOptions { tps_numerator: 1_000_000_000, ..Default::default() };
+        let opts = jxl_mini_encoder::EncoderOptions { distance: 0.0, effort: 3, threads: 1, noise: 0.0 };
         let jxl = jxl_mini_encoder::encode_animation(&[frame; 3], &anim, &opts).unwrap();
-        let image = jxl_oxide::JxlImage::builder()
-            .read(std::io::Cursor::new(&jxl))
-            .expect("parse");
+        let image = jxl_oxide::JxlImage::builder().read(std::io::Cursor::new(&jxl)).expect("parse");
         let total: u64 = (0..image.num_loaded_keyframes())
             .map(|k| u64::from(image.render_frame(k).expect("render").duration()))
             .sum();
         assert_eq!(total, 9_000_000_000, "{w}x{h}");
         let fb = image.render_frame(1).unwrap().image_all_channels();
-        let data: Vec<u8> = fb
-            .buf()
-            .iter()
-            .map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
-            .collect();
+        let data: Vec<u8> = fb.buf().iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect();
         assert!(data == px, "{w}x{h}: pixels differ");
     }
 }
@@ -714,23 +554,13 @@ fn animation_lossy_alpha_change_is_kept() {
             duration: 5,
         })
         .collect();
-    let opts = jxl_mini_encoder::EncoderOptions {
-        distance: 1.0,
-        effort: 3,
-        threads: 1,
-        noise: 0.0,
-    };
+    let opts = jxl_mini_encoder::EncoderOptions { distance: 1.0, effort: 3, threads: 1, noise: 0.0 };
     let jxl = jxl_mini_encoder::encode_animation(&frames, &Default::default(), &opts).unwrap();
-    let image = jxl_oxide::JxlImage::builder()
-        .read(std::io::Cursor::new(&jxl))
-        .expect("parse");
+    let image = jxl_oxide::JxlImage::builder().read(std::io::Cursor::new(&jxl)).expect("parse");
     assert_eq!(image.num_loaded_keyframes(), 2);
     let alpha = |k: usize| -> Vec<u8> {
         let fb = image.render_frame(k).unwrap().image_all_channels();
-        fb.buf()
-            .chunks(4)
-            .map(|p| (p[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
-            .collect()
+        fb.buf().chunks(4).map(|p| (p[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect()
     };
     let want = |p: &Vec<u8>| p.chunks(4).map(|c| c[3]).collect::<Vec<u8>>();
     assert!(alpha(0) == want(&a) && alpha(1) == want(&b));
@@ -743,13 +573,8 @@ fn animation_lossy_alpha_change_is_kept() {
 fn lossless_palette() {
     for (w, h) in [(5, 3), (100, 80), (257, 40), (300, 300)] {
         for ch in [3, 4] {
-            let colors: [[u8; 4]; 5] = [
-                [0, 0, 0, 255],
-                [255, 255, 255, 255],
-                [10, 200, 30, 255],
-                [255, 0, 0, 128],
-                [7, 7, 7, 0],
-            ];
+            let colors: [[u8; 4]; 5] =
+                [[0, 0, 0, 255], [255, 255, 255, 255], [10, 200, 30, 255], [255, 0, 0, 128], [7, 7, 7, 0]];
             let mut px = Vec::new();
             for y in 0..h {
                 for x in 0..w {
@@ -764,12 +589,7 @@ fn lossless_palette() {
             }
             .unwrap();
             for effort in [1, 4, 7, 9] {
-                let jxl = jxl_mini_encoder::Encoder::new()
-                    .lossless()
-                    .effort(effort)
-                    .threads(2)
-                    .encode(&img)
-                    .unwrap();
+                let jxl = jxl_mini_encoder::Encoder::new().lossless().effort(effort).threads(2).encode(&img).unwrap();
                 let (_, _, dc, data) = decode(&jxl);
                 assert_eq!(dc, ch);
                 assert!(data == px, "{w}x{h}x{ch} e{effort}: palette pixels differ");
@@ -824,12 +644,7 @@ fn animation_lossless_sparse_changes() {
                 duration: 5,
             })
             .collect();
-        let opts = jxl_mini_encoder::EncoderOptions {
-            distance: 0.0,
-            effort: 5,
-            threads: 3,
-            noise: 0.0,
-        };
+        let opts = jxl_mini_encoder::EncoderOptions { distance: 0.0, effort: 5, threads: 3, noise: 0.0 };
         let jxl = jxl_mini_encoder::encode_animation(&frames, &Default::default(), &opts).unwrap();
         let image = jxl_oxide::JxlImage::builder().read(std::io::Cursor::new(&jxl)).expect("parse");
         assert_eq!(image.num_loaded_keyframes(), frames_px.len());
@@ -851,7 +666,7 @@ fn lossless_hint_for_palette_animation_with_sparse_changes() {
                 let mut px = vec![30u8; (w * h * 3) as usize];
                 for i in 0..(w * h) as usize {
                     // Few changing pixels, or a different texture in every frame.
-                    let on = if noisy { (i as u32 * 7 + f) % 3 == 0 } else { i as u32 == f * 5 };
+                    let on = if noisy { (i as u32 * 7 + f).is_multiple_of(3) } else { i as u32 == f * 5 };
                     if on {
                         px[i * 3..i * 3 + 3].copy_from_slice(&[200, 40, 40]);
                     }

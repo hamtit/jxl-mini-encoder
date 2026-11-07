@@ -25,12 +25,7 @@ pub fn par_map<T: Send>(n: usize, threads: usize, f: impl Fn(usize) -> T + Sync)
             });
         }
     });
-    results
-        .into_inner()
-        .unwrap()
-        .into_iter()
-        .map(|v| v.expect("missing result"))
-        .collect()
+    results.into_inner().unwrap().into_iter().map(|v| v.expect("missing result")).collect()
 }
 
 /// Run `f` on every task, spread over up to `threads` threads. Tasks are

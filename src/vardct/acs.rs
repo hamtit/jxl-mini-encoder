@@ -50,9 +50,7 @@ impl Acs {
     /// Covered blocks (width, height).
     pub fn blocks(self) -> (usize, usize) {
         match self {
-            Acs::Dct8 | Acs::Identity | Acs::Dct2x2 | Acs::Dct4x4 | Acs::Dct4x8 | Acs::Dct8x4 => {
-                (1, 1)
-            }
+            Acs::Dct8 | Acs::Identity | Acs::Dct2x2 | Acs::Dct4x4 | Acs::Dct4x8 | Acs::Dct8x4 => (1, 1),
             Acs::Dct16 => (2, 2),
             Acs::Dct32 => (4, 4),
             Acs::Dct16x8 => (1, 2),
@@ -107,24 +105,9 @@ impl Acs {
     }
 
     fn params(self) -> [Vec<f32>; 3] {
-        const SEQ_A: [f32; 7] = [
-            -1.025,
-            -0.78,
-            -0.65012,
-            -0.19041574,
-            -0.20819396,
-            -0.421064,
-            -0.32733846,
-        ];
-        const SEQ_B: [f32; 7] = [
-            -0.30419582,
-            -0.36330363,
-            -0.3566038,
-            -0.34430745,
-            -0.33699593,
-            -0.30180866,
-            -0.27321684,
-        ];
+        const SEQ_A: [f32; 7] = [-1.025, -0.78, -0.65012, -0.19041574, -0.20819396, -0.421064, -0.32733846];
+        const SEQ_B: [f32; 7] =
+            [-0.30419582, -0.36330363, -0.3566038, -0.34430745, -0.33699593, -0.30180866, -0.27321684];
         const SEQ_C: [f32; 7] = [-1.2, -1.2, -0.8, -0.7, -0.7, -0.4, -0.5];
         let common = |a: f32, b: f32, c: f32| {
             [(a, SEQ_A), (b, SEQ_B), (c, SEQ_C)].map(|(first, seq)| {
@@ -140,39 +123,12 @@ impl Acs {
                 vec![512.0, -2.0, -1.0, 0.0, -1.0, -2.0],
             ],
             Acs::Dct16 => [
-                vec![
-                    8996.873,
-                    -1.3000778,
-                    -0.4942453,
-                    -0.43909377,
-                    -0.6350102,
-                    -0.9017726,
-                    -1.6162099,
-                ],
-                vec![
-                    3191.4836,
-                    -0.67424583,
-                    -0.80745816,
-                    -0.4492584,
-                    -0.3586544,
-                    -0.3132239,
-                    -0.37615025,
-                ],
-                vec![
-                    1157.504, -2.0531423, -1.4, -0.5068713, -0.4270873, -1.4856834, -4.920914,
-                ],
+                vec![8996.873, -1.3000778, -0.4942453, -0.43909377, -0.6350102, -0.9017726, -1.6162099],
+                vec![3191.4836, -0.67424583, -0.80745816, -0.4492584, -0.3586544, -0.3132239, -0.37615025],
+                vec![1157.504, -2.0531423, -1.4, -0.5068713, -0.4270873, -1.4856834, -4.920914],
             ],
             Acs::Dct32 => [
-                vec![
-                    15718.408,
-                    -1.025,
-                    -0.98,
-                    -0.9012,
-                    -0.4,
-                    -0.48819396,
-                    -0.421064,
-                    -0.27,
-                ],
+                vec![15718.408, -1.025, -0.98, -0.9012, -0.4, -0.48819396, -0.421064, -0.27],
                 vec![
                     7305.7637,
                     -0.8041958,
@@ -183,16 +139,7 @@ impl Acs {
                     -0.40180868,
                     -0.27321684,
                 ],
-                vec![
-                    3803.5317,
-                    -3.0607336,
-                    -2.041327,
-                    -2.023565,
-                    -0.54953897,
-                    -0.4,
-                    -0.4,
-                    -0.3,
-                ],
+                vec![3803.5317, -3.0607336, -2.041327, -2.023565, -0.54953897, -0.4, -0.4, -0.3],
             ],
             Acs::Dct16x8 | Acs::Dct8x16 => [
                 vec![7240.7734, -0.7, -0.7, -0.2, -0.2, -0.2, -0.5],
@@ -200,19 +147,8 @@ impl Acs {
                 vec![506.85413, -1.4, -0.2, -0.5, -0.5, -1.5, -3.6],
             ],
             Acs::Dct32x16 | Acs::Dct16x32 => [
-                vec![
-                    13844.971, -0.971138, -0.658, -0.42026, -0.22712, -0.2206, -0.226, -0.6,
-                ],
-                vec![
-                    4798.964,
-                    -0.6112531,
-                    -0.8377079,
-                    -0.7901486,
-                    -0.26927274,
-                    -0.38272768,
-                    -0.22924222,
-                    -0.20719099,
-                ],
+                vec![13844.971, -0.971138, -0.658, -0.42026, -0.22712, -0.2206, -0.226, -0.6],
+                vec![4798.964, -0.6112531, -0.8377079, -0.7901486, -0.26927274, -0.38272768, -0.22924222, -0.20719099],
                 vec![1807.2369, -1.2, -1.2, -0.7, -0.7, -0.7, -0.4, -0.5],
             ],
             Acs::Dct64 => common(23966.166, 8380.191, 4493.024),
@@ -225,21 +161,13 @@ impl Acs {
 /// Default quantisation weights of the small 8x8 transforms, in libjxl's
 /// 8x8 coefficient layout (index `y * 8 + x`).
 fn small_weights(acs: Acs) -> [Vec<f32>; 3] {
-    const ID: [[f32; 3]; 3] = [
-        [280.0, 3160.0, 3160.0],
-        [60.0, 864.0, 864.0],
-        [18.0, 200.0, 200.0],
-    ];
+    const ID: [[f32; 3]; 3] = [[280.0, 3160.0, 3160.0], [60.0, 864.0, 864.0], [18.0, 200.0, 200.0]];
     const DCT2: [[f32; 6]; 3] = [
         [3840.0, 2560.0, 1280.0, 640.0, 480.0, 300.0],
         [960.0, 640.0, 320.0, 180.0, 140.0, 120.0],
         [640.0, 320.0, 128.0, 64.0, 32.0, 16.0],
     ];
-    const DCT4: [[f32; 4]; 3] = [
-        [2200.0, 0.0, 0.0, 0.0],
-        [392.0, 0.0, 0.0, 0.0],
-        [112.0, -0.25, -0.25, -0.5],
-    ];
+    const DCT4: [[f32; 4]; 3] = [[2200.0, 0.0, 0.0, 0.0], [392.0, 0.0, 0.0, 0.0], [112.0, -0.25, -0.25, -0.5]];
     const DCT4X8: [[f32; 4]; 3] = [
         [2198.0506, -0.962_696_2, -0.761_942_5, -0.655_114_07],
         [764.365_5, -0.926_302, -0.967_523, -0.278_452_9],
@@ -330,11 +258,7 @@ fn natural_order(bw: usize, bh: usize) -> Vec<(u8, u8)> {
     for dist in 1..2 * bw {
         let margin = dist.saturating_sub(bw);
         for order in margin..dist - margin {
-            let (x, y) = if dist % 2 == 1 {
-                (order, dist - 1 - order)
-            } else {
-                (dist - 1 - order, order)
-            };
+            let (x, y) = if dist % 2 == 1 { (order, dist - 1 - order) } else { (dist - 1 - order, order) };
             if x < lbw && y < lbw {
                 continue;
             }
@@ -377,16 +301,8 @@ impl Tables {
                         .into_iter()
                         .map(|(ox, oy)| (oy as usize * 8 + ox as usize) as u16)
                         .collect();
-                    let inv_weights = weights
-                        .clone()
-                        .map(|g| g.iter().map(|&w| 1.0 / w).collect());
-                    return TransformTables {
-                        w,
-                        h,
-                        weights,
-                        inv_weights,
-                        order,
-                    };
+                    let inv_weights = weights.clone().map(|g| g.iter().map(|&w| 1.0 / w).collect());
+                    return TransformTables { w, h, weights, inv_weights, order };
                 }
                 let (cw, ch) = (w.max(h), w.min(h));
                 let tr = acs.transposed();
@@ -405,24 +321,12 @@ impl Tables {
                 let order = natural_order(cw, ch)
                     .into_iter()
                     .map(|(ox, oy)| {
-                        let (x, y) = if tr {
-                            (oy as usize, ox as usize)
-                        } else {
-                            (ox as usize, oy as usize)
-                        };
+                        let (x, y) = if tr { (oy as usize, ox as usize) } else { (ox as usize, oy as usize) };
                         (y * w + x) as u16
                     })
                     .collect();
-                let inv_weights = weights
-                    .clone()
-                    .map(|g| g.iter().map(|&w| 1.0 / w).collect());
-                TransformTables {
-                    w,
-                    h,
-                    weights,
-                    inv_weights,
-                    order,
-                }
+                let inv_weights = weights.clone().map(|g| g.iter().map(|&w| 1.0 / w).collect());
+                TransformTables { w, h, weights, inv_weights, order }
             })
             .collect();
         Tables { t }
@@ -609,8 +513,7 @@ impl Tile {
             return false;
         }
         let v0 = self.flat_val[cy * 8 + cx];
-        (cy..cy + n)
-            .all(|y| (cx..cx + n).all(|x| self.flat[y * 8 + x] && self.flat_val[y * 8 + x] == v0))
+        (cy..cy + n).all(|y| (cx..cx + n).all(|x| self.flat[y * 8 + x] && self.flat_val[y * 8 + x] == v0))
     }
 
     fn set_entropy(&mut self, cx: usize, cy: usize, acs: Acs, e: f32) {
@@ -639,7 +542,7 @@ fn quant_stage(
     e: &mut [f32],
 ) -> (u32, f32) {
     let n = c0.len();
-    assert!(n % 8 == 0 && c1.len() == n && wt.len() == n && iw.len() == n && e.len() == n);
+    assert!(n.is_multiple_of(8) && c1.len() == n && wt.len() == n && iw.len() == n && e.len() == n);
     #[cfg(target_arch = "x86_64")]
     if avx2 {
         // SAFETY: AVX2 support was detected at runtime; lengths checked above.
@@ -676,10 +579,7 @@ unsafe fn quant_stage_avx2(
     use std::arch::x86_64::*;
     let n = c0.len();
     let (kv, qv) = (_mm256_set1_ps(k), _mm256_set1_ps(quant));
-    let (zero, absmask) = (
-        _mm256_setzero_ps(),
-        _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff)),
-    );
+    let (zero, absmask) = (_mm256_setzero_ps(), _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff)));
     let (mut acc, mut nzv) = (zero, _mm256_setzero_si256());
     let mut i = 0;
     while i < n {
@@ -691,10 +591,7 @@ unsafe fn quant_stage_avx2(
             let iwv = _mm256_loadu_ps(iw.as_ptr().add(i));
             let v = _mm256_mul_ps(_mm256_mul_ps(_mm256_sub_ps(a, _mm256_mul_ps(kv, b)), w), qv);
             let r = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(v);
-            _mm256_storeu_ps(
-                e.as_mut_ptr().add(i),
-                _mm256_mul_ps(_mm256_sub_ps(v, r), iwv),
-            );
+            _mm256_storeu_ps(e.as_mut_ptr().add(i), _mm256_mul_ps(_mm256_sub_ps(v, r), iwv));
             let q = _mm256_and_ps(r, absmask);
             acc = _mm256_add_ps(acc, _mm256_sqrt_ps(q));
             // The compare mask is all ones (-1) where q != 0.
@@ -716,7 +613,7 @@ unsafe fn quant_stage_avx2(
 /// Sum of eighth powers of `(mask + off) * pix` over one row (width a
 /// multiple of 8), accumulated in f32 lanes.
 fn loss_row(avx2: bool, mrow: &[f32], prow: &[f32], off: f32) -> f64 {
-    assert!(mrow.len() % 8 == 0 && prow.len() == mrow.len());
+    assert!(mrow.len().is_multiple_of(8) && prow.len() == mrow.len());
     #[cfg(target_arch = "x86_64")]
     if avx2 {
         // SAFETY: AVX2 support was detected at runtime; lengths checked above.
@@ -807,11 +704,7 @@ impl<'a> Search<'a> {
             best += f64::from(e);
             self.probe_cache.push((origin, cache));
         }
-        if base > 0.0 {
-            ((base - best) / base) as f32
-        } else {
-            0.0
-        }
+        if base > 0.0 { ((base - best) / base) as f32 } else { 0.0 }
     }
 
     fn new_tile(&self, bx: usize, by: usize) -> Tile {
@@ -849,15 +742,7 @@ impl<'a> Search<'a> {
     }
 
     /// libjxl's EstimateEntropy: coefficient cost plus masked distortion.
-    fn estimate(
-        &self,
-        acs: Acs,
-        bx: usize,
-        by: usize,
-        entropy_mul: f32,
-        limit: f32,
-        scratch: &mut [f32],
-    ) -> f32 {
+    fn estimate(&self, acs: Acs, bx: usize, by: usize, entropy_mul: f32, limit: f32, scratch: &mut [f32]) -> f32 {
         #[cfg(target_arch = "x86_64")]
         if self.dct.has_avx2() {
             // SAFETY: AVX2 support was detected at runtime.
@@ -881,15 +766,7 @@ impl<'a> Search<'a> {
     }
 
     #[inline(always)]
-    fn estimate_impl(
-        &self,
-        acs: Acs,
-        bx: usize,
-        by: usize,
-        entropy_mul: f32,
-        limit: f32,
-        scratch: &mut [f32],
-    ) -> f32 {
+    fn estimate_impl(&self, acs: Acs, bx: usize, by: usize, entropy_mul: f32, limit: f32, scratch: &mut [f32]) -> f32 {
         let inp = self.inp;
         let t = self.tables.get(acs);
         let (nbx, nby) = acs.blocks();
@@ -915,37 +792,23 @@ impl<'a> Search<'a> {
         let (coeffs, rest) = scratch.split_at_mut(3 * 4096);
         let (err, rest) = rest.split_at_mut(3 * 4096);
         let pix = &mut rest[..4096];
-        let mut cs = coeffs.chunks_exact_mut(4096);
-        let coeffs: [&mut [f32]; 3] = std::array::from_fn(|_| cs.next().unwrap());
-        let mut es = err.chunks_exact_mut(4096);
-        let err: [&mut [f32]; 3] = std::array::from_fn(|_| es.next().unwrap());
+        // `scratch` was split into exactly three 4096-element planes each.
+        let [c0, c1, c2] = coeffs.as_chunks_mut::<4096>().0 else { unreachable!() };
+        let coeffs: [&mut [f32]; 3] = [c0, c1, c2];
+        let [e0, e1, e2] = err.as_chunks_mut::<4096>().0 else { unreachable!() };
+        let err: [&mut [f32]; 3] = [e0, e1, e2];
         // Phase 1: entropy of every channel, Y first. Each channel's cost is
         // non-negative, so the candidate is dropped as soon as the partial
         // sum cannot beat the incumbent -- before any inverse DCT.
         // X needs Y's coefficients (k = cmap[0]); B is transformed last.
         let mut entropy = 0f32;
         for c in [1, 0, 2] {
-            forward_block(
-                self.dct,
-                acs,
-                &inp.planes[c][origin..],
-                inp.stride,
-                coeffs[c],
-            );
+            forward_block(self.dct, acs, &inp.planes[c][origin..], inp.stride, coeffs[c]);
             let k = inp.cmap[c];
             let (wt, iw) = (&t.weights[c][..n], &t.inv_weights[c][..n]);
             let (c0, c1) = (&coeffs[c][..n], &coeffs[1][..n]);
             let e = &mut err[c][..n];
-            let (nz, sum_sqrt) = quant_stage(
-                self.dct.has_avx2(),
-                &c0[..n],
-                &c1[..n],
-                k,
-                &wt[..n],
-                &iw[..n],
-                quant,
-                e,
-            );
+            let (nz, sum_sqrt) = quant_stage(self.dct.has_avx2(), &c0[..n], &c1[..n], k, &wt[..n], &iw[..n], quant, e);
             let nbits = ceil_log2(nz as usize + 1) + 1;
             let mut ec = self.cfg.cost_delta * sum_sqrt;
             ec += self.cfg.zeros_mul * (ceil_log2(nbits + 17) + nbits) as f32;
@@ -985,33 +848,14 @@ impl<'a> Search<'a> {
         self.est_bounded(tile, acs, cx, cy, mul, f32::INFINITY)
     }
 
-    fn est_bounded(
-        &self,
-        tile: &mut Tile,
-        acs: Acs,
-        cx: usize,
-        cy: usize,
-        mul: f32,
-        limit: f32,
-    ) -> f32 {
+    fn est_bounded(&self, tile: &mut Tile, acs: Acs, cx: usize, cy: usize, mul: f32, limit: f32) -> f32 {
         #[cfg(test)]
-        let limit = if self.disable_pruning {
-            f32::INFINITY
-        } else {
-            limit
-        };
+        let limit = if self.disable_pruning { f32::INFINITY } else { limit };
         let slot = &mut tile.cache[acs.index()][cy * 8 + cx];
         if !slot.is_nan() {
             return *slot;
         }
-        let cost = self.estimate(
-            acs,
-            tile.bx + cx,
-            tile.by + cy,
-            mul,
-            limit,
-            &mut tile.scratch,
-        );
+        let cost = self.estimate(acs, tile.bx + cx, tile.by + cy, mul, limit, &mut tile.scratch);
         // A rejected estimate is only a bound, not a reusable exact cost:
         // a later comparison may have a larger incumbent.
         if cost.is_finite() {
@@ -1021,15 +865,7 @@ impl<'a> Search<'a> {
     }
 
     /// libjxl's FindBestFirstLevelDivisionForSquare.
-    fn divide_square(
-        &self,
-        tile: &mut Tile,
-        blocks: usize,
-        cx: usize,
-        cy: usize,
-        mul_split: f32,
-        mul_square: f32,
-    ) {
+    fn divide_square(&self, tile: &mut Tile, blocks: usize, cx: usize, cy: usize, mul_split: f32, mul_square: f32) {
         let half = blocks / 2;
         let (vsplit, hsplit, square) = match blocks {
             2 => (Acs::Dct16x8, Acs::Dct8x16, Acs::Dct16),
@@ -1064,8 +900,7 @@ impl<'a> Search<'a> {
                 v_left = self.est_bounded(tile, vsplit, cx, cy, mul_split, q[0][0] + q[1][0]);
             }
             if tile.acs[cy * 8 + cx + half] != vsplit {
-                v_right =
-                    self.est_bounded(tile, vsplit, cx + half, cy, mul_split, q[0][1] + q[1][1]);
+                v_right = self.est_bounded(tile, vsplit, cx + half, cy, mul_split, q[0][1] + q[1][1]);
             }
         }
         if allow_h {
@@ -1073,8 +908,7 @@ impl<'a> Search<'a> {
                 h_top = self.est_bounded(tile, hsplit, cx, cy, mul_split, q[0][0] + q[0][1]);
             }
             if tile.acs[(cy + half) * 8 + cx] != hsplit {
-                h_bottom =
-                    self.est_bounded(tile, hsplit, cx, cy + half, mul_split, q[1][0] + q[1][1]);
+                h_bottom = self.est_bounded(tile, hsplit, cx, cy + half, mul_split, q[1][0] + q[1][1]);
             }
         }
         let cost_v = v_left.min(q[0][0] + q[1][0]) + v_right.min(q[0][1] + q[1][1]);
@@ -1217,11 +1051,7 @@ impl<'a> Search<'a> {
             // A constant 64x64 tile: one DCT64 carries only its DC.
             for y in 0..8 {
                 for x in 0..8 {
-                    out[y * out_stride + x] = BlockAcs {
-                        acs: Acs::Dct64,
-                        ox: bx as u32,
-                        oy: by as u32,
-                    };
+                    out[y * out_stride + x] = BlockAcs { acs: Acs::Dct64, ox: bx as u32, oy: by as u32 };
                 }
             }
             SCRATCH.with(|c| *c.borrow_mut() = std::mem::take(&mut tile.scratch));
@@ -1289,11 +1119,8 @@ impl<'a> Search<'a> {
         for y in 0..h {
             for x in 0..w {
                 let (ox, oy) = tile.origin[y * 8 + x];
-                out[y * out_stride + x] = BlockAcs {
-                    acs: tile.acs[y * 8 + x],
-                    ox: (bx + ox as usize) as u32,
-                    oy: (by + oy as usize) as u32,
-                };
+                out[y * out_stride + x] =
+                    BlockAcs { acs: tile.acs[y * 8 + x], ox: (bx + ox as usize) as u32, oy: (by + oy as usize) as u32 };
             }
         }
         SCRATCH.with(|c| *c.borrow_mut() = std::mem::take(&mut tile.scratch));
@@ -1350,8 +1177,7 @@ mod tests {
         }
         let mut seed = 7;
         for n in [64usize, 128, 256, 1024] {
-            let mut rnd =
-                |scale: f32| -> Vec<f32> { (0..n).map(|_| lcg(&mut seed) * scale).collect() };
+            let mut rnd = |scale: f32| -> Vec<f32> { (0..n).map(|_| lcg(&mut seed) * scale).collect() };
             let (c0, c1, wt, iw) = (rnd(9.0), rnd(9.0), rnd(1.0), rnd(1.0));
             let (mut e_a, mut e_b) = (vec![0f32; n], vec![0f32; n]);
             let a = quant_stage(true, &c0, &c1, 0.25, &wt, &iw, 1.7, &mut e_a);
@@ -1374,15 +1200,12 @@ mod tests {
                 .map(|i| {
                     let x = i % stride;
                     let y = i / stride;
-                    ((x / 13 + y / 17 + c) % 7) as f32 * 0.03
-                        + ((i * 37 + c * 11) % 101) as f32 * 0.0001
+                    ((x / 13 + y / 17 + c) % 7) as f32 * 0.03 + ((i * 37 + c * 11) % 101) as f32 * 0.0001
                 })
                 .collect()
         });
         let quant: Vec<f32> = (0..bw * bh).map(|i| 0.2 + (i % 19) as f32 * 0.11).collect();
-        let mask: Vec<f32> = (0..stride * bh * 8)
-            .map(|i| 0.1 + (i % 31) as f32)
-            .collect();
+        let mask: Vec<f32> = (0..stride * bh * 8).map(|i| 0.1 + (i % 31) as f32).collect();
         let tables = Tables::new();
         let dct = Dct::new();
         for effort in [5, 7, 9] {
@@ -1405,11 +1228,7 @@ mod tests {
                 serial.disable_pruning = true;
                 // Rejected costs must not poison the memoised exact costs.
                 let mut tile = cached.new_tile(0, 0);
-                assert!(
-                    cached
-                        .est_bounded(&mut tile, Acs::Dct8, 0, 0, 1.0, 0.0)
-                        .is_infinite()
-                );
+                assert!(cached.est_bounded(&mut tile, Acs::Dct8, 0, 0, 1.0, 0.0).is_infinite());
                 assert!(tile.cache[Acs::Dct8.index()][0].is_nan());
                 let exact = cached.est(&mut tile, Acs::Dct8, 0, 0, 1.0);
                 assert!(exact.is_finite());
@@ -1421,19 +1240,12 @@ mod tests {
                     plain.set_small(small);
                     for by in (0..bh).step_by(8) {
                         for bx in (0..bw).step_by(8) {
-                            let init = BlockAcs {
-                                acs: Acs::Dct8,
-                                ox: 0,
-                                oy: 0,
-                            };
+                            let init = BlockAcs { acs: Acs::Dct8, ox: 0, oy: 0 };
                             let mut expected = [init; 64];
                             let mut actual = expected;
                             plain.tile(bx, by, &mut expected, 8);
                             cached.tile(bx, by, &mut actual, 8);
-                            assert_eq!(
-                                actual, expected,
-                                "e{effort} d{distance} small={small} ({bx},{by})"
-                            );
+                            assert_eq!(actual, expected, "e{effort} d{distance} small={small} ({bx},{by})");
                         }
                     }
                 }

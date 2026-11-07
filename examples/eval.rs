@@ -22,12 +22,7 @@ fn load(path: &str) -> (u32, u32, bool, Vec<u8>) {
             png::ColorType::Rgb => (false, buf),
             png::ColorType::Rgba => (true, buf),
             png::ColorType::Grayscale => (false, buf.iter().flat_map(|&g| [g, g, g]).collect()),
-            png::ColorType::GrayscaleAlpha => (
-                true,
-                buf.chunks(2)
-                    .flat_map(|p| [p[0], p[0], p[0], p[1]])
-                    .collect(),
-            ),
+            png::ColorType::GrayscaleAlpha => (true, buf.chunks(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect()),
             c => panic!("unsupported {c:?}"),
         };
         (info.width, info.height, alpha, data)
@@ -45,44 +40,24 @@ fn load(path: &str) -> (u32, u32, bool, Vec<u8>) {
 }
 
 fn decode(jxl: &[u8], channels: usize) -> Vec<u8> {
-    let image = jxl_oxide::JxlImage::builder()
-        .read(std::io::Cursor::new(jxl))
-        .expect("parse");
+    let image = jxl_oxide::JxlImage::builder().read(std::io::Cursor::new(jxl)).expect("parse");
     let render = image.render_frame(0).expect("render");
     let fb = render.image_all_channels();
     assert_eq!(fb.channels(), channels, "channel count");
-    fb.buf()
-        .iter()
-        .map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
-        .collect()
+    fb.buf().iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect()
 }
 
 fn ssim2(w: u32, h: u32, a: &[u8], b: &[u8], ch: usize) -> f64 {
     use ssimulacra2::{ColorPrimaries, Rgb, TransferCharacteristic};
     let conv = |d: &[u8]| {
-        let px: Vec<[f32; 3]> = d
-            .chunks(ch)
-            .map(|p| [p[0], p[1], p[2]].map(|v| f32::from(v) / 255.0))
-            .collect();
-        Rgb::new(
-            px,
-            w as usize,
-            h as usize,
-            TransferCharacteristic::SRGB,
-            ColorPrimaries::BT709,
-        )
-        .unwrap()
+        let px: Vec<[f32; 3]> = d.chunks(ch).map(|p| [p[0], p[1], p[2]].map(|v| f32::from(v) / 255.0)).collect();
+        Rgb::new(px, w as usize, h as usize, TransferCharacteristic::SRGB, ColorPrimaries::BT709).unwrap()
     };
     ssimulacra2::compute_frame_ssimulacra2(conv(a), conv(b)).unwrap()
 }
 
 fn psnr(a: &[u8], b: &[u8]) -> f64 {
-    let mse: f64 = a
-        .iter()
-        .zip(b)
-        .map(|(&x, &y)| (f64::from(x) - f64::from(y)).powi(2))
-        .sum::<f64>()
-        / a.len() as f64;
+    let mse: f64 = a.iter().zip(b).map(|(&x, &y)| (f64::from(x) - f64::from(y)).powi(2)).sum::<f64>() / a.len() as f64;
     10.0 * (255.0f64 * 255.0 / mse.max(1e-12)).log10()
 }
 
@@ -132,9 +107,7 @@ fn main() {
         let t = Instant::now();
         let jxl = match std::env::var("REF_DIR") {
             // Evaluate a file produced by another encoder instead.
-            Ok(dir) => {
-                std::fs::read(format!("{dir}/ref_{}.jxl", f.rsplit('/').next().unwrap())).unwrap()
-            }
+            Ok(dir) => std::fs::read(format!("{dir}/ref_{}.jxl", f.rsplit('/').next().unwrap())).unwrap(),
             Err(_) => enc.encode(&img).unwrap(),
         };
         let ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -144,9 +117,7 @@ fn main() {
             std::fs::write(format!("{dir}/{name}.jxl"), &jxl).unwrap();
         }
         if encode_only {
-            let hash = jxl.iter().fold(0xcbf29ce484222325u64, |h, &b| {
-                (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
-            });
+            let hash = jxl.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3));
             println!("{f}: {} B {ms:.3} ms hash={hash:016x}", jxl.len());
             continue;
         }
@@ -155,11 +126,7 @@ fn main() {
             let name = f.rsplit('/').next().unwrap();
             let file = std::fs::File::create(format!("{dir}/{name}.out.png")).unwrap();
             let mut e = png::Encoder::new(std::io::BufWriter::new(file), w, h);
-            e.set_color(if alpha {
-                png::ColorType::Rgba
-            } else {
-                png::ColorType::Rgb
-            });
+            e.set_color(if alpha { png::ColorType::Rgba } else { png::ColorType::Rgb });
             e.set_depth(png::BitDepth::Eight);
             e.write_header().unwrap().write_image_data(&out).unwrap();
             std::fs::write(format!("{dir}/{name}.jxl"), &jxl).unwrap();

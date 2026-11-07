@@ -26,19 +26,9 @@ fn load(path: &str) -> (u32, u32, bool, Vec<u8>) {
 fn ssim2(w: u32, h: u32, a: &[u8], b: &[u8], ch: usize) -> f64 {
     use ssimulacra2::{ColorPrimaries, Rgb, TransferCharacteristic};
     let conv = |d: &[u8]| {
-        let px: Vec<[f32; 3]> = d
-            .chunks(ch)
-            .map(|p| [p[0], p[1], p[2]].map(|v| f32::from(v) / 255.0))
-            .collect();
+        let px: Vec<[f32; 3]> = d.chunks(ch).map(|p| [p[0], p[1], p[2]].map(|v| f32::from(v) / 255.0)).collect();
         let (w, h) = (w as usize, h as usize);
-        Rgb::new(
-            px,
-            w,
-            h,
-            TransferCharacteristic::SRGB,
-            ColorPrimaries::BT709,
-        )
-        .unwrap()
+        Rgb::new(px, w, h, TransferCharacteristic::SRGB, ColorPrimaries::BT709).unwrap()
     };
     ssimulacra2::compute_frame_ssimulacra2(conv(a), conv(b)).unwrap()
 }
@@ -87,25 +77,17 @@ fn main() {
         enc = enc.lossless();
     }
     let t = Instant::now();
-    let jxl = enc
-        .encode_animation(&frames, &jxl_mini_encoder::AnimationOptions::default())
-        .unwrap();
+    let jxl = enc.encode_animation(&frames, &jxl_mini_encoder::AnimationOptions::default()).unwrap();
     let ms = t.elapsed().as_secs_f64() * 1000.0;
     if let Some(o) = out {
         std::fs::write(o, &jxl).unwrap();
     }
-    print!(
-        "{} frames {w}x{h}: {} B, {ms:.0} ms",
-        frames.len(),
-        jxl.len()
-    );
+    print!("{} frames {w}x{h}: {} B, {ms:.0} ms", frames.len(), jxl.len());
     if !decode {
         println!();
         return;
     }
-    let image = jxl_oxide::JxlImage::builder()
-        .read(std::io::Cursor::new(&jxl))
-        .expect("parse");
+    let image = jxl_oxide::JxlImage::builder().read(std::io::Cursor::new(&jxl)).expect("parse");
     let ch = if *alpha { 4 } else { 3 };
     let (mut tot, mut min) = (0.0, f64::MAX);
     // Inter-frame prediction merges unchanged frames into the previous
@@ -141,24 +123,14 @@ fn main() {
         if let Some(dir) = &dump {
             std::fs::create_dir_all(dir).unwrap();
             let mut enc = png::Encoder::new(
-                std::io::BufWriter::new(
-                    std::fs::File::create(format!("{dir}/d{i:03}.png")).unwrap(),
-                ),
+                std::io::BufWriter::new(std::fs::File::create(format!("{dir}/d{i:03}.png")).unwrap()),
                 *w,
                 *h,
             );
-            enc.set_color(if *alpha {
-                png::ColorType::Rgba
-            } else {
-                png::ColorType::Rgb
-            });
+            enc.set_color(if *alpha { png::ColorType::Rgba } else { png::ColorType::Rgb });
             enc.set_depth(png::BitDepth::Eight);
             enc.write_header().unwrap().write_image_data(&px).unwrap();
         }
     }
-    println!(
-        ", mean ssim2 {:.2}, min {:.2}",
-        tot / loaded.len() as f64,
-        min
-    );
+    println!(", mean ssim2 {:.2}, min {:.2}", tot / loaded.len() as f64, min);
 }

@@ -57,8 +57,8 @@ impl AnsDist {
             let mut encoding = DistEncoding::General(shift);
             if let [a, b] = used[..] {
                 let mut binary = vec![0u16; table_size];
-                binary[a] = ((u64::from(counts[a]) * u64::from(TAB) + total / 2) / total)
-                    .clamp(1, u64::from(TAB - 1)) as u16;
+                binary[a] =
+                    ((u64::from(counts[a]) * u64::from(TAB) + total / 2) / total).clamp(1, u64::from(TAB - 1)) as u16;
                 binary[b] = TAB as u16 - binary[a];
                 let bits = 2 + u8_bits(a as u32) + u8_bits(b as u32) + LOG_TAB;
                 if (bits as f64 + data_bits(counts, &binary, total)) < cost {
@@ -69,12 +69,7 @@ impl AnsDist {
             (f, encoding)
         };
         let (slots, start) = reverse_alias_table(&freq, log_alpha);
-        AnsDist {
-            freq,
-            slots,
-            start,
-            encoding,
-        }
+        AnsDist { freq, slots, start, encoding }
     }
 
     /// ANS slot for the `r`-th (0-based, `r < freq[s]`) state of symbol `s`.
@@ -111,8 +106,7 @@ pub fn estimate_cost(counts: &[u32]) -> f64 {
 /// Cost a prospective merge without allocating a temporary histogram.
 pub fn estimate_merged_cost(a: &[u32], b: &[u32]) -> f64 {
     estimate_cost_counts(
-        (0..a.len().max(b.len()))
-            .map(|i| a.get(i).copied().unwrap_or(0) + b.get(i).copied().unwrap_or(0)),
+        (0..a.len().max(b.len())).map(|i| a.get(i).copied().unwrap_or(0) + b.get(i).copied().unwrap_or(0)),
     )
 }
 
@@ -122,20 +116,8 @@ pub fn estimate_merged_cost(a: &[u32], b: &[u32]) -> f64 {
 fn xlogx(count: u64) -> f64 {
     const N: usize = 4096;
     static TABLE: std::sync::OnceLock<[f64; N]> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        std::array::from_fn(|i| {
-            if i == 0 {
-                0.0
-            } else {
-                i as f64 * (i as f64).log2()
-            }
-        })
-    });
-    if count < N as u64 {
-        table[count as usize]
-    } else {
-        count as f64 * (count as f64).log2()
-    }
+    let table = TABLE.get_or_init(|| std::array::from_fn(|i| if i == 0 { 0.0 } else { i as f64 * (i as f64).log2() }));
+    if count < N as u64 { table[count as usize] } else { count as f64 * (count as f64).log2() }
 }
 
 fn estimate_cost_counts(counts: impl ExactSizeIterator<Item = u32> + Clone) -> f64 {
@@ -173,11 +155,7 @@ fn write_u8(w: &mut BitWriter, v: u32) {
 }
 
 fn u8_bits(v: u32) -> u32 {
-    if v == 0 {
-        1
-    } else {
-        4 + (31 - v.leading_zeros())
-    }
+    if v == 0 { 1 } else { 4 + (31 - v.leading_zeros()) }
 }
 
 /// Number of mantissa bits stored for a frequency with `log = floor(log2 f)`.
@@ -202,11 +180,7 @@ fn representable(v: u32, shift: u32) -> u32 {
 
 /// Log-count code of a frequency: 0 for 0, else floor(log2 f) + 1.
 fn code_of(f: u16) -> u32 {
-    if f == 0 {
-        0
-    } else {
-        32 - u32::from(f).leading_zeros()
-    }
+    if f == 0 { 0 } else { 32 - u32::from(f).leading_zeros() }
 }
 
 /// Normalise counts to 4096 for a given shift. The most frequent symbol (the
@@ -225,9 +199,7 @@ fn normalize(counts: &[u32], shift: u32) -> Option<Vec<u16>> {
             if counts[i] == 0 || i == omit {
                 continue;
             }
-            let target = (f64::from(counts[i]) * f64::from(TAB) / total as f64 * scale)
-                .round()
-                .max(1.0) as u32;
+            let target = (f64::from(counts[i]) * f64::from(TAB) / total as f64 * scale).round().max(1.0) as u32;
             let v = representable(target, shift).min(TAB - 1);
             f[i] = v as u16;
             sum += v;
@@ -282,11 +254,7 @@ fn logcount_code(code: u32) -> (u64, u64, u32) {
 
 fn shift_bits(shift: u32) -> u32 {
     // len unary (up to 3) + len bits
-    let len = if shift == 0 {
-        0
-    } else {
-        31 - (shift + 1).leading_zeros()
-    };
+    let len = if shift == 0 { 0 } else { 31 - (shift + 1).leading_zeros() };
     len + (len < 3) as u32 + len
 }
 
@@ -319,11 +287,7 @@ fn write_general(w: &mut BitWriter, f: &[u16], shift: u32) {
     let alphabet = (f.iter().rposition(|&v| v > 0).unwrap_or(0) + 1).max(3);
     w.write_bool(false); // not simple
     w.write_bool(false); // not flat
-    let len = if shift == 0 {
-        0
-    } else {
-        31 - (shift + 1).leading_zeros()
-    };
+    let len = if shift == 0 { 0 } else { 31 - (shift + 1).leading_zeros() };
     for _ in 0..len {
         w.write_bool(true);
     }

@@ -23,10 +23,7 @@ impl Token {
     #[inline]
     pub fn new(ctx: u32, value: u32) -> Self {
         debug_assert!(ctx <= u32::from(u16::MAX));
-        Token {
-            ctx: ctx as u16,
-            value,
-        }
+        Token { ctx: ctx as u16, value }
     }
 
     #[inline]
@@ -43,11 +40,7 @@ impl Token {
 /// Map a signed integer to the unsigned value JPEG XL codes.
 #[inline]
 pub fn pack_signed(v: i32) -> u32 {
-    if v >= 0 {
-        (v as u32) << 1
-    } else {
-        ((-(v as i64)) as u32) * 2 - 1
-    }
+    if v >= 0 { (v as u32) << 1 } else { ((-(v as i64)) as u32) * 2 - 1 }
 }
 
 /// Hybrid integer configuration: values below `2^split_exp` are coded as
@@ -64,11 +57,7 @@ impl HybridUint {
     pub const DEFAULT: HybridUint = HybridUint::new(4, 2, 0);
 
     pub const fn new(split_exp: u32, msb: u32, lsb: u32) -> Self {
-        HybridUint {
-            split_exp,
-            msb,
-            lsb,
-        }
+        HybridUint { split_exp, msb, lsb }
     }
 
     /// (token, number of raw bits, raw bits)
@@ -127,11 +116,7 @@ pub struct CodeOptions {
 
 impl Default for CodeOptions {
     fn default() -> Self {
-        CodeOptions {
-            max_clusters: 64,
-            tune_configs: true,
-            threads: 1,
-        }
+        CodeOptions { max_clusters: 64, tune_configs: true, threads: 1 }
     }
 }
 
@@ -186,11 +171,7 @@ fn split_pieces<'a>(streams: &[&'a [Token]], threads: usize) -> Vec<&'a [Token]>
 /// Count repeated values once, so configuration tuning need not encode every
 /// sample fourteen times. Bound the temporary storage to 4 MiB; unusual large
 /// values or many wide alphabets fall back to visiting the original tokens.
-fn value_histograms(
-    pieces: &[&[Token]],
-    context_map: &[u8],
-    num_clusters: usize,
-) -> Option<Vec<Vec<u32>>> {
+fn value_histograms(pieces: &[&[Token]], context_map: &[u8], num_clusters: usize) -> Option<Vec<Vec<u32>>> {
     let mut hists = vec![Vec::new(); num_clusters];
     let mut entries = 0;
     for piece in pieces {
@@ -246,9 +227,7 @@ fn merged_cost(a: &[u32], b: &[u32]) -> f64 {
 /// Group contexts with similar statistics. Returns the context map.
 fn cluster(hists: &[Vec<u32>], max_clusters: usize) -> (Vec<u8>, usize) {
     let max_clusters = max_clusters.clamp(1, 255);
-    let used: Vec<usize> = (0..hists.len())
-        .filter(|&i| hists[i].iter().any(|&c| c > 0))
-        .collect();
+    let used: Vec<usize> = (0..hists.len()).filter(|&i| hists[i].iter().any(|&c| c > 0)).collect();
     if used.is_empty() {
         return (vec![0; hists.len()], 1);
     }
@@ -262,21 +241,12 @@ fn cluster(hists: &[Vec<u32>], max_clusters: usize) -> (Vec<u8>, usize) {
             assign[i] = k;
         }
     } else {
-        let first = *used
-            .iter()
-            .max_by(|&&a, &&b| costs[a].total_cmp(&costs[b]))
-            .unwrap();
+        let first = *used.iter().max_by(|&&a, &&b| costs[a].total_cmp(&costs[b])).unwrap();
         let mut seeds = vec![first];
-        let mut dist: Vec<f64> = used
-            .iter()
-            .map(|&i| merged_cost(&hists[i], &hists[first]) - costs[i] - costs[first])
-            .collect();
+        let mut dist: Vec<f64> =
+            used.iter().map(|&i| merged_cost(&hists[i], &hists[first]) - costs[i] - costs[first]).collect();
         while seeds.len() < max_clusters {
-            let (k, &d) = dist
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .unwrap();
+            let (k, &d) = dist.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
             if d <= 0.0 {
                 break;
             }
@@ -294,12 +264,7 @@ fn cluster(hists: &[Vec<u32>], max_clusters: usize) -> (Vec<u8>, usize) {
             // Evaluate each candidate once. min_by's comparator would
             // recompute the current best histogram for every challenger.
             let best = (0..seeds.len())
-                .map(|k| {
-                    (
-                        k,
-                        merged_cost(&hists[i], &hists[seeds[k]]) - costs[seeds[k]],
-                    )
-                })
+                .map(|k| (k, merged_cost(&hists[i], &hists[seeds[k]]) - costs[seeds[k]]))
                 .min_by(|a, b| a.1.total_cmp(&b.1))
                 .unwrap()
                 .0;
@@ -374,10 +339,7 @@ impl EntropyCode {
     /// written with it (possibly split over several streams).
     pub fn build(streams: &[&[Token]], num_ctx: usize, opts: CodeOptions) -> Self {
         let num_ctx = num_ctx.max(1);
-        assert!(
-            num_ctx <= 1 << 16,
-            "too many contexts for 16-bit token contexts"
-        );
+        assert!(num_ctx <= 1 << 16, "too many contexts for 16-bit token contexts");
         let pieces = split_pieces(streams, opts.threads);
         let mut hists: Vec<Vec<u32>> = vec![Vec::new(); num_ctx];
         let per_worker = pieces.len().div_ceil(opts.threads.max(1)).max(1);
@@ -401,48 +363,37 @@ impl EntropyCode {
                 add_into(d, s);
             }
         }
-        let (context_map, num_clusters) = if num_ctx == 1 {
-            (vec![0], 1)
-        } else {
-            cluster(&hists, opts.max_clusters)
-        };
+        let (context_map, num_clusters) = if num_ctx == 1 { (vec![0], 1) } else { cluster(&hists, opts.max_clusters) };
         // Pick a hybrid-uint config per cluster.
         let mut configs = vec![HybridUint::DEFAULT; num_clusters];
         if opts.tune_configs {
             let values = value_histograms(&pieces, &context_map, num_clusters);
             // Integer histogram counts and raw-bit totals remain exact, so
             // aggregating repeated values preserves configuration selection.
-            let costs: Vec<(Vec<Option<f64>>, Vec<bool>)> =
-                par_map(CANDIDATE_CONFIGS.len(), opts.threads, |ci| {
-                    let cfg = CANDIDATE_CONFIGS[ci];
-                    let mut hist: Vec<Vec<u32>> = vec![Vec::new(); num_clusters];
-                    let mut extra = vec![0u64; num_clusters];
-                    let mut used = vec![false; num_clusters];
-                    let mut bad = vec![false; num_clusters];
-                    visit_values(
-                        &pieces,
-                        &context_map,
-                        values.as_deref(),
-                        |c, value, count| {
-                            used[c] = true;
-                            let (tok, n, _) = cfg.encode(value);
-                            if tok >= 256 {
-                                bad[c] = true;
-                                return;
-                            }
-                            extra[c] += u64::from(n) * u64::from(count);
-                            let h = &mut hist[c];
-                            if tok as usize >= h.len() {
-                                h.resize(tok as usize + 1, 0);
-                            }
-                            h[tok as usize] += count;
-                        },
-                    );
-                    let cost = (0..num_clusters)
-                        .map(|c| (!bad[c]).then(|| estimate_cost(&hist[c]) + extra[c] as f64))
-                        .collect();
-                    (cost, used)
+            let costs: Vec<(Vec<Option<f64>>, Vec<bool>)> = par_map(CANDIDATE_CONFIGS.len(), opts.threads, |ci| {
+                let cfg = CANDIDATE_CONFIGS[ci];
+                let mut hist: Vec<Vec<u32>> = vec![Vec::new(); num_clusters];
+                let mut extra = vec![0u64; num_clusters];
+                let mut used = vec![false; num_clusters];
+                let mut bad = vec![false; num_clusters];
+                visit_values(&pieces, &context_map, values.as_deref(), |c, value, count| {
+                    used[c] = true;
+                    let (tok, n, _) = cfg.encode(value);
+                    if tok >= 256 {
+                        bad[c] = true;
+                        return;
+                    }
+                    extra[c] += u64::from(n) * u64::from(count);
+                    let h = &mut hist[c];
+                    if tok as usize >= h.len() {
+                        h.resize(tok as usize + 1, 0);
+                    }
+                    h[tok as usize] += count;
                 });
+                let cost =
+                    (0..num_clusters).map(|c| (!bad[c]).then(|| estimate_cost(&hist[c]) + extra[c] as f64)).collect();
+                (cost, used)
+            });
             for c in 0..num_clusters {
                 if !costs[0].1[c] {
                     continue;
@@ -476,22 +427,13 @@ impl EntropyCode {
             }
         }
         let max_tok = chists.iter().map(|h| h.len()).max().unwrap_or(1);
-        let log_alpha = (5..=8)
-            .find(|&l| (1usize << l) >= max_tok)
-            .expect("token alphabet too large");
+        let log_alpha = (5..=8).find(|&l| (1usize << l) >= max_tok).expect("token alphabet too large");
         let clusters = chists
             .iter()
             .zip(configs)
-            .map(|(h, config)| Cluster {
-                config,
-                dist: AnsDist::new(h, log_alpha),
-            })
+            .map(|(h, config)| Cluster { config, dist: AnsDist::new(h, log_alpha) })
             .collect();
-        EntropyCode {
-            context_map,
-            clusters,
-            log_alpha,
-        }
+        EntropyCode { context_map, clusters, log_alpha }
     }
 
     /// Write the code description (LZ77 flag, context map, configs and
@@ -516,11 +458,7 @@ impl EntropyCode {
         }
         let max = *self.context_map.iter().max().unwrap() as u32;
         let nbits = bits_for(max);
-        let simple_bits = if nbits <= 3 {
-            Some(3 + n * nbits as usize)
-        } else {
-            None
-        };
+        let simple_bits = if nbits <= 3 { Some(3 + n * nbits as usize) } else { None };
         // Even an empty ANS stream has a 32-bit state. Tiny simple maps
         // cannot benefit from building an entropy code (with or without MTF).
         if let Some(bits) = simple_bits
@@ -534,20 +472,8 @@ impl EntropyCode {
             return;
         }
         // Entropy-coded alternative.
-        let tokens: Vec<Token> = self
-            .context_map
-            .iter()
-            .map(|&c| Token::new(0, u32::from(c)))
-            .collect();
-        let code = EntropyCode::build(
-            &[&tokens],
-            1,
-            CodeOptions {
-                max_clusters: 1,
-                tune_configs: true,
-                threads: 1,
-            },
-        );
+        let tokens: Vec<Token> = self.context_map.iter().map(|&c| Token::new(0, u32::from(c))).collect();
+        let code = EntropyCode::build(&[&tokens], 1, CodeOptions { max_clusters: 1, tune_configs: true, threads: 1 });
         let mut coded = BitWriter::new();
         coded.write_bool(false); // no MTF
         code.write_header(&mut coded);
@@ -565,15 +491,8 @@ impl EntropyCode {
                 Token::new(0, index as u32)
             })
             .collect();
-        let mtf_code = EntropyCode::build(
-            &[&mtf_tokens],
-            1,
-            CodeOptions {
-                max_clusters: 1,
-                tune_configs: true,
-                threads: 1,
-            },
-        );
+        let mtf_code =
+            EntropyCode::build(&[&mtf_tokens], 1, CodeOptions { max_clusters: 1, tune_configs: true, threads: 1 });
         let mut mtf = BitWriter::new();
         mtf.write_bool(true);
         mtf_code.write_header(&mut mtf);
@@ -641,10 +560,8 @@ mod tests {
 
     #[test]
     fn aggregated_tuning_matches_individual_values() {
-        let tokens: Vec<_> = (0..100_000)
-            .map(|i| Token::new(i % 3, (i * 17) % 513))
-            .chain([Token::new(2, 65_535)])
-            .collect();
+        let tokens: Vec<_> =
+            (0..100_000).map(|i| Token::new(i % 3, (i * 17) % 513)).chain([Token::new(2, 65_535)]).collect();
         let pieces = [&tokens[..123], &tokens[123..]];
         let map = [0, 1, 0]; // Include merging and an unused cluster.
         let hists = value_histograms(&pieces, &map, 3).unwrap();
@@ -719,14 +636,7 @@ mod tests {
             .collect();
         for tokens in [vec![], vec![Token::new(0, 0); 4096], mixed] {
             for tune_configs in [false, true] {
-                let code = EntropyCode::build(
-                    &[&tokens],
-                    3,
-                    CodeOptions {
-                        tune_configs,
-                        ..CodeOptions::default()
-                    },
-                );
+                let code = EntropyCode::build(&[&tokens], 3, CodeOptions { tune_configs, ..CodeOptions::default() });
                 let expected = write_tokens_reference(&code, &tokens);
                 let mut w = BitWriter::new();
                 code.write_tokens(&tokens, &mut w);
@@ -745,8 +655,7 @@ mod tests {
                 let dec = if tok < split {
                     tok
                 } else {
-                    let nn = cfg.split_exp - (cfg.msb + cfg.lsb)
-                        + ((tok - split) >> (cfg.msb + cfg.lsb));
+                    let nn = cfg.split_exp - (cfg.msb + cfg.lsb) + ((tok - split) >> (cfg.msb + cfg.lsb));
                     assert_eq!(nn, n);
                     let low = tok & ((1 << cfg.lsb) - 1);
                     let t = (tok >> cfg.lsb) & ((1 << cfg.msb) - 1) | (1 << cfg.msb);
