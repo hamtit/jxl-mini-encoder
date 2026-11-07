@@ -1038,7 +1038,11 @@ impl<'a> Search<'a> {
         let mut current = 0f32;
         for y in cy..cy + h {
             for x in cx..cx + w {
-                if tile.priority[y * 8 + x] >= priority {
+                // Every covered cell must still be a block of its own: the
+                // edge loops only test the first cell, so a cell that belongs
+                // to a block chosen earlier (e.g. the second half of a 16x8
+                // pair in the same 2x2 square) would end up in two varblocks.
+                if tile.priority[y * 8 + x] >= priority || !tile.is_first(x, y) {
                     return;
                 }
                 current += tile.entropy[y * 8 + x];

@@ -732,3 +732,28 @@ fn animation_lossless_keeps_hidden_rgb_of_transparent_pixels() {
         assert!(data == direct(p), "frame {i} differs from replace coding");
     }
 }
+
+/// A 96x64 crop of a UI-like screenshot. With 16x8 / 8x16 pairs favoured by the
+/// transform search, the edge merge of a tile's last column used to put a 16x8
+/// block on a cell already covered by an 8x16 block of the same 2x2 square, so
+/// the varblocks overlapped and decoders rejected the file.
+#[test]
+fn edge_merge_does_not_overlap_blocks() {
+    let bytes = include_bytes!("data/ui_crop_overlap.png");
+    let mut dec = png::Decoder::new(std::io::Cursor::new(&bytes[..]));
+    dec.set_transformations(png::Transformations::EXPAND);
+    let mut r = dec.read_info().unwrap();
+    let mut buf = vec![0; r.output_buffer_size().unwrap()];
+    let info = r.next_frame(&mut buf).unwrap();
+    assert_eq!(info.color_type, png::ColorType::Rgb);
+    buf.truncate(info.buffer_size());
+    let img = jxl_mini_encoder::ImageRef::rgb8(info.width, info.height, &buf).unwrap();
+    for quality in [30.0, 40.0, 50.0, 65.0] {
+        for effort in [5, 7] {
+            let jxl = jxl_mini_encoder::Encoder::new().quality(quality).effort(effort).threads(2).encode(&img).unwrap();
+            let (w, h, ch, data) = decode(&jxl);
+            assert_eq!((w, h, ch), (info.width, info.height, 3));
+            assert!(psnr(&buf, &data) > 20.0, "q{quality} e{effort}");
+        }
+    }
+}
