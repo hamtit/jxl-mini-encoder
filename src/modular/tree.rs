@@ -485,14 +485,14 @@ fn residual_token(r: i32) -> (u8, u8) {
     ((t as usize).min(MAX_TOK - 1) as u8, n as u8)
 }
 
-/// `c * log2(c)`, tabulated for small counts.
-#[inline]
-fn xlogx(c: u32) -> f64 {
+/// `c * log2(c)` for small counts.
+const XLOGX_N: usize = 1 << 16;
+
+fn xlogx_table() -> &'static [f32] {
     use std::sync::OnceLock;
     static TABLE: OnceLock<Vec<f32>> = OnceLock::new();
-    const N: usize = 1 << 16;
-    let t = TABLE.get_or_init(|| {
-        (0..N)
+    TABLE.get_or_init(|| {
+        (0..XLOGX_N)
             .map(|c| {
                 if c == 0 {
                     0.0
@@ -501,11 +501,21 @@ fn xlogx(c: u32) -> f64 {
                 }
             })
             .collect()
-    });
+    })
+}
+
+/// `c * log2(c)`, tabulated for small counts.
+#[inline]
+fn xlogx_t(t: &[f32], c: u32) -> f64 {
     match t.get(c as usize) {
         Some(&v) => f64::from(v),
         None => f64::from(c) * f64::from(c).log2(),
     }
+}
+
+#[inline]
+fn xlogx(c: u32) -> f64 {
+    xlogx_t(xlogx_table(), c)
 }
 
 #[derive(Clone)]
@@ -528,13 +538,6 @@ impl Hist {
         self.counts[tok as usize] += 1;
         self.total += 1;
         self.extra += u64::from(extra);
-    }
-    fn merge(&mut self, o: &Hist, ntok: usize) {
-        for (a, b) in self.counts[..ntok].iter_mut().zip(&o.counts[..ntok]) {
-            *a += b;
-        }
-        self.total += o.total;
-        self.extra += o.extra;
     }
     fn cost(&self) -> f64 {
         self.cost_sub(None, MAX_TOK)
@@ -709,77 +712,277 @@ fn learn_sized<const N: usize>(streams: &[(u32, Vec<&Channel>)], opts: &LearnOpt
         .unwrap_or(1);
     // Bucket of every sample for every property, computed once: the same
     // `partition_point` the split search would otherwise redo at each node.
-    let buckets: Vec<Vec<u8>> = par_map(opts.props.len(), opts.threads, |pi| {
-        let th = &thresholds[opts.props[pi] as usize];
-        samples
-            .iter()
-            .map(|s| th.partition_point(|&t| t < s.props[pi]) as u8)
-            .collect()
-    });
+    // Row-major, so the counting pass touches one cache line per sample.
+    let active: Vec<usize> = (0..opts.props.len())
+        .filter(|&pi| !thresholds[opts.props[pi] as usize].is_empty())
+        .collect();
+    let bk: Vec<[u8; N]> = samples
+        .iter()
+        .map(|s| {
+            let mut row = [0u8; N];
+            for &pi in &active {
+                let th = &thresholds[opts.props[pi] as usize];
+                row[pi] = th.partition_point(|&t| t < s.props[pi]) as u8;
+            }
+            row
+        })
+        .collect();
+    let lay = StatsLayout::new(opts, &thresholds, ntok, npred, active);
     let ctx = Learner {
         samples: &samples,
-        buckets: &buckets,
+        bk: &bk,
         ntok,
         thresholds: &thresholds,
         opts,
         npred,
         scale,
+        lay,
     };
-    let (root, _) = ctx.build(&mut idx, leaves, 0, opts.threads.max(1));
+    let (root, _) = ctx.build(&mut idx, None, leaves, 0, opts.threads.max(1));
     Tree::from_build(root)
+}
+
+/// Smallest node whose children's statistics are derived by subtraction.
+const SUB_MIN: usize = 2048;
+
+/// Where each property's bucket statistics live in a [`Stats`]. Section
+/// `props.len()` is the whole node (one bucket).
+struct StatsLayout {
+    /// Properties (indices into `opts.props`) that have split candidates.
+    active: Vec<usize>,
+    /// Number of buckets per section (0 when the property has no thresholds).
+    nb: Vec<usize>,
+    cnt: Vec<usize>,
+    tot: Vec<usize>,
+    ext: Vec<usize>,
+    cnt_len: usize,
+    tot_len: usize,
+    ext_len: usize,
+}
+
+impl StatsLayout {
+    fn new(
+        opts: &LearnOptions,
+        thresholds: &[Vec<i32>],
+        ntok: usize,
+        np: usize,
+        active: Vec<usize>,
+    ) -> Self {
+        let mut l = StatsLayout {
+            active,
+            nb: Vec::new(),
+            cnt: Vec::new(),
+            tot: Vec::new(),
+            ext: Vec::new(),
+            cnt_len: 0,
+            tot_len: 0,
+            ext_len: 0,
+        };
+        for pi in 0..=opts.props.len() {
+            let nb = if pi == opts.props.len() {
+                1
+            } else {
+                let th = &thresholds[opts.props[pi] as usize];
+                if th.is_empty() { 0 } else { th.len() + 1 }
+            };
+            l.nb.push(nb);
+            l.cnt.push(l.cnt_len);
+            l.tot.push(l.tot_len);
+            l.ext.push(l.ext_len);
+            l.cnt_len += nb * np * ntok;
+            l.tot_len += nb;
+            l.ext_len += nb * np;
+        }
+        l
+    }
+}
+
+/// Token histograms of a node, per property bucket and predictor:
+/// `counts[cnt[p] + (b * np + k) * ntok + token]`, `btotal[tot[p] + b]`,
+/// `bextra[ext[p] + b * np + k]`.
+struct Stats {
+    counts: Vec<u32>,
+    btotal: Vec<u32>,
+    bextra: Vec<u64>,
+}
+
+impl Stats {
+    fn add(&mut self, o: &Stats) {
+        for (a, b) in self.counts.iter_mut().zip(&o.counts) {
+            *a += b;
+        }
+        for (a, b) in self.btotal.iter_mut().zip(&o.btotal) {
+            *a += b;
+        }
+        for (a, b) in self.bextra.iter_mut().zip(&o.bextra) {
+            *a += b;
+        }
+    }
+
+    /// `self - o`, where `o` was counted over a subset of `self`'s samples.
+    fn minus(mut self, o: &Stats) -> Stats {
+        for (a, b) in self.counts.iter_mut().zip(&o.counts) {
+            *a -= b;
+        }
+        for (a, b) in self.btotal.iter_mut().zip(&o.btotal) {
+            *a -= b;
+        }
+        for (a, b) in self.bextra.iter_mut().zip(&o.bextra) {
+            *a -= b;
+        }
+        self
+    }
 }
 
 struct Learner<'a, const N: usize> {
     samples: &'a [Sample<N>],
-    /// `buckets[prop_index][sample]`: threshold bucket of each sample.
-    buckets: &'a [Vec<u8>],
+    /// `bk[sample][prop_index]`: threshold bucket of each sample.
+    bk: &'a [[u8; N]],
     /// Number of token values in use (counts beyond are zero).
     ntok: usize,
     thresholds: &'a [Vec<i32>],
     opts: &'a LearnOptions,
     npred: usize,
     scale: f64,
+    lay: StatsLayout,
 }
 
 impl<const N: usize> Learner<'_, N> {
-    /// Best split of `prop` over the samples in `idx`: (cost, prop, value).
+    fn empty_stats(&self) -> Stats {
+        Stats {
+            counts: vec![0; self.lay.cnt_len],
+            btotal: vec![0; self.lay.tot_len],
+            bextra: vec![0; self.lay.ext_len],
+        }
+    }
+
+    /// Statistics of the samples in `idx`, one pass over them for all properties.
+    fn count_seq(&self, idx: &[u32]) -> Stats {
+        let (np, ntok) = (self.npred, self.ntok);
+        let lay = &self.lay;
+        let mut st = self.empty_stats();
+        let whole = lay.nb.len() - 1;
+        for &i in idx {
+            let s = &self.samples[i as usize];
+            let row = &self.bk[i as usize];
+            for &p in &lay.active {
+                let b = usize::from(row[p]);
+                st.btotal[lay.tot[p] + b] += 1;
+                let base = lay.cnt[p] + b * np * ntok;
+                let eb = lay.ext[p] + b * np;
+                for k in 0..np {
+                    st.counts[base + k * ntok + usize::from(s.tok[k])] += 1;
+                    st.bextra[eb + k] += u64::from(s.extra[k]);
+                }
+            }
+            st.btotal[lay.tot[whole]] += 1;
+            for k in 0..np {
+                st.counts[lay.cnt[whole] + k * ntok + usize::from(s.tok[k])] += 1;
+                st.bextra[lay.ext[whole] + k] += u64::from(s.extra[k]);
+            }
+        }
+        st
+    }
+
+    fn count(&self, idx: &[u32], threads: usize) -> Stats {
+        if threads <= 1 || idx.len() < PAR_SPLIT_MIN {
+            return self.count_seq(idx);
+        }
+        let chunk = idx.len().div_ceil(threads);
+        let parts = par_map(idx.len().div_ceil(chunk), threads, |c| {
+            self.count_seq(&idx[c * chunk..((c + 1) * chunk).min(idx.len())])
+        });
+        let mut it = parts.into_iter();
+        let mut total = it.next().unwrap();
+        for p in it {
+            total.add(&p);
+        }
+        total
+    }
+
+    /// Per-predictor token histograms of a node, straight from its samples.
+    fn node_hists(&self, idx: &[u32]) -> Vec<Hist> {
+        let mut hists = vec![Hist::new(); self.npred];
+        for &i in idx.iter() {
+            let s = &self.samples[i as usize];
+            for (k, h) in hists.iter_mut().enumerate() {
+                h.add(s.tok[k], s.extra[k]);
+            }
+        }
+        hists
+    }
+
+    fn hists_of(&self, st: &Stats) -> Vec<Hist> {
+        let (np, ntok) = (self.npred, self.ntok);
+        let whole = self.lay.nb.len() - 1;
+        (0..np)
+            .map(|k| {
+                let mut h = Hist::new();
+                let base = self.lay.cnt[whole] + k * ntok;
+                h.counts[..ntok].copy_from_slice(&st.counts[base..base + ntok]);
+                h.total = st.btotal[self.lay.tot[whole]];
+                h.extra = st.bextra[self.lay.ext[whole] + k];
+                h
+            })
+            .collect()
+    }
+
+    /// Best split of property `prop_index` from the node statistics:
+    /// (cost, prop, value).
     fn best_split_for(
         &self,
-        idx: &[u32],
+        st: &Stats,
         prop_index: usize,
         prop: u8,
         hists: &[Hist],
     ) -> Option<(f64, u8, i32)> {
-        let np = self.npred;
+        let (np, ntok) = (self.npred, self.ntok);
         let th = &self.thresholds[prop as usize];
         if th.is_empty() {
             return None;
         }
+        let lay = &self.lay;
+        let counts = &st.counts[lay.cnt[prop_index]..];
+        let btotal = &st.btotal[lay.tot[prop_index]..];
+        let bextra = &st.bextra[lay.ext[prop_index]..];
         let mut best: Option<(f64, u8, i32)> = None;
-        let ntok = self.ntok;
-        let mut buckets = vec![Hist::new(); (th.len() + 1) * np];
-        let col = &self.buckets[prop_index];
-        for &i in idx {
-            let s = &self.samples[i as usize];
-            let b = usize::from(col[i as usize]);
-            for k in 0..np {
-                buckets[b * np + k].add(s.tok[k], s.extra[k]);
-            }
-        }
         // right = buckets[..=t], left = buckets[t+1..]
-        let mut right = vec![Hist::new(); np];
+        let mut rcounts = vec![0u32; np * ntok];
+        let mut rtotal = 0u32;
+        let mut rextra = vec![0u64; np];
+        let all = hists[0].total;
+        let table = xlogx_table();
         for (t, &val) in th.iter().enumerate() {
-            for k in 0..np {
-                right[k].merge(&buckets[t * np + k], ntok);
+            if btotal[t] == 0 {
+                // Nothing moved to the right side: same split as before.
+                continue;
             }
-            if right[0].total == 0 || right[0].total == hists[0].total {
+            rtotal += btotal[t];
+            for k in 0..np {
+                let src = &counts[(t * np + k) * ntok..(t * np + k + 1) * ntok];
+                for (a, b) in rcounts[k * ntok..(k + 1) * ntok].iter_mut().zip(src) {
+                    *a += b;
+                }
+                rextra[k] += bextra[t * np + k];
+            }
+            if rtotal == all {
                 continue;
             }
             let mut rc = f64::INFINITY;
             let mut lc = f64::INFINITY;
             for k in 0..np {
-                rc = rc.min(right[k].cost_sub(None, ntok));
-                lc = lc.min(hists[k].cost_sub(Some(&right[k]), ntok));
+                let r = &rcounts[k * ntok..(k + 1) * ntok];
+                let mut rbits = rextra[k] as f64 + xlogx_t(table, rtotal);
+                for &c in r {
+                    rbits -= xlogx_t(table, c);
+                }
+                rc = rc.min(rbits);
+                let h = &hists[k];
+                let mut lbits = (h.extra - rextra[k]) as f64 + xlogx_t(table, h.total - rtotal);
+                for (a, b) in h.counts[..ntok].iter().zip(r) {
+                    lbits -= xlogx_t(table, a - b);
+                }
+                lc = lc.min(lbits);
             }
             let c = lc + rc;
             if best.is_none_or(|b| c < b.0) {
@@ -790,22 +993,30 @@ impl<const N: usize> Learner<'_, N> {
     }
 
     /// Build the subtree for `idx`. `leaves` is the number of leaves so far
-    /// (depth-first), and the number after this subtree is returned.
+    /// (depth-first), and the number after this subtree is returned. `stats`
+    /// are the node's statistics when the parent already derived them.
     fn build(
         &self,
         idx: &mut [u32],
+        stats: Option<Stats>,
         leaves: usize,
         depth: usize,
         threads: usize,
     ) -> (Build, usize) {
-        // Best predictor for this node.
-        let mut hists = vec![Hist::new(); self.npred];
-        for &i in idx.iter() {
-            let s = &self.samples[i as usize];
-            for (k, h) in hists.iter_mut().enumerate() {
-                h.add(s.tok[k], s.extra[k]);
+        let leaf = idx.len() < 64 || leaves >= self.opts.max_leaves || depth > 40;
+        let (st, hists) = match stats {
+            Some(st) => {
+                let h = self.hists_of(&st);
+                (Some(st), h)
             }
-        }
+            None if leaf => (None, self.node_hists(idx)),
+            None => {
+                let st = self.count(idx, threads);
+                let h = self.hists_of(&st);
+                (Some(st), h)
+            }
+        };
+        // Best predictor for this node.
         let (best_k, node_cost) = hists
             .iter()
             .map(Hist::cost)
@@ -813,24 +1024,17 @@ impl<const N: usize> Learner<'_, N> {
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .unwrap();
         let pred = self.opts.predictors[best_k];
-        if idx.len() < 64 || leaves >= self.opts.max_leaves || depth > 40 {
+        if leaf {
             return (Build::Leaf(pred), leaves);
         }
+        let st = st.expect("statistics of a split candidate");
         // Find the best split; each side picks its own best predictor.
-        let props = &self.opts.props;
-        let cands = par_map(
-            props.len(),
-            if idx.len() >= PAR_SPLIT_MIN {
-                threads
-            } else {
-                1
-            },
-            |k| self.best_split_for(idx, k, props[k], &hists),
-        );
         let mut best: Option<(f64, u8, i32)> = None;
-        for c in cands.into_iter().flatten() {
-            if best.is_none_or(|b| c.0 < b.0) {
-                best = Some(c);
+        for (k, &prop) in self.opts.props.iter().enumerate() {
+            if let Some(c) = self.best_split_for(&st, k, prop, &hists) {
+                if best.is_none_or(|b| c.0 < b.0) {
+                    best = Some(c);
+                }
             }
         }
         let Some((cost, prop, val)) = best else {
@@ -851,22 +1055,37 @@ impl<const N: usize> Learner<'_, N> {
         }
         let leaves = leaves + 1;
         let (l, r) = idx.split_at_mut(k);
+        // Count the smaller side only; the larger one is the parent minus it.
+        let (lst, rst) = if l.len() + r.len() >= SUB_MIN {
+            if l.len() <= r.len() {
+                let ls = self.count(l, threads);
+                let rs = st.minus(&ls);
+                (Some(ls), Some(rs))
+            } else {
+                let rs = self.count(r, threads);
+                let ls = st.minus(&rs);
+                (Some(ls), Some(rs))
+            }
+        } else {
+            drop(st);
+            (None, None)
+        };
         let (left, right, after) = if threads > 1 && l.len().min(r.len()) >= PAR_SUBTREE_MIN {
             // Build both sides at once. The right side is built as if the
             // left used no leaf budget (so it may be too large) and is then
             // trimmed to what a depth-first walk would have allowed.
             let (tl, tr) = (threads.div_ceil(2), threads / 2);
             let ((left, after_l), (spec, _)) = std::thread::scope(|sc| {
-                let h = sc.spawn(|| self.build(r, leaves, depth + 1, tr));
-                let a = self.build(l, leaves, depth + 1, tl);
+                let h = sc.spawn(|| self.build(r, rst, leaves, depth + 1, tr));
+                let a = self.build(l, lst, leaves, depth + 1, tl);
                 (a, h.join().expect("worker panicked"))
             });
             let mut counter = after_l;
             let right = self.trim(spec, &mut counter);
             (left, right, counter)
         } else {
-            let (left, after_l) = self.build(l, leaves, depth + 1, threads);
-            let (right, after_r) = self.build(r, after_l, depth + 1, threads);
+            let (left, after_l) = self.build(l, lst, leaves, depth + 1, threads);
+            let (right, after_r) = self.build(r, rst, after_l, depth + 1, threads);
             (left, right, after_r)
         };
         (

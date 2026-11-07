@@ -234,6 +234,9 @@ impl ModularOptions {
             if effort >= 7 {
                 l.props.extend([2, 3]);
             }
+            // Index residuals are cheap to split on: a smaller threshold than
+            // for intensities pays off (measured on GIF animations).
+            l.split_cost = 80.0;
         }
         self
     }
