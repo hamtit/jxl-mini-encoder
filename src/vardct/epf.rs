@@ -114,11 +114,11 @@ fn run_stage(src: &Planes, dst: &mut Planes, inv_sigma: &[f32], stage: Stage, th
     let [d0, d1, d2] = &mut dst.p;
     let tasks: Vec<_> = d0.chunks_mut(w * 8).zip(d1.chunks_mut(w * 8)).zip(d2.chunks_mut(w * 8)).enumerate().collect();
     let ctx = StageCtx { w, bw, pw, padded_src: &padded_src, inv_sigma, stage, offs, sm, bsm };
-    #[cfg(target_arch = "x86_64")]
-    let avx2 = std::arch::is_x86_feature_detected!("avx2");
-    #[cfg(not(target_arch = "x86_64"))]
-    let avx2 = false;
-    par_tasks(tasks, threads, |(band, ((o0, o1), o2))| run_band(&ctx, band, o0, o1, o2, avx2));
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    let simd = crate::simd_available();
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let simd = false;
+    par_tasks(tasks, threads, |(band, ((o0, o1), o2))| run_band(&ctx, band, o0, o1, o2, simd));
 }
 
 /// Everything `run_band` reads besides its output band.
@@ -134,19 +134,20 @@ struct StageCtx<'a> {
     bsm: f32,
 }
 
-fn run_band(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2: &mut [f32], avx2: bool) {
-    #[cfg(target_arch = "x86_64")]
-    if avx2 {
+fn run_band(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2: &mut [f32], simd: bool) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if simd {
         // SAFETY: AVX2 support was detected at runtime.
-        return unsafe { run_band_avx2(ctx, band, o0, o1, o2) };
+        return unsafe { run_band_simd(ctx, band, o0, o1, o2) };
     }
-    let _ = avx2;
+    let _ = simd;
     run_band_impl(ctx, band, o0, o1, o2)
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn run_band_avx2(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2: &mut [f32]) {
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+unsafe fn run_band_simd(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2: &mut [f32]) {
     run_band_impl(ctx, band, o0, o1, o2)
 }
 

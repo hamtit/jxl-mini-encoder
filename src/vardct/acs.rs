@@ -532,7 +532,7 @@ impl Tile {
 /// values and the lane-ordered sum of their square roots.
 #[allow(clippy::too_many_arguments)]
 fn quant_stage(
-    avx2: bool,
+    simd: bool,
     c0: &[f32],
     c1: &[f32],
     k: f32,
@@ -544,11 +544,16 @@ fn quant_stage(
     let n = c0.len();
     assert!(n.is_multiple_of(8) && c1.len() == n && wt.len() == n && iw.len() == n && e.len() == n);
     #[cfg(target_arch = "x86_64")]
-    if avx2 {
+    if simd {
         // SAFETY: AVX2 support was detected at runtime; lengths checked above.
         return unsafe { quant_stage_avx2(c0, c1, k, wt, iw, quant, e) };
     }
-    let _ = avx2;
+    #[cfg(target_arch = "aarch64")]
+    if simd {
+        // SAFETY: NEON is part of the aarch64 baseline; lengths checked above.
+        return unsafe { quant_stage_neon(c0, c1, k, wt, iw, quant, e) };
+    }
+    let _ = simd;
     let (mut nz, mut acc) = (0u32, [0f32; 8]);
     for i in 0..n {
         let v = (c0[i] - k * c1[i]) * wt[i] * quant;
@@ -610,16 +615,72 @@ unsafe fn quant_stage_avx2(
     (nzs.iter().sum::<i32>() as u32, reduce8(&lanes))
 }
 
+/// NEON twin of `quant_stage_avx2`: two 4-lane accumulators stand in for the
+/// eight lanes, so the lane-ordered sum is identical.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn quant_stage_neon(
+    c0: &[f32],
+    c1: &[f32],
+    k: f32,
+    wt: &[f32],
+    iw: &[f32],
+    quant: f32,
+    e: &mut [f32],
+) -> (u32, f32) {
+    use std::arch::aarch64::*;
+    let n = c0.len();
+    let (kv, qv) = (vdupq_n_f32(k), vdupq_n_f32(quant));
+    let zero = vdupq_n_f32(0.0);
+    let mut acc = [zero; 2];
+    let mut nzv = [vdupq_n_u32(0); 2];
+    let mut i = 0;
+    while i < n {
+        for h in 0..2 {
+            let o = i + 4 * h;
+            // SAFETY: i + 8 <= n and every slice has n elements.
+            unsafe {
+                let a = vld1q_f32(c0.as_ptr().add(o));
+                let b = vld1q_f32(c1.as_ptr().add(o));
+                let w = vld1q_f32(wt.as_ptr().add(o));
+                let iwv = vld1q_f32(iw.as_ptr().add(o));
+                let v = vmulq_f32(vmulq_f32(vsubq_f32(a, vmulq_f32(kv, b)), w), qv);
+                let r = vrndnq_f32(v);
+                vst1q_f32(e.as_mut_ptr().add(o), vmulq_f32(vsubq_f32(v, r), iwv));
+                let q = vabsq_f32(r);
+                acc[h] = vaddq_f32(acc[h], vsqrtq_f32(q));
+                // The compare mask is all ones where q != 0; shift it down to 1.
+                let m = vmvnq_u32(vceqq_f32(q, zero));
+                nzv[h] = vaddq_u32(nzv[h], vshrq_n_u32::<31>(m));
+            }
+        }
+        i += 8;
+    }
+    let mut lanes = [0f32; 8];
+    // SAFETY: the array holds eight f32 lanes.
+    unsafe {
+        vst1q_f32(lanes.as_mut_ptr(), acc[0]);
+        vst1q_f32(lanes.as_mut_ptr().add(4), acc[1]);
+    }
+    let nz = vaddvq_u32(nzv[0]) + vaddvq_u32(nzv[1]);
+    (nz, reduce8(&lanes))
+}
+
 /// Sum of eighth powers of `(mask + off) * pix` over one row (width a
 /// multiple of 8), accumulated in f32 lanes.
-fn loss_row(avx2: bool, mrow: &[f32], prow: &[f32], off: f32) -> f64 {
+fn loss_row(simd: bool, mrow: &[f32], prow: &[f32], off: f32) -> f64 {
     assert!(mrow.len().is_multiple_of(8) && prow.len() == mrow.len());
     #[cfg(target_arch = "x86_64")]
-    if avx2 {
+    if simd {
         // SAFETY: AVX2 support was detected at runtime; lengths checked above.
         return unsafe { loss_row_avx2(mrow, prow, off) };
     }
-    let _ = avx2;
+    #[cfg(target_arch = "aarch64")]
+    if simd {
+        // SAFETY: NEON is part of the aarch64 baseline; lengths checked above.
+        return unsafe { loss_row_neon(mrow, prow, off) };
+    }
+    let _ = simd;
     let mut lacc = [0f32; 8];
     for (i, (&m, &p)) in mrow.iter().zip(prow).enumerate() {
         let e = (m + off) * p;
@@ -652,6 +713,38 @@ unsafe fn loss_row_avx2(mrow: &[f32], prow: &[f32], off: f32) -> f64 {
     let mut lanes = [0f32; 8];
     // SAFETY: the array holds eight f32 lanes.
     unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), acc) };
+    f64::from(reduce8(&lanes))
+}
+
+/// NEON twin of `loss_row_avx2` (same eight-lane accumulation order).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn loss_row_neon(mrow: &[f32], prow: &[f32], off: f32) -> f64 {
+    use std::arch::aarch64::*;
+    let ov = vdupq_n_f32(off);
+    let mut acc = [vdupq_n_f32(0.0); 2];
+    let mut i = 0;
+    while i < mrow.len() {
+        for h in 0..2 {
+            let o = i + 4 * h;
+            // SAFETY: i + 8 <= len for both slices.
+            unsafe {
+                let m = vld1q_f32(mrow.as_ptr().add(o));
+                let p = vld1q_f32(prow.as_ptr().add(o));
+                let e = vmulq_f32(vaddq_f32(m, ov), p);
+                let e2 = vmulq_f32(e, e);
+                let e4 = vmulq_f32(e2, e2);
+                acc[h] = vaddq_f32(acc[h], vmulq_f32(e4, e4));
+            }
+        }
+        i += 8;
+    }
+    let mut lanes = [0f32; 8];
+    // SAFETY: the array holds eight f32 lanes.
+    unsafe {
+        vst1q_f32(lanes.as_mut_ptr(), acc[0]);
+        vst1q_f32(lanes.as_mut_ptr().add(4), acc[1]);
+    }
     f64::from(reduce8(&lanes))
 }
 
@@ -743,17 +836,18 @@ impl<'a> Search<'a> {
 
     /// libjxl's EstimateEntropy: coefficient cost plus masked distortion.
     fn estimate(&self, acs: Acs, bx: usize, by: usize, entropy_mul: f32, limit: f32, scratch: &mut [f32]) -> f32 {
-        #[cfg(target_arch = "x86_64")]
-        if self.dct.has_avx2() {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        if self.dct.has_simd() {
             // SAFETY: AVX2 support was detected at runtime.
-            return unsafe { self.estimate_avx2(acs, bx, by, entropy_mul, limit, scratch) };
+            return unsafe { self.estimate_simd(acs, bx, by, entropy_mul, limit, scratch) };
         }
         self.estimate_impl(acs, bx, by, entropy_mul, limit, scratch)
     }
 
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn estimate_avx2(
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+    #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+    unsafe fn estimate_simd(
         &self,
         acs: Acs,
         bx: usize,
@@ -808,7 +902,7 @@ impl<'a> Search<'a> {
             let (wt, iw) = (&t.weights[c][..n], &t.inv_weights[c][..n]);
             let (c0, c1) = (&coeffs[c][..n], &coeffs[1][..n]);
             let e = &mut err[c][..n];
-            let (nz, sum_sqrt) = quant_stage(self.dct.has_avx2(), &c0[..n], &c1[..n], k, &wt[..n], &iw[..n], quant, e);
+            let (nz, sum_sqrt) = quant_stage(self.dct.has_simd(), &c0[..n], &c1[..n], k, &wt[..n], &iw[..n], quant, e);
             let nbits = ceil_log2(nz as usize + 1) + 1;
             let mut ec = self.cfg.cost_delta * sum_sqrt;
             ec += self.cfg.zeros_mul * (ceil_log2(nbits + 17) + nbits) as f32;
@@ -830,7 +924,7 @@ impl<'a> Search<'a> {
             let mut lossc = 0f64;
             for y in 0..t.h {
                 let mrow = &inp.mask1x1[(by * 8 + y) * inp.stride + bx * 8..][..t.w];
-                lossc += loss_row(self.dct.has_avx2(), mrow, &pix[y * t.w..(y + 1) * t.w], off);
+                lossc += loss_row(self.dct.has_simd(), mrow, &pix[y * t.w..(y + 1) * t.w], off);
             }
             loss += lossc * CHANNEL_MUL[c];
             if c == 0 && nb >= 2 {
@@ -1171,8 +1265,8 @@ mod tests {
     }
 
     #[test]
-    fn avx2_kernels_match_scalar() {
-        if !Dct::new().has_avx2() {
+    fn simd_kernels_match_scalar() {
+        if !Dct::new().has_simd() {
             return;
         }
         let mut seed = 7;
