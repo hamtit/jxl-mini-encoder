@@ -79,8 +79,8 @@ pub fn initial_quant_field(distance: f32, xyb: &Xyb, scale: f32, threads: usize)
     let mut pre = vec![0f32; qw * qh];
     let mut mask1x1 = vec![0f32; w * h];
     let tasks: Vec<_> = mask1x1.chunks_mut(w * 8).zip(pre.chunks_mut(qw * 2)).enumerate().collect();
-    let avx2 = has_avx2();
-    par_tasks(tasks, threads, |(band, (mask, pre))| mask_band(avx2, py, w, h, qw, band, mask, pre));
+    let simd = has_simd();
+    par_tasks(tasks, threads, |(band, (mask, pre))| mask_band(simd, py, w, h, qw, band, mask, pre));
 
     // Fuzzy erosion to block resolution.
     let mul = if distance < 2.0 { (2.0 - distance) * 0.5 } else { 0.0 };
@@ -127,18 +127,18 @@ pub fn initial_quant_field(distance: f32, xyb: &Xyb, scale: f32, threads: usize)
     let addv = (1.0 - dampen) * 0.48 * scale;
     let (px, pb) = (&xyb.planes[0], &xyb.planes[2]);
     par_tasks(aq.chunks_mut(bw).enumerate().collect(), threads, |(by, row)| {
-        modulate_row(avx2, [px, py, pb], w, by, mulv, addv, row)
+        modulate_row(simd, [px, py, pb], w, by, mulv, addv, row)
     });
 
     AqMaps { quant_field: aq, mask1x1: blur_mask1x1(mask1x1, w, h, threads) }
 }
 
-fn has_avx2() -> bool {
-    #[cfg(target_arch = "x86_64")]
+fn has_simd() -> bool {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
-        std::arch::is_x86_feature_detected!("avx2")
+        crate::simd_available()
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         false
     }
@@ -160,19 +160,20 @@ fn fast_ln1p(x: f32) -> f32 {
     e as f32 * std::f32::consts::LN_2 + 2.0 * s * p
 }
 
-fn mask_band(avx2: bool, py: &[f32], w: usize, h: usize, qw: usize, band: usize, mask: &mut [f32], pre: &mut [f32]) {
-    #[cfg(target_arch = "x86_64")]
-    if avx2 {
+fn mask_band(simd: bool, py: &[f32], w: usize, h: usize, qw: usize, band: usize, mask: &mut [f32], pre: &mut [f32]) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if simd {
         // SAFETY: AVX2 support was detected at runtime.
-        return unsafe { mask_band_avx2(py, w, h, qw, band, mask, pre) };
+        return unsafe { mask_band_simd(py, w, h, qw, band, mask, pre) };
     }
-    let _ = avx2;
+    let _ = simd;
     mask_band_impl(py, w, h, qw, band, mask, pre)
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn mask_band_avx2(py: &[f32], w: usize, h: usize, qw: usize, band: usize, mask: &mut [f32], pre: &mut [f32]) {
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+unsafe fn mask_band_simd(py: &[f32], w: usize, h: usize, qw: usize, band: usize, mask: &mut [f32], pre: &mut [f32]) {
     mask_band_impl(py, w, h, qw, band, mask, pre)
 }
 
@@ -224,19 +225,20 @@ fn mask_band_impl(py: &[f32], w: usize, h: usize, qw: usize, band: usize, mask: 
     }
 }
 
-fn modulate_row(avx2: bool, planes: [&[f32]; 3], w: usize, by: usize, mulv: f32, addv: f32, row: &mut [f32]) {
-    #[cfg(target_arch = "x86_64")]
-    if avx2 {
+fn modulate_row(simd: bool, planes: [&[f32]; 3], w: usize, by: usize, mulv: f32, addv: f32, row: &mut [f32]) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if simd {
         // SAFETY: AVX2 support was detected at runtime.
-        return unsafe { modulate_row_avx2(planes, w, by, mulv, addv, row) };
+        return unsafe { modulate_row_simd(planes, w, by, mulv, addv, row) };
     }
-    let _ = avx2;
+    let _ = simd;
     modulate_row_impl(planes, w, by, mulv, addv, row)
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn modulate_row_avx2(planes: [&[f32]; 3], w: usize, by: usize, mulv: f32, addv: f32, row: &mut [f32]) {
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+unsafe fn modulate_row_simd(planes: [&[f32]; 3], w: usize, by: usize, mulv: f32, addv: f32, row: &mut [f32]) {
     modulate_row_impl(planes, w, by, mulv, addv, row)
 }
 

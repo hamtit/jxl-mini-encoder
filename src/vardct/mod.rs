@@ -165,19 +165,20 @@ fn fast_log2(x: f32) -> f32 {
 }
 
 /// Sum of `fast_log2(1 + |(s - r y) * wm|)`, in eight interleaved lanes.
-fn correlation_cost(avx2: bool, s: &[f32], y: &[f32], wm: &[f32], r: f32) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    if avx2 {
+fn correlation_cost(simd: bool, s: &[f32], y: &[f32], wm: &[f32], r: f32) -> f32 {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if simd {
         // SAFETY: AVX2 support was detected at runtime.
-        return unsafe { correlation_cost_avx2(s, y, wm, r) };
+        return unsafe { correlation_cost_simd(s, y, wm, r) };
     }
-    let _ = avx2;
+    let _ = simd;
     correlation_cost_impl(s, y, wm, r)
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn correlation_cost_avx2(s: &[f32], y: &[f32], wm: &[f32], r: f32) -> f32 {
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+unsafe fn correlation_cost_simd(s: &[f32], y: &[f32], wm: &[f32], r: f32) -> f32 {
     correlation_cost_impl(s, y, wm, r)
 }
 
@@ -413,17 +414,18 @@ impl Ctx<'_> {
         thres: &mut [f32; 4],
         quant: &mut i32,
     ) {
-        #[cfg(target_arch = "x86_64")]
-        if self.dct.has_avx2() {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        if self.dct.has_simd() {
             // SAFETY: AVX2 support was detected at runtime.
-            return unsafe { self.adjust_quant_avx2(block, t, c, acs, thres, quant) };
+            return unsafe { self.adjust_quant_simd(block, t, c, acs, thres, quant) };
         }
         self.adjust_quant_impl(block, t, c, acs, thres, quant)
     }
 
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn adjust_quant_avx2(
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+    #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+    unsafe fn adjust_quant_simd(
         &self,
         block: &[f32],
         t: &acs::TransformTables,
@@ -602,10 +604,10 @@ impl Ctx<'_> {
         if s.len() < CFL_MIN_COEFFS {
             return 0;
         }
-        let avx2 = self.dct.has_avx2();
+        let simd = self.dct.has_simd();
         let cost = |k: i32| -> f32 {
             let r = base + k as f32 / CFL_FACTOR;
-            correlation_cost(avx2, &s, &y, &wm, r)
+            correlation_cost(simd, &s, &y, &wm, r)
         };
         let zero = cost(0);
         let mut best = (zero, 0i32);
@@ -647,10 +649,10 @@ impl Ctx<'_> {
             }
         }
         let m = qac * self.qm_mult[c];
-        #[cfg(target_arch = "x86_64")]
-        if self.dct.has_avx2() {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        if self.dct.has_simd() {
             // SAFETY: AVX2 support was detected at runtime.
-            return unsafe { quantize_avx2(coeffs, &t.weights[c], t.w, t.h, m, thres, out) };
+            return unsafe { quantize_simd(coeffs, &t.weights[c], t.w, t.h, m, thres, out) };
         }
         quantize_impl(coeffs, &t.weights[c], t.w, t.h, m, thres, out)
     }
@@ -725,9 +727,10 @@ fn quantize_impl(coeffs: &[f32], weights: &[f32], w: usize, h: usize, m: f32, th
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn quantize_avx2(coeffs: &[f32], weights: &[f32], w: usize, h: usize, m: f32, thres: [f32; 4], out: &mut [i32]) {
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+unsafe fn quantize_simd(coeffs: &[f32], weights: &[f32], w: usize, h: usize, m: f32, thres: [f32; 4], out: &mut [i32]) {
     quantize_impl(coeffs, weights, w, h, m, thres, out)
 }
 

@@ -420,18 +420,20 @@ macro_rules! sized_kernels {
             }
             true
         }
-        #[cfg(target_arch = "x86_64")]
-        #[target_feature(enable = "avx2")]
-        unsafe fn forward_avx2(ic: &[Vec<f32>], src: &[f32], stride: usize, w: usize, h: usize, out: &mut [f32]) -> bool {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+        #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+        unsafe fn forward_simd(ic: &[Vec<f32>], src: &[f32], stride: usize, w: usize, h: usize, out: &mut [f32]) -> bool {
             match (w, h) {
                 $(($w, $h) => forward_wh::<$w, $h, { $w * $h }>(ic, src, stride, out),)*
                 _ => return false,
             }
             true
         }
-        #[cfg(target_arch = "x86_64")]
-        #[target_feature(enable = "avx2")]
-        unsafe fn inverse_avx2(ic: &[Vec<f32>], c: &[f32], w: usize, h: usize, out: &mut [f32]) -> bool {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+        #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+        unsafe fn inverse_simd(ic: &[Vec<f32>], c: &[f32], w: usize, h: usize, out: &mut [f32]) -> bool {
             match (w, h) {
                 $(($w, $h) => inverse_wh::<$w, $h, { $w * $h }>(ic, c, out),)*
                 _ => return false,
@@ -446,12 +448,12 @@ sized_kernels!((16, 16), (32, 32), (64, 64), (8, 16), (16, 8), (32, 16), (16, 32
 pub struct Dct {
     /// inv_cos[log2 n][i] = 1 / (2 cos(pi (2i + 1) / 2n))
     inv_cos: Vec<Vec<f32>>,
-    avx2: bool,
+    simd: bool,
 }
 
 impl Dct {
-    pub fn has_avx2(&self) -> bool {
-        self.avx2
+    pub fn has_simd(&self) -> bool {
+        self.simd
     }
 
     pub fn new() -> Self {
@@ -463,11 +465,11 @@ impl Dct {
                     .collect()
             })
             .collect();
-        #[cfg(target_arch = "x86_64")]
-        let avx2 = std::arch::is_x86_feature_detected!("avx2");
-        #[cfg(not(target_arch = "x86_64"))]
-        let avx2 = false;
-        Dct { inv_cos, avx2 }
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        let simd = crate::simd_available();
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let simd = false;
+        Dct { inv_cos, simd }
     }
 
     /// 2D forward DCT of a `w` x `h` block read from `src` with row stride
@@ -476,9 +478,9 @@ impl Dct {
         if w == 8 && h == 8 {
             return self.forward8(src, stride, out);
         }
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: `self.avx2` is only set when AVX2 was detected at runtime (see `Dct::new`).
-        if self.avx2 && unsafe { forward_avx2(&self.inv_cos, src, stride, w, h, out) } {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        // SAFETY: `self.simd` is only set when AVX2 was detected at runtime (see `Dct::new`).
+        if self.simd && unsafe { forward_simd(&self.inv_cos, src, stride, w, h, out) } {
             return;
         }
         if forward_plain(&self.inv_cos, src, stride, w, h, out) {
@@ -504,32 +506,34 @@ impl Dct {
     }
 
     fn forward8(&self, src: &[f32], stride: usize, out: &mut [f32]) {
-        #[cfg(target_arch = "x86_64")]
-        if self.avx2 {
-            // SAFETY: `self.avx2` is only set when AVX2 was detected at runtime.
-            return unsafe { self.forward8_avx2(src, stride, out) };
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        if self.simd {
+            // SAFETY: `self.simd` is only set when AVX2 was detected at runtime.
+            return unsafe { self.forward8_simd(src, stride, out) };
         }
         self.forward8_impl(src, stride, out)
     }
 
     fn inverse8(&self, coeffs: &[f32], out: &mut [f32]) {
-        #[cfg(target_arch = "x86_64")]
-        if self.avx2 {
-            // SAFETY: `self.avx2` is only set when AVX2 was detected at runtime.
-            return unsafe { self.inverse8_avx2(coeffs, out) };
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        if self.simd {
+            // SAFETY: `self.simd` is only set when AVX2 was detected at runtime.
+            return unsafe { self.inverse8_simd(coeffs, out) };
         }
         self.inverse8_impl(coeffs, out)
     }
 
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn forward8_avx2(&self, src: &[f32], stride: usize, out: &mut [f32]) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+    #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+    unsafe fn forward8_simd(&self, src: &[f32], stride: usize, out: &mut [f32]) {
         self.forward8_impl(src, stride, out)
     }
 
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn inverse8_avx2(&self, coeffs: &[f32], out: &mut [f32]) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+    #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+    unsafe fn inverse8_simd(&self, coeffs: &[f32], out: &mut [f32]) {
         self.inverse8_impl(coeffs, out)
     }
 
@@ -600,9 +604,9 @@ impl Dct {
         if w == 8 && h == 8 {
             return self.inverse8(coeffs, out);
         }
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: `self.avx2` is only set when AVX2 was detected at runtime (see `Dct::new`).
-        if self.avx2 && unsafe { inverse_avx2(&self.inv_cos, coeffs, w, h, out) } {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        // SAFETY: `self.simd` is only set when AVX2 was detected at runtime (see `Dct::new`).
+        if self.simd && unsafe { inverse_simd(&self.inv_cos, coeffs, w, h, out) } {
             return;
         }
         if inverse_plain(&self.inv_cos, coeffs, w, h, out) {
@@ -663,6 +667,27 @@ mod tests {
                 let r: f32 = (0..n).map(|i| src[i] * t[k * n + i]).sum();
                 assert!((r - c[k]).abs() < 1e-4, "n={n} k={k}: {r} vs {}", c[k]);
             }
+        }
+    }
+
+    /// The width-specialised SIMD kernels must be bit-identical to the plain ones.
+    #[test]
+    fn simd_kernels_match_plain() {
+        let d = Dct::new();
+        if !d.has_simd() {
+            return;
+        }
+        for (w, h) in [(16, 16), (32, 32), (64, 64), (8, 16), (16, 8), (32, 16), (16, 32), (64, 32), (32, 64)] {
+            let n = w * h;
+            let src: Vec<f32> = (0..n).map(|i| ((i * 37 % 1013) as f32) / 500.0 - 1.0).collect();
+            let (mut a, mut b) = (vec![0f32; n], vec![0f32; n]);
+            d.forward(&src, w, w, h, &mut a);
+            assert!(forward_plain(&d.inv_cos, &src, w, w, h, &mut b));
+            assert_eq!(a, b, "forward {w}x{h}");
+            let (mut c, mut e) = (vec![0f32; n], vec![0f32; n]);
+            d.inverse(&a, w, h, &mut c);
+            assert!(inverse_plain(&d.inv_cos, &a, w, h, &mut e));
+            assert_eq!(c, e, "inverse {w}x{h}");
         }
     }
 

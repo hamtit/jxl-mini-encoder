@@ -19,6 +19,24 @@
 // Index loops mirror the specification and libjxl.
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
+/// Whether the vectorised kernels can run: AVX2 is detected at runtime on
+/// x86-64, NEON is part of the aarch64 baseline.
+#[inline]
+pub(crate) fn simd_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        true
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
 mod bit_writer;
 mod entropy;
 mod error;
