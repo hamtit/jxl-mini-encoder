@@ -18,6 +18,7 @@ use crate::entropy::{CodeOptions, EntropyCode, Token, pack_signed};
 use crate::headers::{Encoding, FrameInfo, FramePlacement, GROUP_DIM, Layout, write_frame_header, write_sections};
 use crate::modular::{Channel, GlobalTree, ModularOptions, write_header, write_standalone};
 use crate::parallel::par_map;
+use crate::tune::k as tk;
 use crate::{EncoderOptions, ImageRef};
 use acs::{Acs, BlockAcs, SearchInput, Tables};
 use dct::Dct;
@@ -69,7 +70,7 @@ impl Params {
             epf_iters,
             adaptive_quant: effort >= 5,
             choose_transforms: effort >= 5,
-            quant_dc: initial_quant_dc(distance),
+            quant_dc: initial_quant_dc(distance) * tk(9),
         }
     }
 }
@@ -285,12 +286,12 @@ impl Ctx<'_> {
                     }
                 }
                 let mut hf_mul = i32::from(self.quantizer.raw[aby * self.bw + abx]) + 1;
-                let mut thres_y = [0.56, 0.62, 0.62, 0.62];
+                let mut thres_y = [0.56 * tk(0), 0.62 * tk(1), 0.62 * tk(1), 0.62 * tk(1)];
                 if self.adjust && acs.small().is_none() {
                     let orig = hf_mul;
                     let mut best = 0;
                     for c in [1usize, 0, 2] {
-                        let mut th = [0.58, 0.64, 0.64, 0.64];
+                        let mut th = [0.58 * tk(4), 0.64 * tk(5), 0.64 * tk(5), 0.64 * tk(5)];
                         let mut qn = orig;
                         self.adjust_quant(&coeffs[c][..n], t, c, acs, &mut th, &mut qn);
                         if c == 1 {
@@ -357,8 +358,24 @@ impl Ctx<'_> {
                 coeffs[2][i] = b_all[blk.off + i] - rb * yr[i];
             }
             q[1][..n].copy_from_slice(&qy_all[blk.off..blk.off + n]);
-            self.quantize(&coeffs[0][..n], t, 0, nb, blk.qac, [0.58, 0.62, 0.62, 0.62], &mut q[0]);
-            self.quantize(&coeffs[2][..n], t, 2, nb, blk.qac, [0.58, 0.62, 0.62, 0.62], &mut q[2]);
+            self.quantize(
+                &coeffs[0][..n],
+                t,
+                0,
+                nb,
+                blk.qac,
+                [0.58 * tk(2), 0.62 * tk(3), 0.62 * tk(3), 0.62 * tk(3)],
+                &mut q[0],
+            );
+            self.quantize(
+                &coeffs[2][..n],
+                t,
+                2,
+                nb,
+                blk.qac,
+                [0.58 * tk(2), 0.62 * tk(3), 0.62 * tk(3), 0.62 * tk(3)],
+                &mut q[2],
+            );
             self.tokenize(blk.bx, blk.by, blk.acs, &q, &mut nz_row, &mut tokens);
             if self.recon {
                 let (nbx, nby) = blk.acs.blocks();
@@ -453,8 +470,8 @@ impl Ctx<'_> {
         if xs > 1 || ys > 1 {
             for th in thres.iter_mut() {
                 *th -= (0.003 * area).clamp(0.0, 0.08);
-                if *th < 0.54 {
-                    *th = 0.54;
+                if *th < 0.54 * tk(10) {
+                    *th = 0.54 * tk(10);
                 }
             }
         }
@@ -629,7 +646,7 @@ impl Ctx<'_> {
                 }
             }
         }
-        if best.0 + CFL_MIN_GAIN < zero { best.1 } else { 0 }
+        if best.0 + CFL_MIN_GAIN * tk(12) < zero { best.1 } else { 0 }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -645,7 +662,7 @@ impl Ctx<'_> {
     ) {
         if c != 1 && nb >= 4 {
             for v in &mut thres {
-                *v = (*v - 0.00744 * nb as f32).max(0.5);
+                *v = (*v - 0.00744 * tk(6) * nb as f32).max(0.5);
             }
         }
         let m = qac * self.qm_mult[c];
@@ -886,8 +903,8 @@ pub fn encode(
     let (mut field, mask1x1, q_median) = if params.adaptive_quant {
         // Without Gaborish, scale the AQ target as libjxl does. Flat
         // graphics avoid the sharpening overshoot and extra edge coefficients.
-        let d_iqf = if gaborish { d } else { d * 0.62 };
-        let maps = aq::initial_quant_field(d_iqf, &xyb, 0.765 / d_iqf, opts.threads);
+        let d_iqf = if gaborish { d } else { d * 0.62 * tk(8) };
+        let maps = aq::initial_quant_field(d_iqf, &xyb, 0.765 * tk(11) / d_iqf, opts.threads);
         (maps.quant_field, maps.mask1x1, 0.39 / d)
     } else {
         let q = 0.79 / d;
@@ -903,7 +920,7 @@ pub fn encode(
     if gaborish {
         xyb::gaborish_inverse(&mut xyb, opts.threads);
     }
-    let qk = if params.adaptive_quant { aq_calibration(d, opts.effort) } else { 1.0 };
+    let qk = if params.adaptive_quant { aq_calibration(d, opts.effort) * tk(7) } else { 1.0 };
     field.iter_mut().for_each(|v| *v *= qk);
     let q_median = q_median * qk;
     let dct = Dct::new();
