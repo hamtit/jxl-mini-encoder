@@ -42,13 +42,7 @@ pub struct Neighbors {
 impl Neighbors {
     /// `cur` is the current row (valid up to x), `prev`/`prev2` the rows above.
     #[inline(always)]
-    pub fn at(
-        x: usize,
-        cur: &[i32],
-        prev: Option<&[i32]>,
-        prev2: Option<&[i32]>,
-        width: usize,
-    ) -> Self {
+    pub fn at(x: usize, cur: &[i32], prev: Option<&[i32]>, prev2: Option<&[i32]>, width: usize) -> Self {
         let (n, w, nw) = match (x, prev) {
             (0, None) => (0, 0, 0),
             (_, None) => (cur[x - 1], cur[x - 1], cur[x - 1]),
@@ -65,15 +59,7 @@ impl Neighbors {
         };
         let nn = prev2.map_or(n, |p| p[x]);
         let ww = if x >= 2 { cur[x - 2] } else { w };
-        Neighbors {
-            n,
-            w,
-            nw,
-            ne,
-            nn,
-            ww,
-            nee,
-        }
+        Neighbors { n, w, nw, ne, nn, ww, nee }
     }
 }
 
@@ -87,15 +73,7 @@ impl Predictor {
     /// Prediction for every predictor except `Weighted` (which needs `wp`).
     #[inline(always)]
     pub fn predict(self, nb: &Neighbors, wp: i64) -> i32 {
-        let Neighbors {
-            n,
-            w,
-            nw,
-            ne,
-            nn,
-            ww,
-            nee,
-        } = *nb;
+        let Neighbors { n, w, nw, ne, nn, ww, nee } = *nb;
         let avg = |a: i32, b: i32| ((i64::from(a) + i64::from(b)) / 2) as i32;
         match self {
             Predictor::Zero => 0,
@@ -205,18 +183,11 @@ impl Weighted {
             w3 + ne3 - n3,
             n3 - (((te_w + te_n + te_ne) * P1) >> 5),
             w3 - (((te_w + te_n + te_nw) * P2) >> 5),
-            n3 - ((te_nw * P3[0]
-                + te_n * P3[1]
-                + te_ne * P3[2]
-                + (nn3 - n3) * P3[3]
-                + (nw3 - w3) * P3[4])
-                >> 5),
+            n3 - ((te_nw * P3[0] + te_n * P3[1] + te_ne * P3[2] + (nn3 - n3) * P3[3] + (nw3 - w3) * P3[4]) >> 5),
         ];
         let mut weight = [0u32; 4];
         for i in 0..4 {
-            let err_sum = self.sub_nw_ww[i]
-                .wrapping_add(self.sub_n_w[i])
-                .wrapping_add(self.sub_ne[i]);
+            let err_sum = self.sub_nw_ww[i].wrapping_add(self.sub_n_w[i]).wrapping_add(self.sub_ne[i]);
             let shift = ((u64::from(err_sum) + 1) >> 5).checked_ilog2().unwrap_or(0);
             weight[i] = 4 + ((WEIGHTS[i] * DIV_LOOKUP[(err_sum >> shift) as usize + 1]) >> shift);
         }
@@ -242,11 +213,7 @@ impl Weighted {
                 max_error = e;
             }
         }
-        WpPrediction {
-            prediction,
-            max_error: max_error as i32,
-            subpred,
-        }
+        WpPrediction { prediction, max_error: max_error as i32, subpred }
     }
 
     #[inline(always)]
@@ -332,24 +299,13 @@ pub fn base_props(
 /// Properties 16.. from the previous channel (k = 0 is the most recent one
 /// with the same size).
 #[inline(always)]
-pub fn prev_channel_props(
-    props: &mut [i32; NUM_PROPS],
-    k: usize,
-    ch: &[i32],
-    width: usize,
-    x: usize,
-    y: usize,
-) {
+pub fn prev_channel_props(props: &mut [i32; NUM_PROPS], k: usize, ch: &[i32], width: usize, x: usize, y: usize) {
     let c = ch[y * width + x];
     let g = match (x, y) {
         (0, 0) => 0,
         (0, _) => ch[(y - 1) * width],
         (_, 0) => ch[x - 1],
-        _ => grad_clamped(
-            ch[(y - 1) * width + x],
-            ch[y * width + x - 1],
-            ch[(y - 1) * width + x - 1],
-        ),
+        _ => grad_clamped(ch[(y - 1) * width + x], ch[y * width + x - 1], ch[(y - 1) * width + x - 1]),
     };
     let base = NUM_BASE_PROPS + 4 * k;
     props[base] = c.wrapping_abs();

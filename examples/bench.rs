@@ -8,14 +8,9 @@ fn synth(w: usize, h: usize, ch: usize) -> Vec<u8> {
             for c in 0..ch {
                 s = s.wrapping_mul(1664525).wrapping_add(1013904223);
                 let n = ((s >> 24) as f32 - 128.0) * 0.08;
-                let base = 128.0
-                    + 70.0 * (fx + c as f32).sin() * (fy * 0.7).cos()
-                    + 30.0 * ((x ^ y) as f32 / 90.0).sin();
-                let a = if c == 3 {
-                    200.0 + 40.0 * fx.sin()
-                } else {
-                    base + n
-                };
+                let base =
+                    128.0 + 70.0 * (fx + c as f32).sin() * (fy * 0.7).cos() + 30.0 * ((x ^ y) as f32 / 90.0).sin();
+                let a = if c == 3 { 200.0 + 40.0 * fx.sin() } else { base + n };
                 v.push(a.clamp(0.0, 255.0) as u8);
             }
         }
@@ -38,27 +33,11 @@ fn main() {
     }
     .unwrap();
     let t0 = Instant::now();
-    let out = jxl_mini_encoder::Encoder::new()
-        .quality(q)
-        .effort(e)
-        .threads(t)
-        .encode(&img)
-        .unwrap();
+    let out = jxl_mini_encoder::Encoder::new().quality(q).effort(e).threads(t).encode(&img).unwrap();
     let dt = t0.elapsed().as_secs_f64();
     let mut hsh = 0xcbf29ce484222325u64;
     for &b in &out {
         hsh = (hsh ^ u64::from(b)).wrapping_mul(0x100000001b3);
     }
-    println!(
-        "{}x{} q{} e{} t{} a{} -> {} B hash={:016x} {:.2}s",
-        w,
-        h,
-        q,
-        e,
-        t,
-        alpha as u8,
-        out.len(),
-        hsh,
-        dt
-    );
+    println!("{}x{} q{} e{} t{} a{} -> {} B hash={:016x} {:.2}s", w, h, q, e, t, alpha as u8, out.len(), hsh, dt);
 }

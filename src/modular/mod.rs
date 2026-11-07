@@ -20,11 +20,7 @@ pub struct Channel {
 
 impl Channel {
     pub fn new(w: usize, h: usize) -> Self {
-        Channel {
-            w,
-            h,
-            data: vec![0; w * h],
-        }
+        Channel { w, h, data: vec![0; w * h] }
     }
 
     #[inline]
@@ -52,54 +48,26 @@ impl Channel {
 #[derive(Clone, Copy, Debug)]
 pub enum Transform {
     /// Reversible colour transform on channels begin_c..begin_c+3.
-    Rct {
-        begin_c: u32,
-        permutation: u32,
-        kind: u32,
-    },
+    Rct { begin_c: u32, permutation: u32, kind: u32 },
     /// Palette of `nb_colors` colours (no delta entries) for `num_c` channels
     /// starting at `begin_c`; the channels become one index channel and a
     /// meta channel holding the palette is put in front.
-    Palette {
-        begin_c: u32,
-        num_c: u32,
-        nb_colors: u32,
-    },
+    Palette { begin_c: u32, num_c: u32, nb_colors: u32 },
 }
 
 impl Transform {
     fn write(&self, w: &mut BitWriter) {
         match *self {
-            Transform::Rct {
-                begin_c,
-                permutation,
-                kind,
-            } => {
+            Transform::Rct { begin_c, permutation, kind } => {
                 w.write(2, 0);
-                w.write_u32(
-                    begin_c,
-                    [Bits(3, 0), Bits(6, 8), Bits(10, 72), Bits(13, 1096)],
-                );
-                w.write_u32(
-                    permutation * 7 + kind,
-                    [Val(6), Bits(2, 0), Bits(4, 2), Bits(6, 10)],
-                );
+                w.write_u32(begin_c, [Bits(3, 0), Bits(6, 8), Bits(10, 72), Bits(13, 1096)]);
+                w.write_u32(permutation * 7 + kind, [Val(6), Bits(2, 0), Bits(4, 2), Bits(6, 10)]);
             }
-            Transform::Palette {
-                begin_c,
-                num_c,
-                nb_colors,
-            } => {
+            Transform::Palette { begin_c, num_c, nb_colors } => {
                 w.write(2, 1);
-                w.write_u32(
-                    begin_c,
-                    [Bits(3, 0), Bits(6, 8), Bits(10, 72), Bits(13, 1096)],
-                );
+                w.write_u32(begin_c, [Bits(3, 0), Bits(6, 8), Bits(10, 72), Bits(13, 1096)]);
                 w.write_u32(num_c, [Val(1), Val(3), Val(4), Bits(13, 1)]);
-                w.write_u32(
-                    nb_colors,
-                    [Bits(8, 0), Bits(10, 256), Bits(12, 1280), Bits(16, 5376)],
-                );
+                w.write_u32(nb_colors, [Bits(8, 0), Bits(10, 256), Bits(12, 1280), Bits(16, 5376)]);
                 w.write_u32(0, [Val(0), Bits(8, 1), Bits(10, 257), Bits(16, 1281)]); // nb_deltas
                 w.write(4, 0); // d_pred (unused without deltas)
             }
@@ -151,10 +119,7 @@ pub fn forward_rct(ch: &mut [Channel], permutation: u32, kind: u32) {
 pub fn write_header(w: &mut BitWriter, use_global_tree: bool, transforms: &[Transform]) {
     w.write_bool(use_global_tree);
     w.write_bool(true); // default weighted-predictor parameters
-    w.write_u32(
-        transforms.len() as u32,
-        [Val(0), Val(1), Bits(4, 2), Bits(8, 18)],
-    );
+    w.write_u32(transforms.len() as u32, [Val(0), Val(1), Bits(4, 2), Bits(8, 18)]);
     for t in transforms {
         t.write(w);
     }
@@ -301,10 +266,7 @@ impl GlobalTree {
     /// channels of each stream are freed as soon as that stream is tokenised.
     pub fn build_owned(streams: Vec<(u32, Vec<Channel>)>, opts: &ModularOptions) -> Self {
         let tree = {
-            let views: Vec<(u32, Vec<&Channel>)> = streams
-                .iter()
-                .map(|(id, c)| (*id, c.iter().collect()))
-                .collect();
+            let views: Vec<(u32, Vec<&Channel>)> = streams.iter().map(|(id, c)| (*id, c.iter().collect())).collect();
             opts.tree(&views)
         };
         let mut tokens: Vec<Vec<Token>> = (0..streams.len()).map(|_| Vec::new()).collect();

@@ -63,17 +63,9 @@ impl<'a> ImageRef<'a> {
             .and_then(|n| n.checked_mul(if alpha { 4 } else { 3 }))
             .ok_or(Error::InvalidDimensions { width, height })?;
         if data.len() != expected {
-            return Err(Error::BufferSize {
-                expected,
-                actual: data.len(),
-            });
+            return Err(Error::BufferSize { expected, actual: data.len() });
         }
-        Ok(ImageRef {
-            width,
-            height,
-            alpha,
-            data,
-        })
+        Ok(ImageRef { width, height, alpha, data })
     }
 
     pub fn width(&self) -> u32 {
@@ -114,12 +106,7 @@ pub struct EncoderOptions {
 
 impl Default for EncoderOptions {
     fn default() -> Self {
-        EncoderOptions {
-            distance: 1.0,
-            effort: 7,
-            threads: 1,
-            noise: 0.0,
-        }
+        EncoderOptions { distance: 1.0, effort: 7, threads: 1, noise: 0.0 }
     }
 }
 
@@ -179,11 +166,7 @@ impl Encoder {
     }
 
     /// Encode an animation to a bare JPEG XL codestream.
-    pub fn encode_animation(
-        &self,
-        frames: &[AnimationFrame],
-        anim: &AnimationOptions,
-    ) -> Result<Vec<u8>, Error> {
+    pub fn encode_animation(&self, frames: &[AnimationFrame], anim: &AnimationOptions) -> Result<Vec<u8>, Error> {
         encode_animation(frames, anim, &self.opts)
     }
 
@@ -214,13 +197,8 @@ pub fn encode(image: &ImageRef, opts: &EncoderOptions) -> Result<Vec<u8>, Error>
     opts.effort = opts.effort.clamp(1, 10);
     opts.threads = opts.threads.max(1);
     let mut w = BitWriter::with_capacity(image.data.len() / 8);
-    let info = ImageInfo {
-        width: image.width,
-        height: image.height,
-        has_alpha: image.alpha,
-        xyb: !lossless,
-        animation: None,
-    };
+    let info =
+        ImageInfo { width: image.width, height: image.height, has_alpha: image.alpha, xyb: !lossless, animation: None };
     write_image_header(&mut w, &info);
     encode_frame(image, &opts, FramePlacement::STILL, None, &mut w);
     Ok(w.finish())
@@ -265,11 +243,7 @@ impl Default for AnimationOptions {
     /// 100 ticks per second, so a GIF delay (in centiseconds) is a duration
     /// as is. Loops forever.
     fn default() -> Self {
-        AnimationOptions {
-            tps_numerator: 100,
-            tps_denominator: 1,
-            num_loops: 0,
-        }
+        AnimationOptions { tps_numerator: 100, tps_denominator: 1, num_loops: 0 }
     }
 }
 
@@ -319,10 +293,7 @@ pub fn encode_animation(
     // Decide the noise-dependent tools once for the whole animation so that
     // frames near the threshold do not flip between settings (visible flicker).
     let noise = (!lossless).then(|| {
-        let mut levels: Vec<u32> = frames
-            .iter()
-            .map(|f| vardct::noise_level(&f.image))
-            .collect();
+        let mut levels: Vec<u32> = frames.iter().map(|f| vardct::noise_level(&f.image)).collect();
         levels.sort_unstable();
         levels[levels.len() / 2]
     });
@@ -373,16 +344,7 @@ pub fn encode_animation(
                 }
             }
         }
-        let part = if whole {
-            *src
-        } else {
-            ImageRef {
-                width: rw,
-                height: rh,
-                alpha: och == 4,
-                data: &buf,
-            }
-        };
+        let part = if whole { *src } else { ImageRef { width: rw, height: rh, alpha: och == 4, data: &buf } };
         encode_frame(&part, &inner_opts, placement, noise, &mut fw);
         fw.finish()
     });
@@ -409,29 +371,17 @@ pub fn animation_prefers_lossless(frames: &[AnimationFrame]) -> bool {
     }
     // Colour counts on a few frames are enough to tell a palette animation.
     let step = (frames.len() / 8).max(1);
-    if !frames
-        .iter()
-        .step_by(step)
-        .all(|f| lossless::Palette::of(&f.image).is_some())
-    {
+    if !frames.iter().step_by(step).all(|f| lossless::Palette::of(&f.image).is_some()) {
         return false;
     }
-    let (w, h, ch) = (
-        first.image.width as usize,
-        first.image.height as usize,
-        first.image.channels(),
-    );
+    let (w, h, ch) = (first.image.width as usize, first.image.height as usize, first.image.channels());
     let mut changed = 0usize;
     for pair in frames.windows(2) {
         let (a, b) = (pair[0].image.data, pair[1].image.data);
         if a.len() != b.len() || a.len() != w * h * ch {
             return false;
         }
-        changed += a
-            .chunks_exact(ch)
-            .zip(b.chunks_exact(ch))
-            .filter(|(p, q)| p != q)
-            .count();
+        changed += a.chunks_exact(ch).zip(b.chunks_exact(ch)).filter(|(p, q)| p != q).count();
     }
     changed * 10 < w * h * (frames.len() - 1)
 }
@@ -461,22 +411,13 @@ struct PlannedFrame {
 /// same place, so small changes cannot add up. A frame without any change
 /// only extends the display time of the previous one.
 fn plan_frames(frames: &[AnimationFrame], tolerance: u8) -> Vec<PlannedFrame> {
-    let full = |index: usize| PlannedFrame {
-        index,
-        duration: frames[index].duration,
-        rect: None,
-        blend: false,
-    };
+    let full = |index: usize| PlannedFrame { index, duration: frames[index].duration, rect: None, blend: false };
     // Zero-duration frames are layers of the next frame; keep them as given.
     if frames.iter().any(|f| f.duration == 0) || std::env::var_os("MINI_NO_INTERFRAME").is_some() {
         return (0..frames.len()).map(full).collect();
     }
     let first = &frames[0].image;
-    let (w, h, ch) = (
-        first.width as usize,
-        first.height as usize,
-        first.channels(),
-    );
+    let (w, h, ch) = (first.width as usize, first.height as usize, first.channels());
     let mut canvas = first.data.to_vec();
     let mut plan = vec![full(0)];
     for (index, f) in frames.iter().enumerate().skip(1) {
@@ -526,15 +467,9 @@ fn plan_frames(frames: &[AnimationFrame], tolerance: u8) -> Vec<PlannedFrame> {
             let (bw, bh) = (w.min(8), h.min(8));
             let rect = (bw < w || bh < h).then_some((0, 0, bw as u32, bh as u32));
             for y in 0..bh {
-                canvas[y * w * ch..(y * w + bw) * ch]
-                    .copy_from_slice(&data[y * w * ch..(y * w + bw) * ch]);
+                canvas[y * w * ch..(y * w + bw) * ch].copy_from_slice(&data[y * w * ch..(y * w + bw) * ch]);
             }
-            plan.push(PlannedFrame {
-                index,
-                duration: f.duration,
-                rect,
-                blend: false,
-            });
+            plan.push(PlannedFrame { index, duration: f.duration, rect, blend: false });
             continue;
         }
         let (x0, y0) = (x0 & !7, y0 & !7);
@@ -543,10 +478,7 @@ fn plan_frames(frames: &[AnimationFrame], tolerance: u8) -> Vec<PlannedFrame> {
         // Lossless frames in which most of the rectangle is unchanged are
         // blended, leaving the unchanged pixels transparent. That is cheap
         // however large the rectangle is.
-        let blend = tolerance == 0
-            && opaque
-            && count * 10 < area * 8
-            && std::env::var_os("MINI_NO_BLEND").is_none();
+        let blend = tolerance == 0 && opaque && count * 10 < area * 8 && std::env::var_os("MINI_NO_BLEND").is_none();
         let rect = blend || area * 10 < w * h * 9;
         if rect {
             for y in y0..y1 {

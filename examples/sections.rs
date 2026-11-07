@@ -2,9 +2,7 @@
 fn main() {
     for path in std::env::args().skip(1) {
         let bytes = std::fs::read(&path).unwrap();
-        let image = jxl_oxide::JxlImage::builder()
-            .read(std::io::Cursor::new(&bytes))
-            .unwrap();
+        let image = jxl_oxide::JxlImage::builder().read(std::io::Cursor::new(&bytes)).unwrap();
         let frame = image.frame(0).unwrap();
         let toc = frame.toc();
         let (mut lfg, mut lfgr, mut hfg, mut pg, mut all) = (0u64, 0u64, 0u64, 0u64, 0u64);

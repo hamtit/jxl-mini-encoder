@@ -12,11 +12,7 @@ fn table(n: usize) -> Vec<f32> {
     for k in 0..n {
         for i in 0..n {
             let c = (std::f64::consts::PI * k as f64 * (2 * i + 1) as f64 / (2 * n) as f64).cos();
-            let s = if k == 0 {
-                1.0
-            } else {
-                std::f64::consts::SQRT_2
-            };
+            let s = if k == 0 { 1.0 } else { std::f64::consts::SQRT_2 };
             t[k * n + i] = (c * s / n as f64) as f32;
         }
     }
@@ -144,12 +140,7 @@ fn vmul(a: &V8, k: f32) -> V8 {
 #[inline(always)]
 fn dct8_rows(x: &mut [V8; 8], ic8: &[f32], ic4: &[f32]) {
     const S: f32 = std::f32::consts::FRAC_1_SQRT_2;
-    let e = [
-        vadd(&x[0], &x[7]),
-        vadd(&x[1], &x[6]),
-        vadd(&x[2], &x[5]),
-        vadd(&x[3], &x[4]),
-    ];
+    let e = [vadd(&x[0], &x[7]), vadd(&x[1], &x[6]), vadd(&x[2], &x[5]), vadd(&x[3], &x[4])];
     let o = [
         vsub_mul(&x[0], &x[7], ic8[0]),
         vsub_mul(&x[1], &x[6], ic8[1]),
@@ -158,10 +149,7 @@ fn dct8_rows(x: &mut [V8; 8], ic8: &[f32], ic4: &[f32]) {
     ];
     let dct4 = |t: &[V8; 4]| -> [V8; 4] {
         let e = [vadd(&t[0], &t[3]), vadd(&t[1], &t[2])];
-        let o = [
-            vsub_mul(&t[0], &t[3], ic4[0]),
-            vsub_mul(&t[1], &t[2], ic4[1]),
-        ];
+        let o = [vsub_mul(&t[0], &t[3], ic4[0]), vsub_mul(&t[1], &t[2], ic4[1])];
         let ee = [vadd(&e[0], &e[1]), vsub_mul(&e[0], &e[1], S)];
         let oo = [vadd(&o[0], &o[1]), vsub_mul(&o[0], &o[1], S)];
         [ee[0], vadd(&oo[0], &oo[1]), ee[1], oo[1]]
@@ -184,14 +172,8 @@ fn idct8_rows(x: &mut [V8; 8], ic8: &[f32], ic4: &[f32]) {
     let idct4 = |t: &[V8; 4]| -> [V8; 4] {
         let e = [t[0], t[2]];
         let o = [t[1], vadd(&t[3], &t[1])];
-        let e2 = [
-            vadd(&e[0], &vmul(&e[1], S)),
-            std::array::from_fn(|j| e[0][j] - e[1][j] * S),
-        ];
-        let o2 = [
-            vadd(&o[0], &vmul(&o[1], S)),
-            std::array::from_fn(|j| o[0][j] - o[1][j] * S),
-        ];
+        let e2 = [vadd(&e[0], &vmul(&e[1], S)), std::array::from_fn(|j| e[0][j] - e[1][j] * S)];
+        let o2 = [vadd(&o[0], &vmul(&o[1], S)), std::array::from_fn(|j| o[0][j] - o[1][j] * S)];
         let f = |i: usize| -> (V8, V8) {
             let v = vmul(&o2[i], ic4[i]);
             (vadd(&e2[i], &v), std::array::from_fn(|j| e2[i][j] - v[j]))
@@ -201,12 +183,7 @@ fn idct8_rows(x: &mut [V8; 8], ic8: &[f32], ic4: &[f32]) {
         [a0, a1, a2, a3]
     };
     let e = [x[0], x[2], x[4], x[6]];
-    let o = [
-        x[1],
-        vadd(&x[3], &x[1]),
-        vadd(&x[5], &x[3]),
-        vadd(&x[7], &x[5]),
-    ];
+    let o = [x[1], vadd(&x[3], &x[1]), vadd(&x[5], &x[3]), vadd(&x[7], &x[5])];
     let (e, o) = (idct4(&e), idct4(&o));
     for i in 0..4 {
         let v = vmul(&o[i], ic8[i]);
@@ -393,10 +370,7 @@ fn forward_wh<const W: usize, const H: usize, const N: usize>(
     transpose_c::<W, H>(&a, &mut out[..N]);
     dct_rows_n::<H>(W, &mut out[..N], &mut tmp, inv_cos);
     transpose_c::<H, W>(&out[..N], &mut a);
-    let (sw, sh) = (
-        std::f32::consts::SQRT_2 / W as f32,
-        std::f32::consts::SQRT_2 / H as f32,
-    );
+    let (sw, sh) = (std::f32::consts::SQRT_2 / W as f32, std::f32::consts::SQRT_2 / H as f32);
     let (dw, dh) = (1.0 / W as f32, 1.0 / H as f32);
     for v in 0..H {
         let fv = if v == 0 { dh } else { sh };
@@ -409,11 +383,7 @@ fn forward_wh<const W: usize, const H: usize, const N: usize>(
 
 /// `inverse_sized` for a `W` x `H` block.
 #[inline(always)]
-fn inverse_wh<const W: usize, const H: usize, const N: usize>(
-    inv_cos: &[Vec<f32>],
-    coeffs: &[f32],
-    out: &mut [f32],
-) {
+fn inverse_wh<const W: usize, const H: usize, const N: usize>(inv_cos: &[Vec<f32>], coeffs: &[f32], out: &mut [f32]) {
     let mut a = [0f32; N];
     let mut tmp = [0f32; N];
     let s = std::f32::consts::SQRT_2;
@@ -471,17 +441,7 @@ macro_rules! sized_kernels {
     };
 }
 
-sized_kernels!(
-    (16, 16),
-    (32, 32),
-    (64, 64),
-    (8, 16),
-    (16, 8),
-    (32, 16),
-    (16, 32),
-    (64, 32),
-    (32, 64)
-);
+sized_kernels!((16, 16), (32, 32), (64, 64), (8, 16), (16, 8), (32, 16), (16, 32), (64, 32), (32, 64));
 
 pub struct Dct {
     /// inv_cos[log2 n][i] = 1 / (2 cos(pi (2i + 1) / 2n))
@@ -499,10 +459,7 @@ impl Dct {
             .map(|l| {
                 let n = 1usize << l;
                 (0..n / 2)
-                    .map(|i| {
-                        (0.5 / (std::f64::consts::PI * (2 * i + 1) as f64 / (2 * n) as f64).cos())
-                            as f32
-                    })
+                    .map(|i| (0.5 / (std::f64::consts::PI * (2 * i + 1) as f64 / (2 * n) as f64).cos()) as f32)
                     .collect()
             })
             .collect();
@@ -613,14 +570,7 @@ impl Dct {
         }
     }
 
-    fn forward_sized<const N: usize>(
-        &self,
-        src: &[f32],
-        stride: usize,
-        w: usize,
-        h: usize,
-        out: &mut [f32],
-    ) {
+    fn forward_sized<const N: usize>(&self, src: &[f32], stride: usize, w: usize, h: usize, out: &mut [f32]) {
         let mut a = [0f32; N];
         let mut tmp = [0f32; N];
         let n = w * h;
@@ -631,10 +581,7 @@ impl Dct {
         transpose(&a[..n], w, h, &mut out[..n]);
         dct_rows(&mut out[..n], w, h, &mut tmp, &self.inv_cos);
         transpose(&out[..n], h, w, &mut a[..n]);
-        let (sw, sh) = (
-            std::f32::consts::SQRT_2 / w as f32,
-            std::f32::consts::SQRT_2 / h as f32,
-        );
+        let (sw, sh) = (std::f32::consts::SQRT_2 / w as f32, std::f32::consts::SQRT_2 / h as f32);
         let (dw, dh) = (1.0 / w as f32, 1.0 / h as f32);
         for v in 0..h {
             let fv = if v == 0 { dh } else { sh };
@@ -718,9 +665,7 @@ mod tests {
     #[test]
     fn unrolled_8x8_matches_generic() {
         let d = Dct::new();
-        let src: Vec<f32> = (0..64)
-            .map(|i| ((i * 37 % 101) as f32) / 50.0 - 1.0)
-            .collect();
+        let src: Vec<f32> = (0..64).map(|i| ((i * 37 % 101) as f32) / 50.0 - 1.0).collect();
         let (mut a, mut b) = (vec![0f32; 64], vec![0f32; 64]);
         d.forward8(&src, 8, &mut a);
         d.forward_sized::<64>(&src, 8, 8, 8, &mut b);
@@ -734,20 +679,8 @@ mod tests {
     #[test]
     fn specialised_matches_generic() {
         let d = Dct::new();
-        for (w, h) in [
-            (16, 16),
-            (32, 32),
-            (64, 64),
-            (8, 16),
-            (16, 8),
-            (32, 16),
-            (16, 32),
-            (64, 32),
-            (32, 64),
-        ] {
-            let src: Vec<f32> = (0..w * h)
-                .map(|i| ((i * 37 % 101) as f32) / 50.0 - 1.0)
-                .collect();
+        for (w, h) in [(16, 16), (32, 32), (64, 64), (8, 16), (16, 8), (32, 16), (16, 32), (64, 32), (32, 64)] {
+            let src: Vec<f32> = (0..w * h).map(|i| ((i * 37 % 101) as f32) / 50.0 - 1.0).collect();
             let (mut a, mut b) = (vec![0f32; 4096], vec![0f32; 4096]);
             d.forward(&src, w, w, h, &mut a);
             d.forward_sized::<4096>(&src, w, w, h, &mut b);
@@ -764,9 +697,7 @@ mod tests {
         let d = Dct::new();
         let sizes = [1, 2, 4, 8, 16, 32, 64];
         for (w, h) in sizes.into_iter().flat_map(|w| sizes.map(|h| (w, h))) {
-            let src: Vec<f32> = (0..w * h)
-                .map(|i| ((i * 37 % 101) as f32) / 50.0 - 1.0)
-                .collect();
+            let src: Vec<f32> = (0..w * h).map(|i| ((i * 37 % 101) as f32) / 50.0 - 1.0).collect();
             let mut c = vec![0f32; w * h];
             let mut back = vec![0f32; w * h];
             d.forward(&src, w, w, h, &mut c);

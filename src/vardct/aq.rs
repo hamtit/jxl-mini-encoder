@@ -78,22 +78,12 @@ pub fn initial_quant_field(distance: f32, xyb: &Xyb, scale: f32, threads: usize)
     let (qw, qh) = (w / 4, h / 4);
     let mut pre = vec![0f32; qw * qh];
     let mut mask1x1 = vec![0f32; w * h];
-    let tasks: Vec<_> = mask1x1
-        .chunks_mut(w * 8)
-        .zip(pre.chunks_mut(qw * 2))
-        .enumerate()
-        .collect();
+    let tasks: Vec<_> = mask1x1.chunks_mut(w * 8).zip(pre.chunks_mut(qw * 2)).enumerate().collect();
     let avx2 = has_avx2();
-    par_tasks(tasks, threads, |(band, (mask, pre))| {
-        mask_band(avx2, py, w, h, qw, band, mask, pre)
-    });
+    par_tasks(tasks, threads, |(band, (mask, pre))| mask_band(avx2, py, w, h, qw, band, mask, pre));
 
     // Fuzzy erosion to block resolution.
-    let mul = if distance < 2.0 {
-        (2.0 - distance) * 0.5
-    } else {
-        0.0
-    };
+    let mul = if distance < 2.0 { (2.0 - distance) * 0.5 } else { 0.0 };
     let base = [0.125f32, 0.1, 0.09, 0.06];
     let add = [0.0f32, -0.1, -0.09, -0.06];
     let mut k = [0f32; 4];
@@ -105,55 +95,42 @@ pub fn initial_quant_field(distance: f32, xyb: &Xyb, scale: f32, threads: usize)
         *v *= 0.299_597_06 / norm;
     }
     let mut aq = vec![0f32; bw * bh];
-    par_tasks(
-        aq.chunks_mut(bw).enumerate().collect(),
-        threads,
-        |(by, row)| {
-            for fy in 2 * by..2 * by + 2 {
-                let ym = fy.saturating_sub(1);
-                let yp = (fy + 1).min(qh - 1);
-                for fx in 0..qw {
-                    let xm = fx.saturating_sub(1);
-                    let xp = (fx + 1).min(qw - 1);
-                    let at = |x: usize, y: usize| pre[y * qw + x];
-                    let m = min4([
-                        at(fx, fy),
-                        at(xm, fy),
-                        at(xp, fy),
-                        at(xm, ym),
-                        at(fx, ym),
-                        at(xp, ym),
-                        at(xm, yp),
-                        at(fx, yp),
-                        at(xp, yp),
-                    ]);
-                    row[fx / 2] += k[0] * m[0] + k[1] * m[1] + k[2] * m[2] + k[3] * m[3];
-                }
+    par_tasks(aq.chunks_mut(bw).enumerate().collect(), threads, |(by, row)| {
+        for fy in 2 * by..2 * by + 2 {
+            let ym = fy.saturating_sub(1);
+            let yp = (fy + 1).min(qh - 1);
+            for fx in 0..qw {
+                let xm = fx.saturating_sub(1);
+                let xp = (fx + 1).min(qw - 1);
+                let at = |x: usize, y: usize| pre[y * qw + x];
+                let m = min4([
+                    at(fx, fy),
+                    at(xm, fy),
+                    at(xp, fy),
+                    at(xm, ym),
+                    at(fx, ym),
+                    at(xp, ym),
+                    at(xm, yp),
+                    at(fx, yp),
+                    at(xp, yp),
+                ]);
+                row[fx / 2] += k[0] * m[0] + k[1] * m[1] + k[2] * m[2] + k[3] * m[3];
             }
-        },
-    );
+        }
+    });
 
     drop(pre);
 
     // Per-block modulations.
-    let dampen = if distance >= 2.0 {
-        (1.0 - (distance - 2.0) / 12.0).max(0.0)
-    } else {
-        1.0
-    };
+    let dampen = if distance >= 2.0 { (1.0 - (distance - 2.0) / 12.0).max(0.0) } else { 1.0 };
     let mulv = scale * dampen;
     let addv = (1.0 - dampen) * 0.48 * scale;
     let (px, pb) = (&xyb.planes[0], &xyb.planes[2]);
-    par_tasks(
-        aq.chunks_mut(bw).enumerate().collect(),
-        threads,
-        |(by, row)| modulate_row(avx2, [px, py, pb], w, by, mulv, addv, row),
-    );
+    par_tasks(aq.chunks_mut(bw).enumerate().collect(), threads, |(by, row)| {
+        modulate_row(avx2, [px, py, pb], w, by, mulv, addv, row)
+    });
 
-    AqMaps {
-        quant_field: aq,
-        mask1x1: blur_mask1x1(mask1x1, w, h, threads),
-    }
+    AqMaps { quant_field: aq, mask1x1: blur_mask1x1(mask1x1, w, h, threads) }
 }
 
 fn has_avx2() -> bool {
@@ -183,16 +160,7 @@ fn fast_ln1p(x: f32) -> f32 {
     e as f32 * std::f32::consts::LN_2 + 2.0 * s * p
 }
 
-fn mask_band(
-    avx2: bool,
-    py: &[f32],
-    w: usize,
-    h: usize,
-    qw: usize,
-    band: usize,
-    mask: &mut [f32],
-    pre: &mut [f32],
-) {
+fn mask_band(avx2: bool, py: &[f32], w: usize, h: usize, qw: usize, band: usize, mask: &mut [f32], pre: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     if avx2 {
         // SAFETY: AVX2 support was detected at runtime.
@@ -204,30 +172,14 @@ fn mask_band(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn mask_band_avx2(
-    py: &[f32],
-    w: usize,
-    h: usize,
-    qw: usize,
-    band: usize,
-    mask: &mut [f32],
-    pre: &mut [f32],
-) {
+unsafe fn mask_band_avx2(py: &[f32], w: usize, h: usize, qw: usize, band: usize, mask: &mut [f32], pre: &mut [f32]) {
     mask_band_impl(py, w, h, qw, band, mask, pre)
 }
 
 /// Per-pixel masking of one band of eight rows, and its 4x4 downsampled
 /// pre-erosion sums.
 #[inline(always)]
-fn mask_band_impl(
-    py: &[f32],
-    w: usize,
-    h: usize,
-    qw: usize,
-    band: usize,
-    mask: &mut [f32],
-    pre: &mut [f32],
-) {
+fn mask_band_impl(py: &[f32], w: usize, h: usize, qw: usize, band: usize, mask: &mut [f32], pre: &mut [f32]) {
     const MATCH_GAMMA_OFFSET: f32 = 0.019;
     const LIMIT: f32 = 0.2;
     let mut diff = vec![0f32; w];
@@ -245,10 +197,7 @@ fn mask_band_impl(
             let base = 0.25 * (row2[x] + row1[x] + row[x1] + row[x2]);
             let gammac = ratio_of_derivatives(row[x] + MATCH_GAMMA_OFFSET, false);
             let d = gammac * (row[x] - base);
-            (
-                1.0 / (fast_ln1p(d.abs()) + 0.01),
-                masking_sqrt((d * d).min(LIMIT)),
-            )
+            (1.0 / (fast_ln1p(d.abs()) + 0.01), masking_sqrt((d * d).min(LIMIT)))
         };
         // Edge columns clamp their neighbours; the interior is a plain
         // vector loop.
@@ -275,15 +224,7 @@ fn mask_band_impl(
     }
 }
 
-fn modulate_row(
-    avx2: bool,
-    planes: [&[f32]; 3],
-    w: usize,
-    by: usize,
-    mulv: f32,
-    addv: f32,
-    row: &mut [f32],
-) {
+fn modulate_row(avx2: bool, planes: [&[f32]; 3], w: usize, by: usize, mulv: f32, addv: f32, row: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     if avx2 {
         // SAFETY: AVX2 support was detected at runtime.
@@ -295,26 +236,12 @@ fn modulate_row(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn modulate_row_avx2(
-    planes: [&[f32]; 3],
-    w: usize,
-    by: usize,
-    mulv: f32,
-    addv: f32,
-    row: &mut [f32],
-) {
+unsafe fn modulate_row_avx2(planes: [&[f32]; 3], w: usize, by: usize, mulv: f32, addv: f32, row: &mut [f32]) {
     modulate_row_impl(planes, w, by, mulv, addv, row)
 }
 
 #[inline(always)]
-fn modulate_row_impl(
-    [px, py, pb]: [&[f32]; 3],
-    w: usize,
-    by: usize,
-    mulv: f32,
-    addv: f32,
-    row: &mut [f32],
-) {
+fn modulate_row_impl([px, py, pb]: [&[f32]; 3], w: usize, by: usize, mulv: f32, addv: f32, row: &mut [f32]) {
     for bx in 0..row.len() {
         let (x0, y0) = (bx * 8, by * 8);
         let mut v = compute_mask(row[bx]);
@@ -368,13 +295,7 @@ fn blur_mask1x1(m: Vec<f32>, w: usize, h: usize, threads: usize) -> Vec<f32> {
     const K: [f32; 5] = [0.364_911_25, 0.05, 0.168_888_8, 0.221_069_18, 0.306_563_5];
     let sum = 1.0 + 4.0 * (K[0] + K[1] + K[2] + K[4] + 2.0 * K[3]);
     let n = 1.0 / sum;
-    symmetric5(
-        m,
-        w,
-        h,
-        [n, n * K[0], n * K[2], n * K[1], n * K[4], n * K[3]],
-        threads,
-    )
+    symmetric5(m, w, h, [n, n * K[0], n * K[2], n * K[1], n * K[4], n * K[3]], threads)
 }
 
 /// 5x5 symmetric convolution with mirrored borders. Weights: centre, r
@@ -409,21 +330,14 @@ fn symmetric5(mut src: Vec<f32>, w: usize, h: usize, k: [f32; 6], threads: usize
         .step_by(band_rows)
         .map(|start| {
             let end = (start + band_rows).min(h);
-            [
-                start as isize - 2,
-                start as isize - 1,
-                end as isize,
-                end as isize + 1,
-            ]
-            .map(|y| {
+            [start as isize - 2, start as isize - 1, end as isize, end as isize + 1].map(|y| {
                 let y = mirror(y, h);
                 src[y * w..(y + 1) * w].to_vec()
             })
         })
         .collect();
-    let columns: Vec<[usize; 5]> = (0..w)
-        .map(|x| std::array::from_fn(|i| mirror(x as isize + i as isize - 2, w)))
-        .collect();
+    let columns: Vec<[usize; 5]> =
+        (0..w).map(|x| std::array::from_fn(|i| mirror(x as isize + i as isize - 2, w))).collect();
     par_tasks(
         src.chunks_mut(w * band_rows).zip(halos).collect(),
         threads,
@@ -450,14 +364,7 @@ fn symmetric5(mut src: Vec<f32>, w: usize, h: usize, k: [f32; 6], threads: usize
                         + rr * (p(0, 2) + p(4, 2) + p(2, 0) + p(2, 4))
                         + d * (p(1, 1) + p(1, 3) + p(3, 1) + p(3, 3))
                         + dd * (p(0, 0) + p(0, 4) + p(4, 0) + p(4, 4))
-                        + l * (p(0, 1)
-                            + p(0, 3)
-                            + p(4, 1)
-                            + p(4, 3)
-                            + p(1, 0)
-                            + p(3, 0)
-                            + p(1, 4)
-                            + p(3, 4));
+                        + l * (p(0, 1) + p(0, 3) + p(4, 1) + p(4, 3) + p(1, 0) + p(3, 0) + p(1, 4) + p(3, 4));
                 }
                 if y + 1 < rows {
                     let next = y + 3;
@@ -476,13 +383,7 @@ fn symmetric5(mut src: Vec<f32>, w: usize, h: usize, k: [f32; 6], threads: usize
     src
 }
 
-fn symmetric5_out_of_place(
-    src: &[f32],
-    w: usize,
-    h: usize,
-    k: [f32; 6],
-    threads: usize,
-) -> Vec<f32> {
+fn symmetric5_out_of_place(src: &[f32], w: usize, h: usize, k: [f32; 6], threads: usize) -> Vec<f32> {
     let [c, r, rr, d, dd, l] = k;
     let mirror = |v: isize, n: usize| -> usize {
         let n = n as isize;
@@ -498,35 +399,22 @@ fn symmetric5_out_of_place(
         }
     };
     let mut out = vec![0f32; w * h];
-    par_tasks(
-        out.chunks_mut(w * 8).enumerate().collect(),
-        threads,
-        |(band, chunk)| {
-            for (ry, orow) in chunk.chunks_mut(w).enumerate() {
-                let y = band * 8 + ry;
-                let rows: [usize; 5] =
-                    std::array::from_fn(|i| mirror(y as isize + i as isize - 2, h) * w);
-                for x in 0..w {
-                    let cols: [usize; 5] =
-                        std::array::from_fn(|i| mirror(x as isize + i as isize - 2, w));
-                    let p = |dy: usize, dx: usize| src[rows[dy] + cols[dx]];
-                    orow[x] = c * p(2, 2)
-                        + r * (p(1, 2) + p(3, 2) + p(2, 1) + p(2, 3))
-                        + rr * (p(0, 2) + p(4, 2) + p(2, 0) + p(2, 4))
-                        + d * (p(1, 1) + p(1, 3) + p(3, 1) + p(3, 3))
-                        + dd * (p(0, 0) + p(0, 4) + p(4, 0) + p(4, 4))
-                        + l * (p(0, 1)
-                            + p(0, 3)
-                            + p(4, 1)
-                            + p(4, 3)
-                            + p(1, 0)
-                            + p(3, 0)
-                            + p(1, 4)
-                            + p(3, 4));
-                }
+    par_tasks(out.chunks_mut(w * 8).enumerate().collect(), threads, |(band, chunk)| {
+        for (ry, orow) in chunk.chunks_mut(w).enumerate() {
+            let y = band * 8 + ry;
+            let rows: [usize; 5] = std::array::from_fn(|i| mirror(y as isize + i as isize - 2, h) * w);
+            for x in 0..w {
+                let cols: [usize; 5] = std::array::from_fn(|i| mirror(x as isize + i as isize - 2, w));
+                let p = |dy: usize, dx: usize| src[rows[dy] + cols[dx]];
+                orow[x] = c * p(2, 2)
+                    + r * (p(1, 2) + p(3, 2) + p(2, 1) + p(2, 3))
+                    + rr * (p(0, 2) + p(4, 2) + p(2, 0) + p(2, 4))
+                    + d * (p(1, 1) + p(1, 3) + p(3, 1) + p(3, 3))
+                    + dd * (p(0, 0) + p(0, 4) + p(4, 0) + p(4, 4))
+                    + l * (p(0, 1) + p(0, 3) + p(4, 1) + p(4, 3) + p(1, 0) + p(3, 0) + p(1, 4) + p(3, 4));
             }
-        },
-    );
+        }
+    });
     out
 }
 
@@ -539,10 +427,7 @@ mod tests {
         let mut x = 0f32;
         while x < 40.0 {
             let (a, b) = (fast_ln1p(x), x.ln_1p());
-            assert!(
-                (a - b).abs() <= 2e-6 * b.max(1e-2) + 1e-6,
-                "x={x}: {a} vs {b}"
-            );
+            assert!((a - b).abs() <= 2e-6 * b.max(1e-2) + 1e-6, "x={x}: {a} vs {b}");
             x += 0.0137;
         }
         assert_eq!(fast_ln1p(0.0), 0.0);
@@ -550,31 +435,13 @@ mod tests {
 
     #[test]
     fn in_place_blur_matches_reference() {
-        for (w, h) in [
-            (1, 1),
-            (1, 19),
-            (193, 8),
-            (2, 2),
-            (3, 7),
-            (8, 8),
-            (17, 25),
-            (31, 33),
-            (31, 67),
-        ] {
-            let src: Vec<_> = (0..w * h)
-                .map(|i| ((i * 1237 % 65521) as f32 - 17000.0) / 257.0)
-                .collect();
+        for (w, h) in [(1, 1), (1, 19), (193, 8), (2, 2), (3, 7), (8, 8), (17, 25), (31, 33), (31, 67)] {
+            let src: Vec<_> = (0..w * h).map(|i| ((i * 1237 % 65521) as f32 - 17000.0) / 257.0).collect();
             let k = [0.13, 0.07, 0.035, 0.02, 0.01, 0.005];
             let expected = symmetric5_out_of_place(&src, w, h, k, 1);
             for threads in [1, 2, 3, 8, 100] {
                 let actual = symmetric5(src.clone(), w, h, k, threads);
-                assert!(
-                    actual
-                        .iter()
-                        .zip(&expected)
-                        .all(|(a, b)| a.to_bits() == b.to_bits()),
-                    "{w}x{h} t{threads}"
-                );
+                assert!(actual.iter().zip(&expected).all(|(a, b)| a.to_bits() == b.to_bits()), "{w}x{h} t{threads}");
             }
         }
     }

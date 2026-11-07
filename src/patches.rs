@@ -4,9 +4,7 @@
 
 use crate::bit_writer::{BitWriter, round_to_f16};
 use crate::entropy::{CodeOptions, Token, pack_signed, write_stream};
-use crate::headers::{
-    Encoding, FrameInfo, FramePlacement, GROUP_DIM, Layout, write_frame_header, write_sections,
-};
+use crate::headers::{Encoding, FrameInfo, FramePlacement, GROUP_DIM, Layout, write_frame_header, write_sections};
 use crate::modular::{Channel, GlobalTree, ModularOptions, write_header, write_standalone};
 use crate::parallel::par_map;
 use crate::vardct::xyb::Xyb;
@@ -25,11 +23,7 @@ const WEIGHTS: [f32; 3] = [30.0, 3.0, 1.0];
 /// The reference frame's modular integers are multiples of these steps, which
 /// are coarser at lower quality, as in libjxl (X, Y, B).
 fn dc_quant(distance: f32) -> [f32; 3] {
-    let inv = [
-        65536.0 / (1.0 + 23.0 * distance),
-        4096.0 / (1.0 + 14.0 * distance),
-        4096.0 / (1.0 + 14.0 * distance),
-    ];
+    let inv = [65536.0 / (1.0 + 23.0 * distance), 4096.0 / (1.0 + 14.0 * distance), 4096.0 / (1.0 + 14.0 * distance)];
     // The header holds 128 / inv as a half float.
     inv.map(|i| round_to_f16(128.0 / i) / 128.0)
 }
@@ -169,30 +163,16 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
             }
             for y in py * SIDE..(py + 1) * SIDE {
                 for x in qx * SIDE..(qx + 1) * SIDE {
-                    let open = (y.saturating_sub(1)..(y + 2).min(h)).any(|ny| {
-                        (x.saturating_sub(1)..(x + 2).min(w)).any(|nx| !is_bg[ny * w + nx])
-                    });
+                    let open = (y.saturating_sub(1)..(y + 2).min(h))
+                        .any(|ny| (x.saturating_sub(1)..(x + 2).min(w)).any(|nx| !is_bg[ny * w + nx]));
                     if open {
-                        queue.push_back(Item {
-                            x: x as u32,
-                            y: y as u32,
-                            sx: x as u32,
-                            sy: y as u32,
-                            color: px(x, y),
-                        });
+                        queue.push_back(Item { x: x as u32, y: y as u32, sx: x as u32, sy: y as u32, color: px(x, y) });
                     }
                 }
             }
         }
     }
-    while let Some(Item {
-        x: cx,
-        y: cy,
-        sx,
-        sy,
-        color,
-    }) = queue.pop_front()
-    {
+    while let Some(Item { x: cx, y: cy, sx, sy, color }) = queue.pop_front() {
         let (cx, cy) = (cx as usize, cy as usize);
         bg_src[cy * w + cx] = sy * w as u32 + sx;
         let (x0, x1) = (cx.saturating_sub(1), (cx + 2).min(w));
@@ -206,13 +186,7 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
                     continue;
                 }
                 if similar(color, px(nx, ny), 0.8) {
-                    queue.push_back(Item {
-                        x: nx as u32,
-                        y: ny as u32,
-                        sx,
-                        sy,
-                        color,
-                    });
+                    queue.push_back(Item { x: nx as u32, y: ny as u32, sx, sy, color });
                     is_bg[row + nx] = true;
                 }
             }
@@ -329,12 +303,10 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
                 continue;
             }
             let rc = background(reference.0, reference.1);
-            let has_similar = (min_y.saturating_sub(SIMILAR_RADIUS)
-                ..(max_y + SIMILAR_RADIUS + 1).min(h))
-                .any(|iy| {
-                    (min_x.saturating_sub(SIMILAR_RADIUS)..(max_x + SIMILAR_RADIUS + 1).min(w))
-                        .any(|ix| similar(rc, px(ix, iy), 0.03))
-                });
+            let has_similar = (min_y.saturating_sub(SIMILAR_RADIUS)..(max_y + SIMILAR_RADIUS + 1).min(h)).any(|iy| {
+                (min_x.saturating_sub(SIMILAR_RADIUS)..(max_x + SIMILAR_RADIUS + 1).min(w))
+                    .any(|ix| similar(rc, px(ix, iy), 0.03))
+            });
             if !has_similar {
                 continue;
             }
@@ -376,14 +348,7 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
     let mut patches: Vec<Patch> = found
         .into_iter()
         .filter(|(_, _, pos)| pos.len() >= MIN_OCCURRENCES)
-        .map(|((pxs, pys, _), pixels, positions)| Patch {
-            w: pxs,
-            h: pys,
-            rx: 0,
-            ry: 0,
-            pixels,
-            positions,
-        })
+        .map(|((pxs, pys, _), pixels, positions)| Patch { w: pxs, h: pys, rx: 0, ry: 0, pixels, positions })
         .collect();
     if patches.iter().map(|p| p.w * p.h).max().unwrap_or(0) < MIN_MAX_PATCH_PIXELS {
         return None;
@@ -395,10 +360,7 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
     let max_y = patches.iter().map(|p| p.h).max()?;
     let total: usize = patches.iter().map(|p| p.w * p.h).sum();
     let root = (total as f32).sqrt();
-    let (mut rw, mut rh) = (
-        (max_x as f32).max(root) as usize,
-        (max_y as f32).max(root) as usize,
-    );
+    let (mut rw, mut rh) = ((max_x as f32).max(root) as usize, (max_y as f32).max(root) as usize);
     let used_h = loop {
         rw = (rw as f32 * 1.05 + 1.0) as usize;
         rh = (rh as f32 * 1.05 + 1.0) as usize;
@@ -448,11 +410,7 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
     let rh = used_h;
 
     // Quantise the reference image the way the decoder will read it.
-    let mut channels = [
-        Channel::new(rw, rh),
-        Channel::new(rw, rh),
-        Channel::new(rw, rh),
-    ];
+    let mut channels = [Channel::new(rw, rh), Channel::new(rw, rh), Channel::new(rw, rh)];
     let mut decoded: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0.0; rw * rh]);
     let dq = dc_quant(distance);
     let inv: [f32; 3] = dq.map(|q| 1.0 / q);
@@ -472,14 +430,7 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
             }
         }
     }
-    Some(Patches {
-        patches,
-        ref_w: rw,
-        ref_h: rh,
-        decoded,
-        channels,
-        dc_quant: dq,
-    })
+    Some(Patches { patches, ref_w: rw, ref_h: rh, decoded, channels, dc_quant: dq })
 }
 
 impl Patches {
@@ -544,13 +495,7 @@ impl Patches {
     }
 
     /// Write the reference frame (an XYB Modular frame, not shown).
-    pub fn write_reference_frame(
-        &self,
-        num_extra: u32,
-        effort: u32,
-        threads: usize,
-        out: &mut BitWriter,
-    ) {
+    pub fn write_reference_frame(&self, num_extra: u32, effort: u32, threads: usize, out: &mut BitWriter) {
         let (w, h) = (self.ref_w, self.ref_h);
         let mut channels: Vec<Channel> = self.channels.to_vec();
         // The decoder expects every extra channel in every frame.
@@ -596,10 +541,7 @@ impl Patches {
         let streams: Vec<(u32, Vec<Channel>)> = (0..ng)
             .map(|g| {
                 let (x, y, gw, gh) = layout.group_rect(g);
-                (
-                    (1 + 3 * nlf + 17 + g) as u32,
-                    channels.iter().map(|c| c.crop(x, y, gw, gh)).collect(),
-                )
+                ((1 + 3 * nlf + 17 + g) as u32, channels.iter().map(|c| c.crop(x, y, gw, gh)).collect())
             })
             .collect();
         let global = GlobalTree::build_owned(streams, &mopts);

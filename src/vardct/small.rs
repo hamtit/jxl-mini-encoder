@@ -19,19 +19,11 @@ fn basis(n: usize) -> &'static Basis {
     static B8: OnceLock<Basis> = OnceLock::new();
     let cell = if n == 4 { &B4 } else { &B8 };
     cell.get_or_init(|| {
-        let mut b = Basis {
-            fwd: [[0.0; 8]; 8],
-            inv: [[0.0; 8]; 8],
-        };
+        let mut b = Basis { fwd: [[0.0; 8]; 8], inv: [[0.0; 8]; 8] };
         for k in 0..n {
-            let s = if k == 0 {
-                1.0
-            } else {
-                std::f64::consts::SQRT_2
-            };
+            let s = if k == 0 { 1.0 } else { std::f64::consts::SQRT_2 };
             for i in 0..n {
-                let c =
-                    (std::f64::consts::PI * k as f64 * (2 * i + 1) as f64 / (2 * n) as f64).cos();
+                let c = (std::f64::consts::PI * k as f64 * (2 * i + 1) as f64 / (2 * n) as f64).cos();
                 b.fwd[k][i] = (s * c / n as f64) as f32;
                 b.inv[i][k] = (s * c) as f32;
             }
@@ -256,11 +248,8 @@ pub fn inverse(kind: Small, coef: &[f32], out: &mut [f32], stride: usize) {
                             if ix == 1 && iy == 1 {
                                 continue;
                             }
-                            let slot = if ix == 0 && iy == 0 {
-                                (y + 2) * 8 + x + 2
-                            } else {
-                                (y + iy * 2) * 8 + x + ix * 2
-                            };
+                            let slot =
+                                if ix == 0 && iy == 0 { (y + 2) * 8 + x + 2 } else { (y + iy * 2) * 8 + x + ix * 2 };
                             d[iy][ix] = c[slot];
                             sum += d[iy][ix];
                         }
@@ -342,13 +331,7 @@ pub enum Small {
 mod tests {
     use super::*;
 
-    const KINDS: [Small; 5] = [
-        Small::Identity,
-        Small::Dct2x2,
-        Small::Dct4x4,
-        Small::Dct4x8,
-        Small::Dct8x4,
-    ];
+    const KINDS: [Small; 5] = [Small::Identity, Small::Dct2x2, Small::Dct4x4, Small::Dct4x8, Small::Dct8x4];
 
     fn pixels() -> Vec<f32> {
         let mut s = 12345u32;
@@ -364,11 +347,8 @@ mod tests {
     fn roundtrip_and_mean() {
         let px = pixels();
         let stride = 11;
-        let mean: f32 = (0..8)
-            .flat_map(|y| (0..8).map(move |x| (y, x)))
-            .map(|(y, x)| px[y * stride + x])
-            .sum::<f32>()
-            / 64.0;
+        let mean: f32 =
+            (0..8).flat_map(|y| (0..8).map(move |x| (y, x))).map(|(y, x)| px[y * stride + x]).sum::<f32>() / 64.0;
         for k in KINDS {
             let mut c = [0f32; 64];
             forward(k, &px, stride, &mut c);

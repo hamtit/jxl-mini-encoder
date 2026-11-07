@@ -15,9 +15,7 @@ use crate::bit_writer::BitWriter;
 use crate::bit_writer::U32Dist::{Bits, Val};
 use crate::bit_writer::{ceil_log2, pack_f16, unpack_f16};
 use crate::entropy::{CodeOptions, EntropyCode, Token, pack_signed};
-use crate::headers::{
-    Encoding, FrameInfo, FramePlacement, GROUP_DIM, Layout, write_frame_header, write_sections,
-};
+use crate::headers::{Encoding, FrameInfo, FramePlacement, GROUP_DIM, Layout, write_frame_header, write_sections};
 use crate::modular::{Channel, GlobalTree, ModularOptions, write_header, write_standalone};
 use crate::parallel::par_map;
 use crate::{EncoderOptions, ImageRef};
@@ -33,15 +31,14 @@ const BLOCK_CTX_MAP: [u8; 39] = [
     7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
 ];
 const COEFF_FREQ_CONTEXT: [u16; 63] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15, 16, 16, 17, 17, 18, 18, 19, 19, 20,
-    20, 21, 21, 22, 22, 23, 23, 23, 23, 24, 24, 24, 24, 25, 25, 25, 25, 26, 26, 26, 26, 27, 27, 27,
-    27, 28, 28, 28, 28, 29, 29, 29, 29, 30, 30, 30, 30,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22, 22,
+    23, 23, 23, 23, 24, 24, 24, 24, 25, 25, 25, 25, 26, 26, 26, 26, 27, 27, 27, 27, 28, 28, 28, 28, 29, 29, 29, 29, 30,
+    30, 30, 30,
 ];
 const COEFF_NUM_NONZERO_CONTEXT: [u16; 63] = [
-    0, 31, 62, 62, 93, 93, 93, 93, 123, 123, 123, 123, 152, 152, 152, 152, 152, 152, 152, 152, 180,
-    180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 206, 206, 206, 206, 206, 206, 206, 206,
-    206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206,
-    206, 206, 206, 206,
+    0, 31, 62, 62, 93, 93, 93, 93, 123, 123, 123, 123, 152, 152, 152, 152, 152, 152, 152, 152, 180, 180, 180, 180, 180,
+    180, 180, 180, 180, 180, 180, 180, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206,
+    206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206,
 ];
 const NUM_HF_CTX: usize = 495 * NUM_BLOCK_CLUSTERS as usize;
 
@@ -87,15 +84,11 @@ fn chroma_scales(xyb: &Xyb, w: usize, h: usize) -> (u32, u32) {
     for y in 1..h {
         for x in 1..w {
             let i = y * stride + x;
-            dx = dx
-                .max((px[i] - px[i - 1]).abs())
-                .max((px[i] - px[i - stride]).abs());
+            dx = dx.max((px[i] - px[i - 1]).abs()).max((px[i] - px[i - stride]).abs());
             let diff = pb[i] - py[i];
             let diff_prev = pb[i - 1] - py[i - 1];
             let diff_row = pb[i - stride] - py[i - stride];
-            db = db
-                .max((diff - diff_prev).abs())
-                .max((diff - diff_row).abs());
+            db = db.max((diff - diff_prev).abs()).max((diff - diff_row).abs());
             let exposed_b = pb[i] - py[i] * 1.2;
             if exposed_b >= 0.0 {
                 let edge = (pb[i] - pb[i - 1]).abs() + (pb[i] - pb[i - stride]).abs();
@@ -202,8 +195,7 @@ fn correlation_cost_impl(s: &[f32], y: &[f32], wm: &[f32], r: f32) -> f32 {
         }
         i += 8;
     }
-    let mut total =
-        ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
+    let mut total = ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
     while i < n {
         total += fast_log2(1.0 + ((s[i] - r * y[i]) * wm[i]).abs());
         i += 1;
@@ -267,8 +259,7 @@ impl Ctx<'_> {
         // Pass 1: transform every block and quantise Y; X and B are kept
         // unquantised until the colour correlation of their tile is known.
         let mut blks: Vec<Blk> = Vec::new();
-        let (mut x_all, mut b_all, mut yr_all, mut qy_all) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut x_all, mut b_all, mut yr_all, mut qy_all) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut y_all = Vec::new();
         for by in 0..gbh {
             for bx in 0..gbw {
@@ -283,13 +274,7 @@ impl Ctx<'_> {
                 let (nbx, nby) = acs.blocks();
                 let origin = aby * 8 * stride + abx * 8;
                 for c in 0..3 {
-                    acs::forward_block(
-                        self.dct,
-                        acs,
-                        &self.xyb.planes[c][origin..],
-                        stride,
-                        &mut coeffs[c],
-                    );
+                    acs::forward_block(self.dct, acs, &self.xyb.planes[c][origin..], stride, &mut coeffs[c]);
                     acs::lf_from_llf(self.dct, &coeffs[c], acs, &mut lf[c]);
                 }
                 for iy in 0..nby {
@@ -331,13 +316,7 @@ impl Ctx<'_> {
                         };
                     }
                 }
-                blks.push(Blk {
-                    bx,
-                    by,
-                    acs,
-                    qac,
-                    off: x_all.len(),
-                });
+                blks.push(Blk { bx, by, acs, qac, off: x_all.len() });
                 if self.recon {
                     y_all.extend_from_slice(&coeffs[1][..n]);
                 }
@@ -353,10 +332,7 @@ impl Ctx<'_> {
         {
             for (t, slot) in cmap.iter_mut().enumerate() {
                 let (tx, ty) = (t % tw, t / tw);
-                let list: Vec<&Blk> = blks
-                    .iter()
-                    .filter(|b| b.bx / 8 == tx && b.by / 8 == ty)
-                    .collect();
+                let list: Vec<&Blk> = blks.iter().filter(|b| b.bx / 8 == tx && b.by / 8 == ty).collect();
                 for (k, c, src, base) in [(0usize, 0usize, &x_all, 0.0f32), (1, 2, &b_all, 1.0)] {
                     slot[k] = self.pick_correlation(&list, c, src, &yr_all, base);
                 }
@@ -364,11 +340,8 @@ impl Ctx<'_> {
         }
         // Pass 3: quantise X and B and emit tokens in block order.
         let rstride = gbw * 8;
-        let mut recon: [Vec<u16>; 3] = if self.recon {
-            std::array::from_fn(|_| vec![0u16; rstride * gbh * 8])
-        } else {
-            Default::default()
-        };
+        let mut recon: [Vec<u16>; 3] =
+            if self.recon { std::array::from_fn(|_| vec![0u16; rstride * gbh * 8]) } else { Default::default() };
         let mut rc: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0f32; 64 * 64]);
         let mut pix = vec![0f32; 64 * 64];
         for blk in &blks {
@@ -383,24 +356,8 @@ impl Ctx<'_> {
                 coeffs[2][i] = b_all[blk.off + i] - rb * yr[i];
             }
             q[1][..n].copy_from_slice(&qy_all[blk.off..blk.off + n]);
-            self.quantize(
-                &coeffs[0][..n],
-                t,
-                0,
-                nb,
-                blk.qac,
-                [0.58, 0.62, 0.62, 0.62],
-                &mut q[0],
-            );
-            self.quantize(
-                &coeffs[2][..n],
-                t,
-                2,
-                nb,
-                blk.qac,
-                [0.58, 0.62, 0.62, 0.62],
-                &mut q[2],
-            );
+            self.quantize(&coeffs[0][..n], t, 0, nb, blk.qac, [0.58, 0.62, 0.62, 0.62], &mut q[0]);
+            self.quantize(&coeffs[2][..n], t, 2, nb, blk.qac, [0.58, 0.62, 0.62, 0.62], &mut q[2]);
             self.tokenize(blk.bx, blk.by, blk.acs, &q, &mut nz_row, &mut tokens);
             if self.recon {
                 let (nbx, nby) = blk.acs.blocks();
@@ -418,10 +375,8 @@ impl Ctx<'_> {
                     for i in 0..n {
                         let yv = yr[i];
                         rc1[i] = yv;
-                        rc0[i] =
-                            rx * yv + dequant_bias(q0[i], 0) * iw0[i] * inv_qac / self.qm_mult[0];
-                        rc2[i] =
-                            rb * yv + dequant_bias(q2[i], 2) * iw2[i] * inv_qac / self.qm_mult[2];
+                        rc0[i] = rx * yv + dequant_bias(q0[i], 0) * iw0[i] * inv_qac / self.qm_mult[0];
+                        rc2[i] = rb * yv + dequant_bias(q2[i], 2) * iw2[i] * inv_qac / self.qm_mult[2];
                     }
                 }
                 for y in 0..nby {
@@ -437,23 +392,14 @@ impl Ctx<'_> {
                     acs::inverse_block(self.dct, blk.acs, &rc[c][..n], &mut pix[..n]);
                     for y in 0..ph {
                         let dst = (blk.by * 8 + y) * rstride + blk.bx * 8;
-                        for (o, &v) in recon[c][dst..dst + pw]
-                            .iter_mut()
-                            .zip(&pix[y * pw..(y + 1) * pw])
-                        {
+                        for (o, &v) in recon[c][dst..dst + pw].iter_mut().zip(&pix[y * pw..(y + 1) * pw]) {
                             *o = pack_f16(v);
                         }
                     }
                 }
             }
         }
-        GroupOut {
-            tokens,
-            dc,
-            cmap,
-            raw_updates,
-            recon,
-        }
+        GroupOut { tokens, dc, cmap, raw_updates, recon }
     }
 
     /// libjxl's AdjustQuantBlockAC: nudges the block's quantiser (and the
@@ -525,11 +471,7 @@ impl Ctx<'_> {
             for x in x0..t.w {
                 let hfix = hy + usize::from(x >= t.w / 2);
                 let val = br[x] * (wr[x] * m);
-                let v = if val.abs() < thres[hfix] {
-                    0.0
-                } else {
-                    val.round_ties_even()
-                };
+                let v = if val.abs() < thres[hfix] { 0.0 } else { val.round_ties_even() };
                 let err = (val - v).abs();
                 sum_err += err;
                 sum_vals += v.abs();
@@ -563,9 +505,7 @@ impl Ctx<'_> {
             let r = new_q as f32 / orig as f32;
             if hf_nz[3] == 0.0 && hf_max_err[3] > LIMIT {
                 thres[3] = MUL * hf_max_err[3] * r;
-            } else if (hf_nz[1] == 0.0 && hf_max_err[1] > LIMIT)
-                || (hf_nz[2] == 0.0 && hf_max_err[2] > LIMIT)
-            {
+            } else if (hf_nz[1] == 0.0 && hf_max_err[1] > LIMIT) || (hf_nz[2] == 0.0 && hf_max_err[2] > LIMIT) {
                 thres[1] = MUL * hf_max_err[1].max(hf_max_err[2]) * r;
                 thres[2] = thres[1];
             } else if hf_nz[0] == 0.0 && hf_max_err[0] > LIMIT {
@@ -590,26 +530,10 @@ impl Ctx<'_> {
         }
         if t.w * t.h > 64 {
             const KMUL1: [[f64; 3]; 4] = [
-                [
-                    0.22080615753848404,
-                    0.45797479824262011,
-                    0.29859235095977965,
-                ],
-                [
-                    0.70109486510286834,
-                    0.16185281305512639,
-                    0.14387691730035473,
-                ],
-                [
-                    0.114985964456218638,
-                    0.44656840441027695,
-                    0.10587658215149048,
-                ],
-                [
-                    0.46849665264409396,
-                    0.41239077937781954,
-                    0.088667407767185444,
-                ],
+                [0.22080615753848404, 0.45797479824262011, 0.29859235095977965],
+                [0.70109486510286834, 0.16185281305512639, 0.14387691730035473],
+                [0.114985964456218638, 0.44656840441027695, 0.10587658215149048],
+                [0.46849665264409396, 0.41239077937781954, 0.088667407767185444],
             ];
             const KMUL2: [[f64; 3]; 4] = [
                 [0.27450281941822197, 1.1255766549984996, 0.98950459134128388],
@@ -703,11 +627,7 @@ impl Ctx<'_> {
                 }
             }
         }
-        if best.0 + CFL_MIN_GAIN < zero {
-            best.1
-        } else {
-            0
-        }
+        if best.0 + CFL_MIN_GAIN < zero { best.1 } else { 0 }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -758,11 +678,7 @@ impl Ctx<'_> {
                 (0, _) => row[0],
                 _ => (row[bx] + row[bx - 1] + 1) >> 1,
             };
-            let nz_ctx_idx = if predicted >= 8 {
-                4 + predicted / 2
-            } else {
-                predicted
-            };
+            let nz_ctx_idx = if predicted >= 8 { 4 + predicted / 2 } else { predicted };
             let qc = &q[c];
             let nz = order.iter().filter(|&&p| qc[p as usize] != 0).count() as u32;
             out.push(Token::new(block_ctx + nz_ctx_idx * NUM_BLOCK_CLUSTERS, nz));
@@ -795,15 +711,7 @@ impl Ctx<'_> {
 }
 
 #[inline(always)]
-fn quantize_impl(
-    coeffs: &[f32],
-    weights: &[f32],
-    w: usize,
-    h: usize,
-    m: f32,
-    thres: [f32; 4],
-    out: &mut [i32],
-) {
+fn quantize_impl(coeffs: &[f32], weights: &[f32], w: usize, h: usize, m: f32, thres: [f32; 4], out: &mut [i32]) {
     for y in 0..h {
         let ty = usize::from(y >= h / 2) * 2;
         let (lo, hi) = (thres[ty], thres[ty + 1]);
@@ -819,15 +727,7 @@ fn quantize_impl(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn quantize_avx2(
-    coeffs: &[f32],
-    weights: &[f32],
-    w: usize,
-    h: usize,
-    m: f32,
-    thres: [f32; 4],
-    out: &mut [i32],
-) {
+unsafe fn quantize_avx2(coeffs: &[f32], weights: &[f32], w: usize, h: usize, m: f32, thres: [f32; 4], out: &mut [i32]) {
     quantize_impl(coeffs, weights, w, h, m, thres, out)
 }
 
@@ -931,12 +831,7 @@ pub fn encode(
         let mut data = Vec::with_capacity(rw * rh);
         for row in y..y + rh {
             let base = (row * w + x) * 4 + 3;
-            data.extend(
-                img.data[base..base + (rw - 1) * 4 + 1]
-                    .iter()
-                    .step_by(4)
-                    .map(|&v| i32::from(v)),
-            );
+            data.extend(img.data[base..base + (rw - 1) * 4 + 1].iter().step_by(4).map(|&v| i32::from(v)));
         }
         Channel { w: rw, h: rh, data }
     };
@@ -946,17 +841,12 @@ pub fn encode(
         let streams: Vec<(u32, Vec<Channel>)> = (0..ng)
             .map(|g| {
                 let (x, y, gw, gh) = alpha_layout.group_rect(g);
-                (
-                    (1 + 3 * nlf + 17 + g) as u32,
-                    vec![alpha_rect(x, y, gw, gh)],
-                )
+                ((1 + 3 * nlf + 17 + g) as u32, vec![alpha_rect(x, y, gw, gh)])
             })
             .collect();
         let mopts = alpha_mopts.clone();
         if opts.threads > 1 {
-            AlphaJob::Worker(std::thread::spawn(move || {
-                GlobalTree::build_owned(streams, &mopts)
-            }))
+            AlphaJob::Worker(std::thread::spawn(move || GlobalTree::build_owned(streams, &mopts)))
         } else {
             // A single-thread encode stays on the calling thread.
             AlphaJob::Inline(streams, mopts)
@@ -1010,22 +900,13 @@ pub fn encode(
     if gaborish {
         xyb::gaborish_inverse(&mut xyb, opts.threads);
     }
-    let qk = if params.adaptive_quant {
-        aq_calibration(d, opts.effort)
-    } else {
-        1.0
-    };
+    let qk = if params.adaptive_quant { aq_calibration(d, opts.effort) } else { 1.0 };
     field.iter_mut().for_each(|v| *v *= qk);
     let q_median = q_median * qk;
     let dct = Dct::new();
     let tables = Tables::new();
-    let mut acs_map: Vec<BlockAcs> = (0..bw * bh)
-        .map(|i| BlockAcs {
-            acs: Acs::Dct8,
-            ox: (i % bw) as u32,
-            oy: (i / bw) as u32,
-        })
-        .collect();
+    let mut acs_map: Vec<BlockAcs> =
+        (0..bw * bh).map(|i| BlockAcs { acs: Acs::Dct8, ox: (i % bw) as u32, oy: (i / bw) as u32 }).collect();
     if params.choose_transforms {
         let input = SearchInput {
             planes: [&xyb.planes[0], &xyb.planes[1], &xyb.planes[2]],
@@ -1076,11 +957,7 @@ pub fn encode(
             quantizer: &quantizer,
             acs: &acs_map,
             tables: &tables,
-            qm_mult: [
-                1.25f32.powi(params.x_qm_scale as i32 - 2),
-                1.0,
-                1.25f32.powi(params.b_qm_scale as i32 - 2),
-            ],
+            qm_mult: [1.25f32.powi(params.x_qm_scale as i32 - 2), 1.0, 1.25f32.powi(params.b_qm_scale as i32 - 2)],
             dct: &dct,
             adjust: params.adaptive_quant && std::env::var_os("MINI_NO_ADJUST_QUANT").is_none(),
             recon: dynamic_epf,
@@ -1107,10 +984,7 @@ pub fn encode(
                 let (gx, gy, gw, _) = layout.group_rect(g);
                 let rw = gw.div_ceil(8) * 8;
                 let ly = y - gy;
-                for (o, &v) in dst[gx..gx + rw]
-                    .iter_mut()
-                    .zip(&groups[g].recon[c][ly * rw..(ly + 1) * rw])
-                {
+                for (o, &v) in dst[gx..gx + rw].iter_mut().zip(&groups[g].recon[c][ly * rw..(ly + 1) * rw]) {
                     *o = unpack_f16(v);
                 }
             }
@@ -1118,15 +992,7 @@ pub fn encode(
         let orig_rows = |by0: usize, by1: usize| -> [Vec<f32>; 3] {
             let (y0, y1) = (by0 * 8, (by1 * 8).min(h));
             let ch = img.channels();
-            let mut x = Xyb::from_srgb8(
-                &img.data[y0 * w * ch..y1 * w * ch],
-                ch,
-                w,
-                y1 - y0,
-                xyb_w,
-                (by1 - by0) * 8,
-                1,
-            );
+            let mut x = Xyb::from_srgb8(&img.data[y0 * w * ch..y1 * w * ch], ch, w, y1 - y0, xyb_w, (by1 - by0) * 8, 1);
             if let Some(p) = &patches {
                 p.subtract_rows(&mut x.planes, xyb_w, y0, (by1 - by0) * 8);
             }
@@ -1172,11 +1038,7 @@ pub fn encode(
 
     // LF image, quantised; B is predicted from the reconstructed Y.
     let step = quantizer.lf_step();
-    let mut lf = [
-        Channel::new(bw, bh),
-        Channel::new(bw, bh),
-        Channel::new(bw, bh),
-    ]; // Y, X, B
+    let mut lf = [Channel::new(bw, bh), Channel::new(bw, bh), Channel::new(bw, bh)]; // Y, X, B
     for g in &groups {
         for &(x, y, [dx, dy, db]) in &g.dc {
             let qy = (dy / step[1]).round() as i32;
@@ -1187,8 +1049,7 @@ pub fn encode(
         }
     }
 
-    let mopts = ModularOptions::for_effort(opts.effort.min(4), bw * bh * 3)
-        .with_threads(opts.threads.div_ceil(nlf));
+    let mopts = ModularOptions::for_effort(opts.effort.min(4), bw * bh * 3).with_threads(opts.threads.div_ceil(nlf));
     let lf_sections: Vec<BitWriter> = par_map(nlf, opts.threads, |i| {
         let (x, y, lw, lh) = layout.lf_group_rect(i);
         let (lbx, lby, lbw, lbh) = (x / 8, y / 8, lw.div_ceil(8), lh.div_ceil(8));
@@ -1237,12 +1098,7 @@ pub fn encode(
                 }
                 None => sharp.data.fill(epf_sharpness(d, gaborish)),
             }
-            let meta = [
-                ytox.crop(x / 64, y / 64, cw, chh),
-                ytob.crop(x / 64, y / 64, cw, chh),
-                info,
-                sharp,
-            ];
+            let meta = [ytox.crop(x / 64, y / 64, cw, chh), ytob.crop(x / 64, y / 64, cw, chh), info, sharp];
             let refs: Vec<&Channel> = meta.iter().collect();
             write_standalone(&mut m, &refs, (1 + 2 * nlf + i) as u32, &[], &mopts);
             let lf_bits = match lf_job {
@@ -1275,10 +1131,7 @@ pub fn encode(
     });
 
     let frame = FrameInfo {
-        encoding: Encoding::VarDct {
-            x_qm_scale: params.x_qm_scale,
-            b_qm_scale: params.b_qm_scale,
-        },
+        encoding: Encoding::VarDct { x_qm_scale: params.x_qm_scale, b_qm_scale: params.b_qm_scale },
         num_extra: u32::from(img.has_alpha()),
         xyb: true,
         gaborish,
@@ -1304,14 +1157,8 @@ pub fn encode(
         }
     }
     lf_global.write_bool(true); // default LF dequantisation
-    lf_global.write_u32(
-        quantizer.global_scale,
-        [Bits(11, 1), Bits(11, 2049), Bits(12, 4097), Bits(16, 8193)],
-    );
-    lf_global.write_u32(
-        quantizer.quant_lf,
-        [Val(16), Bits(5, 1), Bits(8, 1), Bits(16, 1)],
-    );
+    lf_global.write_u32(quantizer.global_scale, [Bits(11, 1), Bits(11, 2049), Bits(12, 4097), Bits(16, 8193)]);
+    lf_global.write_u32(quantizer.quant_lf, [Val(16), Bits(5, 1), Bits(8, 1), Bits(16, 1)]);
     lf_global.write_bool(true); // default HF block context
     lf_global.write_bool(true); // default LF channel correlation
     match (&alpha, &alpha_tree) {
@@ -1349,11 +1196,7 @@ pub fn encode(
 
     if ng == 1 {
         let mut all = lf_global;
-        for s in lf_sections
-            .iter()
-            .chain([&hf_global])
-            .chain(pass_groups.iter())
-        {
+        for s in lf_sections.iter().chain([&hf_global]).chain(pass_groups.iter()) {
             all.append(s);
         }
         write_sections(out, vec![all]);

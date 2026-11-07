@@ -41,11 +41,7 @@ pub const QUANT_BIAS_NUMERATOR: f32 = 0.145;
 #[inline]
 pub fn dequant_bias(q: i32, c: usize) -> f32 {
     let qf = q as f32;
-    if q.abs() <= 1 {
-        qf * QUANT_BIAS[c]
-    } else {
-        qf - QUANT_BIAS_NUMERATOR / qf
-    }
+    if q.abs() <= 1 { qf * QUANT_BIAS[c] } else { qf - QUANT_BIAS_NUMERATOR / qf }
 }
 
 pub const GLOBAL_SCALE_DENOM: f32 = 65536.0;
@@ -70,15 +66,8 @@ impl Quantizer {
         }
         let inv_gs = GLOBAL_SCALE_DENOM / gs as f32;
         let quant_lf = ((quant_dc * inv_gs + 0.5).min(65536.0) as u32).max(1);
-        let raw = field
-            .iter()
-            .map(|&q| ((q * inv_gs + 0.5).clamp(1.0, QUANT_MAX) as u32 - 1) as u8)
-            .collect();
-        Quantizer {
-            global_scale: gs as u32,
-            quant_lf,
-            raw,
-        }
+        let raw = field.iter().map(|&q| ((q * inv_gs + 0.5).clamp(1.0, QUANT_MAX) as u32 - 1) as u8).collect();
+        Quantizer { global_scale: gs as u32, quant_lf, raw }
     }
 
     /// Scale applied (with the block's hf_mul) before rounding HF coefficients.

@@ -41,13 +41,8 @@ pub struct FramePlacement {
 }
 
 impl FramePlacement {
-    pub const STILL: FramePlacement = FramePlacement {
-        duration: None,
-        is_last: true,
-        save: false,
-        crop: None,
-        blend: false,
-    };
+    pub const STILL: FramePlacement =
+        FramePlacement { duration: None, is_last: true, save: false, crop: None, blend: false };
 }
 
 fn write_size(w: &mut BitWriter, width: u32, height: u32) {
@@ -74,19 +69,8 @@ fn write_size(w: &mut BitWriter, width: u32, height: u32) {
 /// The aspect-ratio code that yields `width` from `height`, or 0.
 fn ratio_of(width: u32, height: u32) -> u32 {
     let h = u64::from(height);
-    let candidates = [
-        h,
-        h * 12 / 10,
-        h * 4 / 3,
-        h * 3 / 2,
-        h * 16 / 9,
-        h * 5 / 4,
-        h * 2,
-    ];
-    candidates
-        .iter()
-        .position(|&c| c == u64::from(width))
-        .map_or(0, |i| i as u32 + 1)
+    let candidates = [h, h * 12 / 10, h * 4 / 3, h * 3 / 2, h * 16 / 9, h * 5 / 4, h * 2];
+    candidates.iter().position(|&c| c == u64::from(width)).map_or(0, |i| i as u32 + 1)
 }
 
 /// Signature, SizeHeader and ImageMetadata, padded to a byte boundary.
@@ -104,14 +88,8 @@ pub fn write_image_header(w: &mut BitWriter, info: &ImageInfo) {
             w.write_bool(false); // have_intrinsic_size
             w.write_bool(false); // have_preview
             w.write_bool(true); // have_animation
-            w.write_u32(
-                a.tps_numerator,
-                [Val(100), Val(1000), Bits(10, 1), Bits(30, 1)],
-            );
-            w.write_u32(
-                a.tps_denominator,
-                [Val(1), Val(1001), Bits(8, 1), Bits(10, 1)],
-            );
+            w.write_u32(a.tps_numerator, [Val(100), Val(1000), Bits(10, 1), Bits(30, 1)]);
+            w.write_u32(a.tps_denominator, [Val(1), Val(1001), Bits(8, 1), Bits(10, 1)]);
             w.write_u32(a.num_loops, [Val(0), Bits(3, 0), Bits(16, 0), Bits(32, 0)]);
             w.write_bool(false); // have_timecodes
         }
@@ -170,11 +148,7 @@ pub fn write_frame_header(w: &mut BitWriter, f: &FrameInfo, size: (u32, u32)) {
     let modular = matches!(f.encoding, Encoding::Modular);
     w.write(1, u64::from(modular));
     // flags: kPatches = 2, kSkipAdaptiveDCSmoothing = 128
-    w.write_u64(
-        u64::from(f.noise.is_some())
-            + u64::from(f.patches) * 2
-            + if f.skip_lf_smoothing { 128 } else { 0 },
-    );
+    w.write_u64(u64::from(f.noise.is_some()) + u64::from(f.patches) * 2 + if f.skip_lf_smoothing { 128 } else { 0 });
     if !f.xyb {
         w.write_bool(false); // do_ycbcr
     }
@@ -185,10 +159,7 @@ pub fn write_frame_header(w: &mut BitWriter, f: &FrameInfo, size: (u32, u32)) {
     }
     match f.encoding {
         Encoding::Modular => w.write(2, u64::from(GROUP_SIZE_SHIFT)),
-        Encoding::VarDct {
-            x_qm_scale,
-            b_qm_scale,
-        } => {
+        Encoding::VarDct { x_qm_scale, b_qm_scale } => {
             if f.xyb {
                 w.write(3, u64::from(x_qm_scale));
                 w.write(3, u64::from(b_qm_scale));
@@ -275,15 +246,7 @@ pub fn write_toc(w: &mut BitWriter, sizes: &[usize]) {
     w.zero_pad_to_byte();
     for &s in sizes {
         let s = u32::try_from(s).expect("section too large");
-        w.write_u32(
-            s,
-            [
-                Bits(10, 0),
-                Bits(14, 1024),
-                Bits(22, 17408),
-                Bits(30, 4_211_712),
-            ],
-        );
+        w.write_u32(s, [Bits(10, 0), Bits(14, 1024), Bits(22, 17408), Bits(30, 4_211_712)]);
     }
     w.zero_pad_to_byte();
 }
@@ -324,12 +287,7 @@ impl Layout {
     pub fn group_rect(&self, g: usize) -> (usize, usize, usize, usize) {
         let (gx, gy) = (g % self.groups_x, g / self.groups_x);
         let (x, y) = (gx * GROUP_DIM, gy * GROUP_DIM);
-        (
-            x,
-            y,
-            GROUP_DIM.min(self.width - x),
-            GROUP_DIM.min(self.height - y),
-        )
+        (x, y, GROUP_DIM.min(self.width - x), GROUP_DIM.min(self.height - y))
     }
 
     /// Pixel rectangle of an LF group.

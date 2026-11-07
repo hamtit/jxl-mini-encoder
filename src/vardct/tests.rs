@@ -38,9 +38,7 @@ fn flat_graphics_detection_ignores_alpha_but_not_rgb_gradients() {
             .collect();
         let image = ImageRef::rgba8(w, h, &pixels).unwrap();
         assert_eq!(flat_graphics(&image), w / 8 * (h / 8) >= 4);
-        let gradient: Vec<u8> = (0..w * h)
-            .flat_map(|i| [i as u8, (i / w) as u8, 0])
-            .collect();
+        let gradient: Vec<u8> = (0..w * h).flat_map(|i| [i as u8, (i / w) as u8, 0]).collect();
         let image = ImageRef::rgb8(w, h, &gradient).unwrap();
         assert!(!flat_graphics(&image));
     }
