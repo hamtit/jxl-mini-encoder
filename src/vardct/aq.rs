@@ -3,7 +3,6 @@
 
 use super::xyb::Xyb;
 use crate::parallel::par_tasks;
-use crate::tune::k as tk;
 
 const SG_MUL: f32 = 226.772_16;
 const SG_MUL2: f32 = 1.0 / 73.377_13;
@@ -30,19 +29,19 @@ fn masking_sqrt(v: f32) -> f32 {
 }
 
 fn compute_mask(out_val: f32) -> f32 {
-    const BASE: f32 = -0.7647;
+    const BASE: f32 = -0.7029;
     const MUL4: f32 = 9.470_873;
     const MUL2: f32 = 17.350_365;
-    const OFFSET2: f32 = 302.595_88;
+    const OFFSET2: f32 = 362.9;
     const MUL3: f32 = 6.794_325;
-    const OFFSET3: f32 = 3.717_963_6;
+    const OFFSET3: f32 = 3.676;
     const OFFSET4: f32 = 0.25 * OFFSET3;
-    const MUL0: f32 = 0.800_617_6;
-    let v1 = (out_val * MUL0 * tk(16)).max(1e-3);
-    let v2 = 1.0 / (v1 + OFFSET2 * tk(17));
-    let v3 = 1.0 / (v1 * v1 + OFFSET3 * tk(18));
+    const MUL0: f32 = 1.034;
+    let v1 = (out_val * MUL0).max(1e-3);
+    let v2 = 1.0 / (v1 + OFFSET2);
+    let v3 = 1.0 / (v1 * v1 + OFFSET3);
     let v4 = 1.0 / (v1 * v1 + OFFSET4);
-    BASE * tk(19) + MUL4 * v4 + MUL2 * v2 + MUL3 * v3
+    BASE + MUL4 * v4 + MUL2 * v2 + MUL3 * v3
 }
 
 /// The four smallest values, in increasing order.

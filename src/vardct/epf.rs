@@ -8,13 +8,12 @@
 //! rule, working on whole planes padded to a multiple of 8.
 
 use crate::parallel::{par_map, par_tasks};
-use crate::tune::k as tk;
 
 /// Inverse sigma below which a block is left unfiltered.
 const MIN_SIGMA: f32 = -3.905_243;
 const INV_SIGMA_NUM: f32 = -1.171_572_9;
 const QUANT_MUL: f32 = 0.46;
-const CHANNEL_SCALE: [f32; 3] = [40.0, 5.0, 3.5];
+const CHANNEL_SCALE: [f32; 3] = [40.18, 3.487, 3.016];
 const BORDER_SAD_MUL: f32 = 2.0 / 3.0;
 const PAD: usize = 3;
 /// Pixels per tile in the filter passes.
@@ -206,9 +205,9 @@ fn run_band_impl(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2
                     let (a1, b1) = (&padded_src[1][base..base + dw], &padded_src[1][nb..nb + dw]);
                     let (a2, b2) = (&padded_src[2][base..base + dw], &padded_src[2][nb..nb + dw]);
                     for x in xs..xe + 2 {
-                        let t0 = (a0[x] - b0[x]).abs() * CHANNEL_SCALE[0] * tk(13);
-                        let t1 = (a1[x] - b1[x]).abs() * CHANNEL_SCALE[1] * tk(15);
-                        let t2 = (a2[x] - b2[x]).abs() * CHANNEL_SCALE[2] * tk(14);
+                        let t0 = (a0[x] - b0[x]).abs() * CHANNEL_SCALE[0];
+                        let t1 = (a1[x] - b1[x]).abs() * CHANNEL_SCALE[1];
+                        let t2 = (a2[x] - b2[x]).abs() * CHANNEL_SCALE[2];
                         out[x] = t0 + t1 + t2;
                     }
                 }
@@ -260,9 +259,9 @@ fn run_band_impl(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2
                             &padded_src[2][row + x0..row + x0 + tw],
                         );
                         for x in 0..tw {
-                            let t0 = (p0[x] - m0[x]).abs() * CHANNEL_SCALE[0] * tk(13);
-                            let t1 = (p1[x] - m1[x]).abs() * CHANNEL_SCALE[1] * tk(15);
-                            let t2 = (p2[x] - m2[x]).abs() * CHANNEL_SCALE[2] * tk(14);
+                            let t0 = (p0[x] - m0[x]).abs() * CHANNEL_SCALE[0];
+                            let t1 = (p1[x] - m1[x]).abs() * CHANNEL_SCALE[1];
+                            let t2 = (p2[x] - m2[x]).abs() * CHANNEL_SCALE[2];
                             let sad = t0 + t1 + t2;
                             let wt = (sad * ip[x] + 1.0).max(0.0) * ac[x];
                             ws[x] += wt;
