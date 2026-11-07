@@ -70,6 +70,7 @@ PNG 連番から試すには `cargo run --release --example anim -- -q 80 -e 7 -
 - effort 5 以下、または上記を無効にした場合は定数強度です。逆Gaborish使用時の距離1.5以上ではEPFの平滑化を少し弱めて写真の細部を保持します（高品質域・逆Gaborish無効時は変更していません）。
 - effort 7 以上では libjxl と同様に、画素統計から X / B チャンネルの量子化スケール（x_qm_scale / b_qm_scale）を引き上げます。`MINI_NO_CHROMA_ADJUST=1` で無効化できます。
 - 適応量子化の係数には、libjxl と同じ品質・effort での SSIMULACRA2 を揃えるための較正係数（`aq_calibration`）を掛けています。effort 6–7 で最大 +5%（低品質ほど大きい）、effort 8 以上で −4% です。libjxl は effort 8 以上で Butteraugli 反復量子化を使うため、出力サイズ・スコアの動作点が異なります。
+- 量子化のデッドゾーン閾値・AQ の強さ・DC 量子化・色相関の採用閾値など 13 個の手調整定数は、Kodak 画像 10 枚（effort 7、品質 55 / 80）を使った CMA-ES による自動探索で調整済みです。目的関数は同一 SSIMULACRA2 でのサイズで、未使用の Kodak 14 枚では品質 40–90 で平均約 3% 小さくなります（effort 5–8 でも 1.7–3.6%）。ピークメモリ・速度は変わりません。
 - パッチは effort 7 以上で有効です。テキストや UI の繰り返し図形を参照フレームに符号化します。`MINI_NO_PATCHES=1` で無効化できます。
 - ノイズ合成は `Encoder::noise(強度)` で有効にできます（既定は無効。SSIMULACRA2 は下がります）。
 - AFV、スプライン、butteraugli による反復量子化は未実装です。
