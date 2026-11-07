@@ -335,11 +335,11 @@ pub fn encode_animation(
                     } else {
                         buf.extend_from_slice(px);
                     }
-                    if let Some(prev) = prev {
-                        if prev[o + i * sch..o + (i + 1) * sch] == *px {
-                            let n = buf.len();
-                            buf[n - och..].fill(0); // transparent: keep the canvas
-                        }
+                    if let Some(prev) = prev
+                        && prev[o + i * sch..o + (i + 1) * sch] == *px
+                    {
+                        let n = buf.len();
+                        buf[n - och..].fill(0); // transparent: keep the canvas
                     }
                 }
             }
@@ -427,7 +427,7 @@ fn plan_frames(frames: &[AnimationFrame], tolerance: u8) -> Vec<PlannedFrame> {
         // frame cannot make a pixel transparent, and it does not keep the
         // hidden colour of a transparent pixel that stays unchanged.
         let mut count = 0usize;
-        let opaque = ch == 3 || data.chunks_exact(4).all(|p| p[3] == 255);
+        let opaque = ch == 3 || data.as_chunks::<4>().0.iter().all(|p| p[3] == 255);
         for y in 0..h {
             let row = y * w * ch;
             let (a, b) = (&canvas[row..row + w * ch], &data[row..row + w * ch]);

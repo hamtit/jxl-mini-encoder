@@ -477,6 +477,7 @@ impl Dct {
             return self.forward8(src, stride, out);
         }
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: `self.avx2` is only set when AVX2 was detected at runtime (see `Dct::new`).
         if self.avx2 && unsafe { forward_avx2(&self.inv_cos, src, stride, w, h, out) } {
             return;
         }
@@ -505,6 +506,7 @@ impl Dct {
     fn forward8(&self, src: &[f32], stride: usize, out: &mut [f32]) {
         #[cfg(target_arch = "x86_64")]
         if self.avx2 {
+            // SAFETY: `self.avx2` is only set when AVX2 was detected at runtime.
             return unsafe { self.forward8_avx2(src, stride, out) };
         }
         self.forward8_impl(src, stride, out)
@@ -513,6 +515,7 @@ impl Dct {
     fn inverse8(&self, coeffs: &[f32], out: &mut [f32]) {
         #[cfg(target_arch = "x86_64")]
         if self.avx2 {
+            // SAFETY: `self.avx2` is only set when AVX2 was detected at runtime.
             return unsafe { self.inverse8_avx2(coeffs, out) };
         }
         self.inverse8_impl(coeffs, out)
@@ -598,6 +601,7 @@ impl Dct {
             return self.inverse8(coeffs, out);
         }
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: `self.avx2` is only set when AVX2 was detected at runtime (see `Dct::new`).
         if self.avx2 && unsafe { inverse_avx2(&self.inv_cos, coeffs, w, h, out) } {
             return;
         }

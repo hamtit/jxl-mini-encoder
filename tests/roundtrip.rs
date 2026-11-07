@@ -76,7 +76,7 @@ fn constant_planes_and_binary_images() {
                 let out = jxl_mini_encoder::Encoder::new().quality(quality).encode(&image).unwrap();
                 let (dw, dh, ch, decoded) = decode(&out);
                 assert_eq!((dw, dh, ch), (w, h, 4));
-                assert!(decoded.chunks_exact(4).all(|p| p[3] == alpha));
+                assert!(decoded.as_chunks::<4>().0.iter().all(|p| p[3] == alpha));
                 if quality == 100.0 {
                     assert_eq!(decoded, pixels);
                 }
@@ -326,8 +326,8 @@ fn strip_opaque_alpha(data: Vec<u8>, dch: usize, ch: usize) -> Vec<u8> {
         return data;
     }
     assert_eq!((dch, ch), (4, 3), "unexpected channel count");
-    assert!(data.chunks_exact(4).all(|p| p[3] == 255), "alpha not opaque");
-    data.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect()
+    assert!(data.as_chunks::<4>().0.iter().all(|p| p[3] == 255), "alpha not opaque");
+    data.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect()
 }
 
 fn animation(w: u32, h: u32, ch: usize, n: usize, distance: f32, effort: u32) {
@@ -666,7 +666,7 @@ fn lossless_hint_for_palette_animation_with_sparse_changes() {
                 let mut px = vec![30u8; (w * h * 3) as usize];
                 for i in 0..(w * h) as usize {
                     // Few changing pixels, or a different texture in every frame.
-                    let on = if noisy { (i as u32 * 7 + f) % 3 == 0 } else { i as u32 == f * 5 };
+                    let on = if noisy { (i as u32 * 7 + f).is_multiple_of(3) } else { i as u32 == f * 5 };
                     if on {
                         px[i * 3..i * 3 + 3].copy_from_slice(&[200, 40, 40]);
                     }

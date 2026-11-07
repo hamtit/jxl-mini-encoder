@@ -542,7 +542,7 @@ fn quant_stage(
     e: &mut [f32],
 ) -> (u32, f32) {
     let n = c0.len();
-    assert!(n % 8 == 0 && c1.len() == n && wt.len() == n && iw.len() == n && e.len() == n);
+    assert!(n.is_multiple_of(8) && c1.len() == n && wt.len() == n && iw.len() == n && e.len() == n);
     #[cfg(target_arch = "x86_64")]
     if avx2 {
         // SAFETY: AVX2 support was detected at runtime; lengths checked above.
@@ -613,7 +613,7 @@ unsafe fn quant_stage_avx2(
 /// Sum of eighth powers of `(mask + off) * pix` over one row (width a
 /// multiple of 8), accumulated in f32 lanes.
 fn loss_row(avx2: bool, mrow: &[f32], prow: &[f32], off: f32) -> f64 {
-    assert!(mrow.len() % 8 == 0 && prow.len() == mrow.len());
+    assert!(mrow.len().is_multiple_of(8) && prow.len() == mrow.len());
     #[cfg(target_arch = "x86_64")]
     if avx2 {
         // SAFETY: AVX2 support was detected at runtime; lengths checked above.
@@ -792,10 +792,11 @@ impl<'a> Search<'a> {
         let (coeffs, rest) = scratch.split_at_mut(3 * 4096);
         let (err, rest) = rest.split_at_mut(3 * 4096);
         let pix = &mut rest[..4096];
-        let mut cs = coeffs.chunks_exact_mut(4096);
-        let coeffs: [&mut [f32]; 3] = std::array::from_fn(|_| cs.next().unwrap());
-        let mut es = err.chunks_exact_mut(4096);
-        let err: [&mut [f32]; 3] = std::array::from_fn(|_| es.next().unwrap());
+        // `scratch` was split into exactly three 4096-element planes each.
+        let [c0, c1, c2] = coeffs.as_chunks_mut::<4096>().0 else { unreachable!() };
+        let coeffs: [&mut [f32]; 3] = [c0, c1, c2];
+        let [e0, e1, e2] = err.as_chunks_mut::<4096>().0 else { unreachable!() };
+        let err: [&mut [f32]; 3] = [e0, e1, e2];
         // Phase 1: entropy of every channel, Y first. Each channel's cost is
         // non-negative, so the candidate is dropped as soon as the partial
         // sum cannot beat the incumbent -- before any inverse DCT.

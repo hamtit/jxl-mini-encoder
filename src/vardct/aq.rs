@@ -216,7 +216,7 @@ fn mask_band_impl(py: &[f32], w: usize, h: usize, qw: usize, band: usize, mask: 
             di[i] = masking_sqrt((d * d).min(LIMIT));
         }
         let prow = &mut pre[(ry / 4) * qw..(ry / 4 + 1) * qw];
-        for (p, d4) in prow.iter_mut().zip(diff.chunks_exact(4)) {
+        for (p, d4) in prow.iter_mut().zip(diff.as_chunks::<4>().0.iter()) {
             for &v in d4 {
                 *p += v * 0.25;
             }

@@ -1,6 +1,6 @@
 name: CI
 
-# PRs and pushes build/test on Linux x64 and arm64, then verify a source package.
+# PRs and pushes run rustfmt/clippy and build/test on Linux x64 and arm64, then verify a source package.
 # Merging a version bump to main creates v<version> and a GitHub release.
 # Pushing a matching tag is also supported. Nothing is published to crates.io.
 on:
@@ -77,6 +77,21 @@ jobs:
             echo "release=$release"
           } >> "$GITHUB_OUTPUT"
 
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
   build:
     needs: config
     strategy:
@@ -143,7 +158,7 @@ jobs:
 
   release:
     if: needs.config.outputs.release == 'true'
-    needs: [config, package]
+    needs: [config, lint, package]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

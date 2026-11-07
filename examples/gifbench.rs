@@ -14,7 +14,7 @@ fn main() {
     for _ in 0..n {
         dl.push(u(o));
         o += 4;
-        let rgb: Vec<u8> = b[o..o + fsz].chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let rgb: Vec<u8> = b[o..o + fsz].as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
         data.push(rgb);
         o += fsz;
     }

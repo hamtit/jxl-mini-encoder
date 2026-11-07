@@ -833,10 +833,10 @@ impl<const N: usize> Learner<'_, N> {
         // Find the best split; each side picks its own best predictor.
         let mut best: Option<(f64, u8, i32)> = None;
         for (k, &prop) in self.opts.props.iter().enumerate() {
-            if let Some(c) = self.best_split_for(&st, k, prop, &hists) {
-                if best.is_none_or(|b| c.0 < b.0) {
-                    best = Some(c);
-                }
+            if let Some(c) = self.best_split_for(&st, k, prop, &hists)
+                && best.is_none_or(|b| c.0 < b.0)
+            {
+                best = Some(c);
             }
         }
         let Some((cost, prop, val)) = best else {

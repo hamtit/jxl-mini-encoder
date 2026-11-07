@@ -55,7 +55,7 @@ fn estimate_sigma(xyb: &Xyb, w: usize, h: usize) -> f32 {
 /// LUT (10 bit, 8 entries) for the noise to add after coding at `distance`,
 /// or `None` when the content is clean or coding keeps the noise anyway.
 pub fn params(xyb: &Xyb, w: usize, h: usize, distance: f32, gain: f32) -> Option<[u16; 8]> {
-    if !(gain > 0.0) {
+    if gain.is_nan() || gain <= 0.0 {
         return None;
     }
     let sigma = estimate_sigma(xyb, w, h) * (lost_variance(distance)).sqrt() * gain;

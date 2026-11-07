@@ -215,7 +215,12 @@ fn run_band_impl(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2
         for r in 0..rows {
             let y = y0 + r;
             let border_row = r == 0 || r == 7;
-            for (k, (ip, ac)) in isig_px[xs..xe].chunks_exact_mut(8).zip(active[xs..xe].chunks_exact_mut(8)).enumerate()
+            for (k, (ip, ac)) in isig_px[xs..xe]
+                .as_chunks_mut::<8>()
+                .0
+                .iter_mut()
+                .zip(active[xs..xe].as_chunks_mut::<8>().0.iter_mut())
+                .enumerate()
             {
                 let isig = sigmas[rb0 + k];
                 if isig >= MIN_SIGMA {
