@@ -1038,7 +1038,11 @@ impl<'a> Search<'a> {
         let mut current = 0f32;
         for y in cy..cy + h {
             for x in cx..cx + w {
-                if tile.priority[y * 8 + x] >= priority {
+                // Every covered cell must still be a block of its own: the
+                // edge loops only test the first cell, so a cell that belongs
+                // to a block chosen earlier (e.g. the second half of a 16x8
+                // pair in the same 2x2 square) would end up in two varblocks.
+                if tile.priority[y * 8 + x] >= priority || !tile.is_first(x, y) {
                     return;
                 }
                 current += tile.entropy[y * 8 + x];
@@ -1152,11 +1156,11 @@ impl<'a> Search<'a> {
             return;
         }
         self.select_8x8(&mut tile, self.small);
-        const MUL_16X8: f32 = 1.21;
-        const MUL_16X16: f32 = 1.34;
-        const MUL_16X32: f32 = 1.49;
-        const MUL_32X32: f32 = 1.48;
-        const MUL_64: f32 = 2.25;
+        const MUL_16X8: f32 = 0.8439;
+        const MUL_16X16: f32 = 0.9346;
+        const MUL_16X32: f32 = 1.039;
+        const MUL_32X32: f32 = 1.032;
+        const MUL_64: f32 = 1.569;
         // 16x8 / 8x16 / 16x16 on aligned 2x2 squares, rectangles at the edges.
         for cy in (0..h).step_by(2) {
             for cx in (0..w).step_by(2) {

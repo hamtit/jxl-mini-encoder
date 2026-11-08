@@ -61,7 +61,7 @@ impl Params {
                 x_qm_scale += 1;
             }
         }
-        let epf_iters = [0.7, 1.5, 4.0].iter().filter(|&&t| distance >= t).count() as u32;
+        let epf_iters = [0.7, 1.5, 4.0].iter().filter(|&&t| distance >= t * 1.1).count() as u32;
         Params {
             distance,
             x_qm_scale,
@@ -69,7 +69,7 @@ impl Params {
             epf_iters,
             adaptive_quant: effort >= 5,
             choose_transforms: effort >= 5,
-            quant_dc: initial_quant_dc(distance),
+            quant_dc: initial_quant_dc(distance) * 1.657,
         }
     }
 }
@@ -137,6 +137,9 @@ fn epf_sharpness(distance: f32, gaborish: bool) -> i32 {
 /// fades towards high fidelity where the gap closes. From effort 8 libjxl
 /// runs a Butteraugli-driven quantisation loop that yields smaller files at a
 /// lower score, so a coarser quantiser tracks it.
+/// Extra AQ-field scale found by the offline CMA-ES search (see README).
+const AQ_TUNE: f32 = 1.582;
+
 fn aq_calibration(distance: f32, effort: u32) -> f32 {
     match effort {
         ..=5 => 1.0,
@@ -154,7 +157,7 @@ fn initial_quant_dc(distance: f32) -> f32 {
 /// Colour-correlation factors are coded in units of 1/84.
 const CFL_FACTOR: f32 = 84.0;
 /// Cost-proxy gain a tile needs before it leaves the default correlation.
-const CFL_MIN_GAIN: f32 = 12.0;
+const CFL_MIN_GAIN: f32 = 7.534;
 /// Tiles with fewer non-zero Y coefficients keep the default correlation.
 const CFL_MIN_COEFFS: usize = 16;
 
@@ -285,12 +288,12 @@ impl Ctx<'_> {
                     }
                 }
                 let mut hf_mul = i32::from(self.quantizer.raw[aby * self.bw + abx]) + 1;
-                let mut thres_y = [0.56, 0.62, 0.62, 0.62];
+                let mut thres_y = [0.4735, 0.7275, 0.7275, 0.7275];
                 if self.adjust && acs.small().is_none() {
                     let orig = hf_mul;
                     let mut best = 0;
                     for c in [1usize, 0, 2] {
-                        let mut th = [0.58, 0.64, 0.64, 0.64];
+                        let mut th = [0.4692, 0.5962, 0.5962, 0.5962];
                         let mut qn = orig;
                         self.adjust_quant(&coeffs[c][..n], t, c, acs, &mut th, &mut qn);
                         if c == 1 {
@@ -357,8 +360,8 @@ impl Ctx<'_> {
                 coeffs[2][i] = b_all[blk.off + i] - rb * yr[i];
             }
             q[1][..n].copy_from_slice(&qy_all[blk.off..blk.off + n]);
-            self.quantize(&coeffs[0][..n], t, 0, nb, blk.qac, [0.58, 0.62, 0.62, 0.62], &mut q[0]);
-            self.quantize(&coeffs[2][..n], t, 2, nb, blk.qac, [0.58, 0.62, 0.62, 0.62], &mut q[2]);
+            self.quantize(&coeffs[0][..n], t, 0, nb, blk.qac, [0.5387, 0.4818, 0.4818, 0.4818], &mut q[0]);
+            self.quantize(&coeffs[2][..n], t, 2, nb, blk.qac, [0.5387, 0.4818, 0.4818, 0.4818], &mut q[2]);
             self.tokenize(blk.bx, blk.by, blk.acs, &q, &mut nz_row, &mut tokens);
             if self.recon {
                 let (nbx, nby) = blk.acs.blocks();
@@ -453,8 +456,8 @@ impl Ctx<'_> {
         if xs > 1 || ys > 1 {
             for th in thres.iter_mut() {
                 *th -= (0.003 * area).clamp(0.0, 0.08);
-                if *th < 0.54 {
-                    *th = 0.54;
+                if *th < 0.5289 {
+                    *th = 0.530;
                 }
             }
         }
@@ -493,24 +496,24 @@ impl Ctx<'_> {
             }
         }
         if c == 1 && sum_vals * 8.0 < area {
-            const LIMIT: f32 = 0.46;
+            let limit: f32 = 0.5375;
             const MUL: f32 = 0.9999;
             let orig = *quant;
             let mut new_q = *quant;
             for i in 1..4 {
-                if hf_nz[i] == 0.0 && hf_max_err[i] > LIMIT {
+                if hf_nz[i] == 0.0 && hf_max_err[i] > limit {
                     new_q = orig + 1;
                     break;
                 }
             }
             *quant = new_q;
             let r = new_q as f32 / orig as f32;
-            if hf_nz[3] == 0.0 && hf_max_err[3] > LIMIT {
+            if hf_nz[3] == 0.0 && hf_max_err[3] > limit {
                 thres[3] = MUL * hf_max_err[3] * r;
-            } else if (hf_nz[1] == 0.0 && hf_max_err[1] > LIMIT) || (hf_nz[2] == 0.0 && hf_max_err[2] > LIMIT) {
+            } else if (hf_nz[1] == 0.0 && hf_max_err[1] > limit) || (hf_nz[2] == 0.0 && hf_max_err[2] > limit) {
                 thres[1] = MUL * hf_max_err[1].max(hf_max_err[2]) * r;
                 thres[2] = thres[1];
-            } else if hf_nz[0] == 0.0 && hf_max_err[0] > LIMIT {
+            } else if hf_nz[0] == 0.0 && hf_max_err[0] > limit {
                 thres[0] = MUL * hf_max_err[0] * r;
             }
         }
@@ -645,7 +648,7 @@ impl Ctx<'_> {
     ) {
         if c != 1 && nb >= 4 {
             for v in &mut thres {
-                *v = (*v - 0.00744 * nb as f32).max(0.5);
+                *v = (*v - 0.006628 * nb as f32).max(0.5);
             }
         }
         let m = qac * self.qm_mult[c];
@@ -886,8 +889,8 @@ pub fn encode(
     let (mut field, mask1x1, q_median) = if params.adaptive_quant {
         // Without Gaborish, scale the AQ target as libjxl does. Flat
         // graphics avoid the sharpening overshoot and extra edge coefficients.
-        let d_iqf = if gaborish { d } else { d * 0.62 };
-        let maps = aq::initial_quant_field(d_iqf, &xyb, 0.765 / d_iqf, opts.threads);
+        let d_iqf = if gaborish { d } else { d * 0.892 };
+        let maps = aq::initial_quant_field(d_iqf, &xyb, 0.4062 / d_iqf, opts.threads);
         (maps.quant_field, maps.mask1x1, 0.39 / d)
     } else {
         let q = 0.79 / d;
@@ -903,7 +906,7 @@ pub fn encode(
     if gaborish {
         xyb::gaborish_inverse(&mut xyb, opts.threads);
     }
-    let qk = if params.adaptive_quant { aq_calibration(d, opts.effort) } else { 1.0 };
+    let qk = if params.adaptive_quant { aq_calibration(d, opts.effort) * AQ_TUNE } else { 1.0 };
     field.iter_mut().for_each(|v| *v *= qk);
     let q_median = q_median * qk;
     let dct = Dct::new();

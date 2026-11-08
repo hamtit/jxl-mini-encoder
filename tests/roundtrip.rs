@@ -732,3 +732,89 @@ fn animation_lossless_keeps_hidden_rgb_of_transparent_pixels() {
         assert!(data == direct(p), "frame {i} differs from replace coding");
     }
 }
+
+/// A 96x64 crop of a UI-like screenshot: two white cards with rounded corners on
+/// a grey background and a thin blue chart line. Each entry is
+/// `"<row repeat> <colour><run length> ..."`, with `.` background, `w` card,
+/// `o` card outline and `B` chart line.
+const UI_CROP: [&str; 31] = [
+    "1 w9 B11 w24 o1 .17 o1 w33",
+    "1 w2 B8 w9 B4 w21 o1 .17 o1 w33",
+    "1 B3 w19 B3 w19 o1 .17 o1 w33",
+    "1 B1 w23 B4 w16 o1 .17 o1 w33",
+    "1 w27 B4 w13 o1 .17 o1 w33",
+    "1 w30 B1 w13 o1 .17 o1 w33",
+    "2 w44 o1 .17 o1 w33",
+    "1 w44 o1 .17 o1 w28 B2 w3",
+    "1 w44 o1 .17 o1 w27 B6",
+    "1 w44 o1 .17 o1 w26 B3 w4",
+    "1 w44 o1 .17 o1 w25 B3 w5",
+    "1 w44 o1 .17 o1 w24 B3 w6",
+    "1 w44 o1 .17 o1 w23 B3 w7",
+    "1 w44 o1 .17 o1 w22 B3 w8",
+    "1 w44 o1 .17 o1 w20 B4 w9",
+    "1 w44 o1 .17 o1 w19 B3 w11",
+    "1 w44 o1 .17 o1 w18 B3 w12",
+    "1 w44 o1 .17 o1 w17 B3 w13",
+    "1 w44 o1 .17 o1 w16 B3 w14",
+    "1 w44 o1 .17 o1 w15 B3 w15",
+    "1 w44 o1 .17 o1 w14 B3 w16",
+    "1 w44 o1 .17 o1 w15 B1 w17",
+    "23 w44 o1 .17 o1 w33",
+    "2 w43 o1 .19 o1 w32",
+    "2 w42 o1 .21 o1 w31",
+    "1 w41 o1 .23 o1 w30",
+    "1 w40 o1 .25 o1 w29",
+    "1 w38 o2 .27 o2 w27",
+    "1 w36 o2 .31 o2 w25",
+    "1 o36 .35 o25",
+    "9 .96",
+];
+
+fn ui_crop() -> (usize, usize, Vec<u8>) {
+    let colour = |c: char| match c {
+        '.' => [245, 246, 248],
+        'w' => [255, 255, 255],
+        'o' => [220, 222, 228],
+        'B' => [60, 120, 230],
+        _ => unreachable!(),
+    };
+    let mut px = Vec::new();
+    let mut rows = 0;
+    for entry in UI_CROP {
+        let mut parts = entry.split(' ');
+        let repeat: usize = parts.next().unwrap().parse().unwrap();
+        let mut row = Vec::new();
+        for run in parts {
+            let n: usize = run[1..].parse().unwrap();
+            for _ in 0..n {
+                row.extend_from_slice(&colour(run.chars().next().unwrap()));
+            }
+        }
+        assert_eq!(row.len(), 96 * 3);
+        for _ in 0..repeat {
+            px.extend_from_slice(&row);
+        }
+        rows += repeat;
+    }
+    (96, rows, px)
+}
+
+/// With 16x8 / 8x16 pairs favoured by the transform search, the edge merge of
+/// a tile's last column used to put a 16x8 block on a cell already covered by
+/// an 8x16 block of the same 2x2 square, so the varblocks overlapped and
+/// decoders rejected the file.
+#[test]
+fn edge_merge_does_not_overlap_blocks() {
+    let (w, h, px) = ui_crop();
+    assert_eq!(h, 64);
+    let img = jxl_mini_encoder::ImageRef::rgb8(w as u32, h as u32, &px).unwrap();
+    for quality in [30.0, 40.0, 50.0, 65.0] {
+        for effort in [5, 7] {
+            let jxl = jxl_mini_encoder::Encoder::new().quality(quality).effort(effort).threads(2).encode(&img).unwrap();
+            let (dw, dh, ch, data) = decode(&jxl);
+            assert_eq!((dw, dh, ch), (w as u32, h as u32, 3));
+            assert!(psnr(&px, &data) > 20.0, "q{quality} e{effort}");
+        }
+    }
+}

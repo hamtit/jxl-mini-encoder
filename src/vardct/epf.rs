@@ -13,7 +13,7 @@ use crate::parallel::{par_map, par_tasks};
 const MIN_SIGMA: f32 = -3.905_243;
 const INV_SIGMA_NUM: f32 = -1.171_572_9;
 const QUANT_MUL: f32 = 0.46;
-const CHANNEL_SCALE: [f32; 3] = [40.0, 5.0, 3.5];
+const CHANNEL_SCALE: [f32; 3] = [40.18, 3.487, 3.016];
 const BORDER_SAD_MUL: f32 = 2.0 / 3.0;
 const PAD: usize = 3;
 /// Pixels per tile in the filter passes.
