@@ -5,7 +5,7 @@ mod ans;
 
 use crate::bit_writer::{BitWriter, bits_for};
 use crate::parallel::par_map;
-use ans::{AnsDist, estimate_cost, estimate_merged_cost};
+use ans::{AnsDist, estimate_cost, estimate_merged_cost, estimate_removed_cost};
 
 /// A value to be entropy coded in a given context.
 ///
@@ -112,11 +112,14 @@ pub struct CodeOptions {
     pub tune_configs: bool,
     /// Worker threads for the histogram and tuning passes.
     pub threads: usize,
+    /// Rounds of re-assigning contexts to clusters after the seeding (only
+    /// worth it for codes with many sparse contexts).
+    pub refine_rounds: usize,
 }
 
 impl Default for CodeOptions {
     fn default() -> Self {
-        CodeOptions { max_clusters: 64, tune_configs: true, threads: 1 }
+        CodeOptions { max_clusters: 64, tune_configs: true, threads: 1, refine_rounds: 0 }
     }
 }
 
@@ -225,7 +228,7 @@ fn merged_cost(a: &[u32], b: &[u32]) -> f64 {
 }
 
 /// Group contexts with similar statistics. Returns the context map.
-fn cluster(hists: &[Vec<u32>], max_clusters: usize) -> (Vec<u8>, usize) {
+fn cluster(hists: &[Vec<u32>], max_clusters: usize, refine_rounds: usize) -> (Vec<u8>, usize) {
     let max_clusters = max_clusters.clamp(1, 255);
     let used: Vec<usize> = (0..hists.len()).filter(|&i| hists[i].iter().any(|&c| c > 0)).collect();
     if used.is_empty() {
@@ -270,6 +273,41 @@ fn cluster(hists: &[Vec<u32>], max_clusters: usize) -> (Vec<u8>, usize) {
                 .0;
             assign[i] = best;
             add_into(&mut cluster_hist[best], &hists[i]);
+        }
+        // Refinement (k-means style): move each context to the cluster where
+        // it costs least, now that the clusters, not just their seeds, are
+        // known. Sparse contexts in particular end up better placed.
+        let mut ccost: Vec<f64> = cluster_hist.iter().map(|h| estimate_cost(h)).collect();
+        for _ in 0..refine_rounds {
+            let mut moved = 0;
+            for &i in &used {
+                let k0 = assign[i];
+                let h = &hists[i];
+                let without_cost = estimate_removed_cost(&cluster_hist[k0], h);
+                let mut best = (ccost[k0] - without_cost, k0);
+                for (k, (ch, &cc)) in cluster_hist.iter().zip(&ccost).enumerate() {
+                    if k != k0 {
+                        let d = merged_cost(ch, h) - cc;
+                        if d < best.0 {
+                            best = (d, k);
+                        }
+                    }
+                }
+                if best.1 != k0 {
+                    let k = best.1;
+                    for (c, &v) in cluster_hist[k0].iter_mut().zip(h) {
+                        *c -= v;
+                    }
+                    ccost[k0] = without_cost;
+                    add_into(&mut cluster_hist[k], h);
+                    ccost[k] = estimate_cost(&cluster_hist[k]);
+                    assign[i] = k;
+                    moved += 1;
+                }
+            }
+            if moved == 0 {
+                break;
+            }
         }
     }
     // Greedy pairwise merging while it saves bits.
@@ -363,7 +401,8 @@ impl EntropyCode {
                 add_into(d, s);
             }
         }
-        let (context_map, num_clusters) = if num_ctx == 1 { (vec![0], 1) } else { cluster(&hists, opts.max_clusters) };
+        let (context_map, num_clusters) =
+            if num_ctx == 1 { (vec![0], 1) } else { cluster(&hists, opts.max_clusters, opts.refine_rounds) };
         // Pick a hybrid-uint config per cluster.
         let mut configs = vec![HybridUint::DEFAULT; num_clusters];
         if opts.tune_configs {
@@ -452,67 +491,7 @@ impl EntropyCode {
     }
 
     fn write_context_map(&self, w: &mut BitWriter) {
-        let n = self.context_map.len();
-        if n == 1 {
-            return;
-        }
-        let max = *self.context_map.iter().max().unwrap() as u32;
-        let nbits = bits_for(max);
-        let simple_bits = if nbits <= 3 { Some(3 + n * nbits as usize) } else { None };
-        // Even an empty ANS stream has a 32-bit state. Tiny simple maps
-        // cannot benefit from building an entropy code (with or without MTF).
-        if let Some(bits) = simple_bits
-            && bits <= 32
-        {
-            w.write_bool(true);
-            w.write(2, u64::from(nbits));
-            for &c in &self.context_map {
-                w.write(nbits, u64::from(c));
-            }
-            return;
-        }
-        // Entropy-coded alternative.
-        let tokens: Vec<Token> = self.context_map.iter().map(|&c| Token::new(0, u32::from(c))).collect();
-        let code = EntropyCode::build(&[&tokens], 1, CodeOptions { max_clusters: 1, tune_configs: true, threads: 1 });
-        let mut coded = BitWriter::new();
-        coded.write_bool(false); // no MTF
-        code.write_header(&mut coded);
-        code.write_tokens(&tokens, &mut coded);
-
-        // MTF can make runs of related contexts much cheaper. Compare actual
-        // encoded headers so it is never selected just on an entropy estimate.
-        let mut order: Vec<u8> = (0..=255).collect();
-        let mtf_tokens: Vec<Token> = self
-            .context_map
-            .iter()
-            .map(|&c| {
-                let index = order.iter().position(|&v| v == c).unwrap();
-                order[..=index].rotate_right(1);
-                Token::new(0, index as u32)
-            })
-            .collect();
-        let mtf_code =
-            EntropyCode::build(&[&mtf_tokens], 1, CodeOptions { max_clusters: 1, tune_configs: true, threads: 1 });
-        let mut mtf = BitWriter::new();
-        mtf.write_bool(true);
-        mtf_code.write_header(&mut mtf);
-        mtf_code.write_tokens(&mtf_tokens, &mut mtf);
-        if mtf.bits_written() < coded.bits_written() {
-            coded = mtf;
-        }
-        match simple_bits {
-            Some(bits) if bits <= coded.bits_written() => {
-                w.write_bool(true);
-                w.write(2, u64::from(nbits));
-                for &c in &self.context_map {
-                    w.write(nbits, u64::from(c));
-                }
-            }
-            _ => {
-                w.write_bool(false);
-                w.append(&coded);
-            }
-        }
+        write_context_map(&self.context_map, w);
     }
 
     /// Write an ANS stream of tokens (initial state followed by interleaved
@@ -543,6 +522,70 @@ impl EntropyCode {
                 w.write(16, u64::from(*r));
             }
             w.write(n, u64::from(b));
+        }
+    }
+}
+
+/// Write a context map (simple, entropy-coded or MTF + entropy-coded,
+/// whichever is smallest).
+pub fn write_context_map(context_map: &[u8], w: &mut BitWriter) {
+    let n = context_map.len();
+    if n == 1 {
+        return;
+    }
+    let max = *context_map.iter().max().unwrap() as u32;
+    let nbits = bits_for(max);
+    let simple_bits = if nbits <= 3 { Some(3 + n * nbits as usize) } else { None };
+    // Even an empty ANS stream has a 32-bit state. Tiny simple maps
+    // cannot benefit from building an entropy code (with or without MTF).
+    if let Some(bits) = simple_bits
+        && bits <= 32
+    {
+        w.write_bool(true);
+        w.write(2, u64::from(nbits));
+        for &c in context_map {
+            w.write(nbits, u64::from(c));
+        }
+        return;
+    }
+    // Entropy-coded alternative.
+    let tokens: Vec<Token> = context_map.iter().map(|&c| Token::new(0, u32::from(c))).collect();
+    let code = EntropyCode::build(&[&tokens], 1, CodeOptions { max_clusters: 1, ..CodeOptions::default() });
+    let mut coded = BitWriter::new();
+    coded.write_bool(false); // no MTF
+    code.write_header(&mut coded);
+    code.write_tokens(&tokens, &mut coded);
+
+    // MTF can make runs of related contexts much cheaper. Compare actual
+    // encoded headers so it is never selected just on an entropy estimate.
+    let mut order: Vec<u8> = (0..=255).collect();
+    let mtf_tokens: Vec<Token> = context_map
+        .iter()
+        .map(|&c| {
+            let index = order.iter().position(|&v| v == c).unwrap();
+            order[..=index].rotate_right(1);
+            Token::new(0, index as u32)
+        })
+        .collect();
+    let mtf_code = EntropyCode::build(&[&mtf_tokens], 1, CodeOptions { max_clusters: 1, ..CodeOptions::default() });
+    let mut mtf = BitWriter::new();
+    mtf.write_bool(true);
+    mtf_code.write_header(&mut mtf);
+    mtf_code.write_tokens(&mtf_tokens, &mut mtf);
+    if mtf.bits_written() < coded.bits_written() {
+        coded = mtf;
+    }
+    match simple_bits {
+        Some(bits) if bits <= coded.bits_written() => {
+            w.write_bool(true);
+            w.write(2, u64::from(nbits));
+            for &c in context_map {
+                w.write(nbits, u64::from(c));
+            }
+        }
+        _ => {
+            w.write_bool(false);
+            w.append(&coded);
         }
     }
 }

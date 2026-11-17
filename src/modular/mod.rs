@@ -178,6 +178,7 @@ impl ModularOptions {
                 max_clusters: if effort >= 5 { 128 } else { 32 },
                 tune_configs: effort >= 3,
                 threads: 1,
+                refine_rounds: 0,
             },
         }
     }
