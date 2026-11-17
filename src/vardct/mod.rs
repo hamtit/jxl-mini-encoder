@@ -792,15 +792,37 @@ pub(crate) fn noise_level(img: &ImageRef) -> u32 {
     let step = ((w * h) / 250_000).max(1).isqrt().max(1);
     let mut hist = [0u32; 1021];
     let mut n = 0u32;
-    for y in (1..h - 1).step_by(step) {
-        for x in (1..w - 1).step_by(step) {
-            let l = 4 * luma(x, y) as i32
-                - luma(x - 1, y) as i32
-                - luma(x + 1, y) as i32
-                - luma(x, y - 1) as i32
-                - luma(x, y + 1) as i32;
-            hist[l.unsigned_abs() as usize] += 1;
-            n += 1;
+    if step == 1 {
+        // Every pixel is sampled: compute each luma value once, three rows
+        // at a time, instead of five times.
+        let luma_row = |y: usize, row: &mut [i32]| {
+            for (x, l) in row.iter_mut().enumerate() {
+                *l = luma(x, y) as i32;
+            }
+        };
+        let mut rows = [vec![0i32; w], vec![0i32; w], vec![0i32; w]];
+        luma_row(0, &mut rows[0]);
+        luma_row(1, &mut rows[1]);
+        for y in 1..h - 1 {
+            luma_row(y + 1, &mut rows[(y + 1) % 3]);
+            let (up, mid, down) = (&rows[(y - 1) % 3], &rows[y % 3], &rows[(y + 1) % 3]);
+            for x in 1..w - 1 {
+                let l = 4 * mid[x] - mid[x - 1] - mid[x + 1] - up[x] - down[x];
+                hist[l.unsigned_abs() as usize] += 1;
+            }
+            n += (w - 2) as u32;
+        }
+    } else {
+        for y in (1..h - 1).step_by(step) {
+            for x in (1..w - 1).step_by(step) {
+                let l = 4 * luma(x, y) as i32
+                    - luma(x - 1, y) as i32
+                    - luma(x + 1, y) as i32
+                    - luma(x, y - 1) as i32
+                    - luma(x, y + 1) as i32;
+                hist[l.unsigned_abs() as usize] += 1;
+                n += 1;
+            }
         }
     }
     let mut acc = 0;

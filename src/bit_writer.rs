@@ -188,15 +188,19 @@ pub fn pack_f16(v: f32) -> u16 {
     sign | (r >> 13).min(0x7bff) as u16
 }
 
-/// Inverse of `pack_f16`.
+/// Inverse of `pack_f16`. Pure bit manipulation (no `powi`): this runs once
+/// per reconstructed sample in the EPF selection.
+#[inline]
 pub fn unpack_f16(h: u16) -> f32 {
-    let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
-    let exp = i32::from((h >> 10) & 0x1f);
-    let mant = f32::from(h & 0x3ff);
-    if exp == 0 {
-        return sign * mant / 16_777_216.0;
+    let h = u32::from(h);
+    let sign = (h & 0x8000) << 16;
+    let em = h & 0x7fff;
+    if em < 0x400 {
+        // Zero or subnormal: exactly mant * 2^-24.
+        return f32::from_bits((em as f32 * (1.0 / 16_777_216.0)).to_bits() | sign);
     }
-    sign * (1.0 + mant / 1024.0) * 2f32.powi(exp - 15)
+    // Rebias the exponent from 15 to 127 and widen the mantissa.
+    f32::from_bits(sign | ((em << 13) + 0x3800_0000))
 }
 
 /// `ceil(log2(x + 1))`: the number of bits needed to store values up to `x`.
@@ -218,6 +222,25 @@ mod tests {
         for &v in &[0.0f32, 1e-9, 3e-5, 6.1e-5, 0.01, -0.03, 0.5, 0.8573, -1.2, 100.0] {
             let r = unpack_f16(pack_f16(v));
             assert!((r - v).abs() <= v.abs() / 1024.0 + 3e-8, "{v} -> {r}");
+        }
+    }
+
+    #[test]
+    fn unpack_f16_is_exact() {
+        for h in 0..=0x7bffu16 {
+            for s in [0u16, 0x8000] {
+                let v = h | s;
+                let sign = if v & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+                let exp = i32::from((v >> 10) & 0x1f);
+                let mant = f32::from(v & 0x3ff);
+                let want = if exp == 0 {
+                    sign * mant / 16_777_216.0
+                } else {
+                    sign * (1.0 + mant / 1024.0) * 2f32.powi(exp - 15)
+                };
+                assert_eq!(unpack_f16(v).to_bits(), want.to_bits(), "{v:#x}");
+                assert_eq!(pack_f16(unpack_f16(v)), v, "{v:#x}");
+            }
         }
     }
 
