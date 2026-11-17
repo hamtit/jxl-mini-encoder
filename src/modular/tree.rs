@@ -156,7 +156,7 @@ impl Tree {
                 }
             }
         }
-        write_stream(&tokens, 6, CodeOptions { max_clusters: 6, tune_configs: true, threads: 1 }, w);
+        write_stream(&tokens, 6, CodeOptions { max_clusters: 6, ..CodeOptions::default() }, w);
     }
 
     /// Tokenise a list of channels forming one modular stream.

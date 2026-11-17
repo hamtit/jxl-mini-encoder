@@ -110,6 +110,11 @@ pub fn estimate_merged_cost(a: &[u32], b: &[u32]) -> f64 {
     )
 }
 
+/// Cost of `a` with the counts of `b` (a part of it) removed.
+pub fn estimate_removed_cost(a: &[u32], b: &[u32]) -> f64 {
+    estimate_cost_counts((0..a.len()).map(|i| a[i] - b.get(i).copied().unwrap_or(0)))
+}
+
 /// Histogram clustering repeatedly evaluates small integer counts. Tabulating
 /// c*log2(c) avoids a transcendental call per occupied bin, and the entropy is
 /// then xlogx(total) - sum(xlogx(count)). Use f64 to keep tie decisions stable.

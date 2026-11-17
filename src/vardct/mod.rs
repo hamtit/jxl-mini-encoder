@@ -2,9 +2,11 @@
 
 mod acs;
 mod aq;
+mod blockctx;
 mod dct;
 mod epf;
 mod noise;
+mod order;
 mod quant;
 mod small;
 #[cfg(test)]
@@ -17,19 +19,14 @@ use crate::bit_writer::{ceil_log2, pack_f16, unpack_f16};
 use crate::entropy::{CodeOptions, EntropyCode, Token, pack_signed};
 use crate::headers::{Encoding, FrameInfo, FramePlacement, GROUP_DIM, Layout, write_frame_header, write_sections};
 use crate::modular::{Channel, GlobalTree, ModularOptions, write_header, write_standalone};
-use crate::parallel::par_map;
+use crate::parallel::{par_map, par_tasks};
 use crate::{EncoderOptions, ImageRef};
 use acs::{Acs, BlockAcs, SearchInput, Tables};
+use blockctx::BlockCtxMap;
 use dct::Dct;
 use quant::{Quantizer, dequant_bias};
 use xyb::Xyb;
 
-const NUM_BLOCK_CLUSTERS: u32 = 15;
-const BLOCK_CTX_MAP: [u8; 39] = [
-    0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6, //
-    7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14, //
-    7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
-];
 const COEFF_FREQ_CONTEXT: [u16; 63] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22, 22,
     23, 23, 23, 23, 24, 24, 24, 24, 25, 25, 25, 25, 26, 26, 26, 26, 27, 27, 27, 27, 28, 28, 28, 28, 29, 29, 29, 29, 30,
@@ -40,7 +37,6 @@ const COEFF_NUM_NONZERO_CONTEXT: [u16; 63] = [
     180, 180, 180, 180, 180, 180, 180, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206,
     206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206,
 ];
-const NUM_HF_CTX: usize = 495 * NUM_BLOCK_CLUSTERS as usize;
 
 /// Distance-dependent encoder parameters.
 struct Params {
@@ -77,24 +73,38 @@ impl Params {
 /// libjxl's pixel statistics for chromacity adjustment (effort >= 7): the
 /// largest neighbour differences in X and B raise the X/B quantisation
 /// multipliers on saturated, high-contrast content.
-fn chroma_scales(xyb: &Xyb, w: usize, h: usize) -> (u32, u32) {
+fn chroma_scales(xyb: &Xyb, w: usize, h: usize, threads: usize) -> (u32, u32) {
     let stride = xyb.w;
     let (px, py, pb) = (&xyb.planes[0], &xyb.planes[1], &xyb.planes[2]);
-    let (mut dx, mut db, mut exposed) = (0f32, 0f32, 0f32);
-    for y in 1..h {
-        for x in 1..w {
-            let i = y * stride + x;
-            dx = dx.max((px[i] - px[i - 1]).abs()).max((px[i] - px[i - stride]).abs());
-            let diff = pb[i] - py[i];
-            let diff_prev = pb[i - 1] - py[i - 1];
-            let diff_row = pb[i - stride] - py[i - stride];
-            db = db.max((diff - diff_prev).abs()).max((diff - diff_row).abs());
-            let exposed_b = pb[i] - py[i] * 1.2;
-            if exposed_b >= 0.0 {
-                let edge = (pb[i] - pb[i - 1]).abs() + (pb[i] - pb[i - stride]).abs();
-                exposed = exposed.max(exposed_b * edge);
+    // Maxima over bands of rows, in parallel (a maximum does not depend on
+    // the order of evaluation).
+    let rows = h.saturating_sub(1);
+    let bands = threads.clamp(1, rows.div_ceil(64).max(1));
+    let per = rows.div_ceil(bands).max(1);
+    let parts = par_map(bands, threads, |k| {
+        let (mut dx, mut db, mut exposed) = (0f32, 0f32, 0f32);
+        for y in 1 + k * per..(1 + (k + 1) * per).min(h) {
+            for x in 1..w {
+                let i = y * stride + x;
+                dx = dx.max((px[i] - px[i - 1]).abs()).max((px[i] - px[i - stride]).abs());
+                let diff = pb[i] - py[i];
+                let diff_prev = pb[i - 1] - py[i - 1];
+                let diff_row = pb[i - stride] - py[i - stride];
+                db = db.max((diff - diff_prev).abs()).max((diff - diff_row).abs());
+                let exposed_b = pb[i] - py[i] * 1.2;
+                if exposed_b >= 0.0 {
+                    let edge = (pb[i] - pb[i - 1]).abs() + (pb[i] - pb[i - stride]).abs();
+                    exposed = exposed.max(exposed_b * edge);
+                }
             }
         }
+        (dx, db, exposed)
+    });
+    let (mut dx, mut db, mut exposed) = (0f32, 0f32, 0f32);
+    for (a, b, c) in parts {
+        dx = dx.max(a);
+        db = db.max(b);
+        exposed = exposed.max(c);
     }
     let x_extra = match dx {
         v if v >= 0.026 => 3,
@@ -215,6 +225,8 @@ struct Blk {
     acs: Acs,
     qac: f32,
     off: usize,
+    /// Quantiser multiplier (1..=256).
+    qf: u32,
 }
 
 /// Shared read-only state for coding groups.
@@ -231,6 +243,7 @@ struct Ctx<'a> {
     adjust: bool,
     /// Also reconstruct the decoded image (for the EPF strength choice).
     recon: bool,
+    block_ctx: &'a BlockCtxMap,
 }
 
 /// Output of coding one group: HF tokens and the block LF values.
@@ -320,7 +333,7 @@ impl Ctx<'_> {
                         };
                     }
                 }
-                blks.push(Blk { bx, by, acs, qac, off: x_all.len() });
+                blks.push(Blk { bx, by, acs, qac, qf: hf_mul as u32, off: x_all.len() });
                 if self.recon {
                     y_all.extend_from_slice(&coeffs[1][..n]);
                 }
@@ -362,7 +375,7 @@ impl Ctx<'_> {
             q[1][..n].copy_from_slice(&qy_all[blk.off..blk.off + n]);
             self.quantize(&coeffs[0][..n], t, 0, nb, blk.qac, [0.5387, 0.4818, 0.4818, 0.4818], &mut q[0]);
             self.quantize(&coeffs[2][..n], t, 2, nb, blk.qac, [0.5387, 0.4818, 0.4818, 0.4818], &mut q[2]);
-            self.tokenize(blk.bx, blk.by, blk.acs, &q, &mut nz_row, &mut tokens);
+            self.tokenize(blk.bx, blk.by, blk.acs, blk.qf, &q, &mut nz_row, &mut tokens);
             if self.recon {
                 let (nbx, nby) = blk.acs.blocks();
                 let inv_qac = 1.0 / blk.qac;
@@ -665,6 +678,7 @@ impl Ctx<'_> {
         bx: usize,
         by: usize,
         acs: Acs,
+        qf: u32,
         q: &[Vec<i32>; 3],
         nz_row: &mut [Vec<u32>; 3],
         out: &mut Vec<Token>,
@@ -675,7 +689,8 @@ impl Ctx<'_> {
         let (nbx, _) = acs.blocks();
         let order = &t.order[nb..];
         for (ci, c) in [(0usize, 1usize), (1, 0), (2, 2)] {
-            let block_ctx = u32::from(BLOCK_CTX_MAP[ci * 13 + acs.order_id()]);
+            let num = self.block_ctx.num;
+            let block_ctx = self.block_ctx.ctx(ci, acs.order_id(), qf);
             let row = &mut nz_row[c];
             let predicted = match (bx, by) {
                 (0, 0) => 32,
@@ -686,30 +701,51 @@ impl Ctx<'_> {
             let nz_ctx_idx = if predicted >= 8 { 4 + predicted / 2 } else { predicted };
             let qc = &q[c];
             let nz = order.iter().filter(|&&p| qc[p as usize] != 0).count() as u32;
-            out.push(Token::new(block_ctx + nz_ctx_idx * NUM_BLOCK_CLUSTERS, nz));
+            out.push(Token::new(block_ctx + nz_ctx_idx * num, nz));
             let val = (nz + nb as u32 - 1) >> log;
             row[bx..bx + nbx].fill(val);
             if nz == 0 {
                 continue;
             }
-            let base = 37 * NUM_BLOCK_CLUSTERS + block_ctx * 458;
-            let mut prev = u32::from(nz <= nb as u32 * 4);
-            let mut remaining = nz;
-            for (idx, &p) in order.iter().enumerate() {
-                let v = qc[p as usize];
-                let ctx = base
-                    + (u32::from(COEFF_NUM_NONZERO_CONTEXT[((remaining - 1) >> log) as usize])
-                        + u32::from(COEFF_FREQ_CONTEXT[idx >> log]))
-                        * 2
-                    + prev;
-                out.push(Token::new(ctx, pack_signed(v)));
-                prev = u32::from(v != 0);
-                if v != 0 {
-                    remaining -= 1;
-                    if remaining == 0 {
-                        break;
-                    }
-                }
+            emit_coeffs(
+                coeff_ctx_base(num, block_ctx),
+                nz,
+                log,
+                order.len(),
+                |idx| pack_signed(qc[order[idx] as usize]),
+                |t| out.push(t),
+            );
+        }
+    }
+}
+
+/// First coefficient context of block context `block_ctx` (of `num`).
+#[inline]
+fn coeff_ctx_base(num: u32, block_ctx: u32) -> u32 {
+    37 * num + block_ctx * 458
+}
+
+/// Tokens of the HF coefficients of one block and channel, `nz` of them
+/// non-zero, with contexts from `base` (see `coeff_ctx_base`): `value(idx)`
+/// is the packed coefficient at position `idx` of the coefficient order
+/// (after the LLF positions); coding stops after the last non-zero one.
+#[inline(always)]
+fn emit_coeffs(base: u32, nz: u32, log: u32, len: usize, value: impl Fn(usize) -> u32, mut out: impl FnMut(Token)) {
+    let mut prev = u32::from(nz <= 4 << log);
+    let mut remaining = nz;
+    for idx in 0..len {
+        let v = value(idx);
+        let ctx = base
+            + (u32::from(COEFF_NUM_NONZERO_CONTEXT[((remaining - 1) >> log) as usize])
+                + u32::from(COEFF_FREQ_CONTEXT[idx >> log]))
+                * 2
+            + prev;
+        out(Token::new(ctx, v));
+        prev = u32::from(v != 0);
+        if v != 0 {
+            remaining -= 1;
+            if remaining == 0 {
+                break;
             }
         }
     }
@@ -792,15 +828,37 @@ pub(crate) fn noise_level(img: &ImageRef) -> u32 {
     let step = ((w * h) / 250_000).max(1).isqrt().max(1);
     let mut hist = [0u32; 1021];
     let mut n = 0u32;
-    for y in (1..h - 1).step_by(step) {
-        for x in (1..w - 1).step_by(step) {
-            let l = 4 * luma(x, y) as i32
-                - luma(x - 1, y) as i32
-                - luma(x + 1, y) as i32
-                - luma(x, y - 1) as i32
-                - luma(x, y + 1) as i32;
-            hist[l.unsigned_abs() as usize] += 1;
-            n += 1;
+    if step == 1 {
+        // Every pixel is sampled: compute each luma value once, three rows
+        // at a time, instead of five times.
+        let luma_row = |y: usize, row: &mut [i32]| {
+            for (x, l) in row.iter_mut().enumerate() {
+                *l = luma(x, y) as i32;
+            }
+        };
+        let mut rows = [vec![0i32; w], vec![0i32; w], vec![0i32; w]];
+        luma_row(0, &mut rows[0]);
+        luma_row(1, &mut rows[1]);
+        for y in 1..h - 1 {
+            luma_row(y + 1, &mut rows[(y + 1) % 3]);
+            let (up, mid, down) = (&rows[(y - 1) % 3], &rows[y % 3], &rows[(y + 1) % 3]);
+            for x in 1..w - 1 {
+                let l = 4 * mid[x] - mid[x - 1] - mid[x + 1] - up[x] - down[x];
+                hist[l.unsigned_abs() as usize] += 1;
+            }
+            n += (w - 2) as u32;
+        }
+    } else {
+        for y in (1..h - 1).step_by(step) {
+            for x in (1..w - 1).step_by(step) {
+                let l = 4 * luma(x, y) as i32
+                    - luma(x - 1, y) as i32
+                    - luma(x + 1, y) as i32
+                    - luma(x, y - 1) as i32
+                    - luma(x, y + 1) as i32;
+                hist[l.unsigned_abs() as usize] += 1;
+                n += 1;
+            }
         }
     }
     let mut acc = 0;
@@ -860,7 +918,7 @@ pub fn encode(
     });
     let xyb = Xyb::from_srgb8(img.data, img.channels(), w, h, bw * 8, bh * 8, opts.threads);
     if opts.effort >= 7 && std::env::var_os("MINI_NO_CHROMA_ADJUST").is_none() {
-        let (x, b) = chroma_scales(&xyb, w, h);
+        let (x, b) = chroma_scales(&xyb, w, h, opts.threads);
         params.x_qm_scale = params.x_qm_scale.max(x);
         params.b_qm_scale = b;
     }
@@ -951,6 +1009,11 @@ pub fn encode(
         acs::adjust_quant_field(&acs_map, bw, d, &mut field);
     }
     let mut quantizer = Quantizer::new(params.quant_dc, q_median, &field);
+    let block_ctx = if opts.effort >= 4 {
+        BlockCtxMap::choose(&quantizer.raw, &acs_map, bw, d)
+    } else {
+        BlockCtxMap::default_map()
+    };
     drop(field);
     let layout = Layout::new(w, h);
     let ng = layout.num_groups();
@@ -967,6 +1030,7 @@ pub fn encode(
             dct: &dct,
             adjust: params.adaptive_quant && std::env::var_os("MINI_NO_ADJUST_QUANT").is_none(),
             recon: dynamic_epf,
+            block_ctx: &block_ctx,
         };
         par_map(ng, opts.threads, |g| ctx.code_group(g))
     };
@@ -1055,26 +1119,33 @@ pub fn encode(
         }
     }
 
-    let mopts = ModularOptions::for_effort(opts.effort.min(4), bw * bh * 3).with_threads(opts.threads.div_ceil(nlf));
-    let lf_sections: Vec<BitWriter> = par_map(nlf, opts.threads, |i| {
-        let (x, y, lw, lh) = layout.lf_group_rect(i);
-        let (lbx, lby, lbw, lbh) = (x / 8, y / 8, lw.div_ceil(8), lh.div_ceil(8));
-        let mut s = BitWriter::new();
-        s.write(2, 0); // extra precision
-        let crops: Vec<Channel> = lf.iter().map(|c| c.crop(lbx, lby, lbw, lbh)).collect();
-        let refs: Vec<&Channel> = crops.iter().collect();
-        // The LF image and the HF metadata are independent streams: code the
-        // LF image on a worker and append both in order.
-        std::thread::scope(|sc| {
-            let lf_fn = || {
-                let mut b = BitWriter::new();
-                write_standalone(&mut b, &refs, (1 + i) as u32, &[], &mopts);
-                b
-            };
-            // A single-thread encode stays on the calling thread.
-            let lf_job = (opts.threads > 1).then(|| sc.spawn(lf_fn));
+    // The LF image and the HF metadata below are coded on a worker while the
+    // HF tokens are reordered and their entropy code is built (not during the
+    // EPF choice, where the memory use peaks). The worker gets one thread per
+    // LF group (the modular coding of one LF group is mostly serial) and at
+    // most half of the threads; the calling thread keeps the rest, so the
+    // total stays within the requested threads. A single-thread encode does
+    // everything on the calling thread.
+    let side_threads = nlf.min(opts.threads / 2).max(1);
+    let main_threads = if opts.threads > 1 { opts.threads - side_threads } else { 1 };
+    let mopts = ModularOptions::for_effort(opts.effort.min(4), bw * bh * 3).with_threads(side_threads.div_ceil(nlf));
+    let lf_images = || {
+        par_map(nlf, side_threads, |i| {
+            let (x, y, lw, lh) = layout.lf_group_rect(i);
+            let crops: Vec<Channel> = lf.iter().map(|c| c.crop(x / 8, y / 8, lw.div_ceil(8), lh.div_ceil(8))).collect();
+            let refs: Vec<&Channel> = crops.iter().collect();
+            let mut b = BitWriter::new();
+            write_standalone(&mut b, &refs, (1 + i) as u32, &[], &mopts);
+            b
+        })
+    };
+    // HF metadata of each LF group: colour correlation maps, block types and
+    // quant field, EPF sharpness.
+    let hf_meta = || {
+        par_map(nlf, side_threads, |i| {
+            let (x, y, lw, lh) = layout.lf_group_rect(i);
+            let (lbx, lby, lbw, lbh) = (x / 8, y / 8, lw.div_ceil(8), lh.div_ceil(8));
             let mut m = BitWriter::new();
-            // HF metadata: colour correlation maps, block types and quant field, EPF sharpness.
             let mut blocks = Vec::new();
             for by in lby..lby + lbh {
                 for bx in lbx..lbx + lbw {
@@ -1107,27 +1178,53 @@ pub fn encode(
             let meta = [ytox.crop(x / 64, y / 64, cw, chh), ytob.crop(x / 64, y / 64, cw, chh), info, sharp];
             let refs: Vec<&Channel> = meta.iter().collect();
             write_standalone(&mut m, &refs, (1 + 2 * nlf + i) as u32, &[], &mopts);
-            let lf_bits = match lf_job {
-                Some(job) => job.join().expect("LF worker panicked"),
-                None => lf_fn(),
-            };
-            s.append(&lf_bits);
-            s.append(&m);
-        });
-        s
-    });
+            m
+        })
+    };
+    let (lf_images, hf_meta, orders, hf_code) = std::thread::scope(|sc| {
+        let side_job = (opts.threads > 1).then(|| sc.spawn(|| (lf_images(), hf_meta())));
+        // Coefficient orders sorted by non-zero frequency (libjxl, effort >= 4).
+        let orders = if opts.effort >= 4 && std::env::var_os("MINI_NO_COEFF_ORDER").is_none() {
+            let streams: Vec<&[Token]> = groups.iter().map(|g| g.tokens.as_slice()).collect();
+            order::compute(&streams, &layout, &acs_map, bw, block_ctx.num, main_threads)
+        } else {
+            order::CoeffOrders::natural()
+        };
+        if !orders.is_natural() {
+            // In place, so that only one extra group of tokens per thread is alive.
+            par_tasks(groups.iter_mut().enumerate().collect(), main_threads, |(g, out)| {
+                out.tokens = order::retokenize(&out.tokens, &layout, &acs_map, bw, g, block_ctx.num, &orders);
+            });
+        }
 
+        // HF entropy code over all groups.
+        let streams: Vec<&[Token]> = groups.iter().map(|g| g.tokens.as_slice()).collect();
+        let code_opts = CodeOptions {
+            max_clusters: if opts.effort >= 5 { 64 } else { 16 },
+            tune_configs: opts.effort >= 3,
+            threads: main_threads,
+            refine_rounds: 3,
+        };
+        let hf_code = EntropyCode::build(&streams, 495 * block_ctx.num as usize, code_opts);
+        let (lf_images, hf_meta) = match side_job {
+            Some(job) => job.join().expect("LF worker panicked"),
+            None => (lf_images(), hf_meta()),
+        };
+        (lf_images, hf_meta, orders, hf_code)
+    });
     drop(lf);
     drop(acs_map);
-
-    // HF entropy code over all groups.
-    let streams: Vec<&[Token]> = groups.iter().map(|g| g.tokens.as_slice()).collect();
-    let code_opts = CodeOptions {
-        max_clusters: if opts.effort >= 5 { 64 } else { 16 },
-        tune_configs: opts.effort >= 3,
-        threads: opts.threads,
-    };
-    let hf_code = EntropyCode::build(&streams, NUM_HF_CTX, code_opts);
+    let lf_sections: Vec<BitWriter> = lf_images
+        .iter()
+        .zip(&hf_meta)
+        .map(|(lf_bits, m)| {
+            let mut s = BitWriter::new();
+            s.write(2, 0); // extra precision
+            s.append(lf_bits);
+            s.append(m);
+            s
+        })
+        .collect();
 
     // Alpha as a modular extra channel (its tree was learned concurrently).
     let alpha = (img.has_alpha() && small).then(|| alpha_rect(0, 0, w, h));
@@ -1165,7 +1262,7 @@ pub fn encode(
     lf_global.write_bool(true); // default LF dequantisation
     lf_global.write_u32(quantizer.global_scale, [Bits(11, 1), Bits(11, 2049), Bits(12, 4097), Bits(16, 8193)]);
     lf_global.write_u32(quantizer.quant_lf, [Val(16), Bits(5, 1), Bits(8, 1), Bits(16, 1)]);
-    lf_global.write_bool(true); // default HF block context
+    block_ctx.write(&mut lf_global);
     lf_global.write_bool(true); // default LF channel correlation
     match (&alpha, &alpha_tree) {
         (None, None) => lf_global.write_bool(false), // no global tree, no channels
@@ -1184,7 +1281,7 @@ pub fn encode(
     let mut hf_global = BitWriter::new();
     hf_global.write_bool(true); // default dequantisation matrices
     hf_global.write(ceil_log2(ng as u64), 0); // one HF preset
-    hf_global.write_u32(0, [Val(0x5f), Val(0x13), Val(0), Bits(13, 0)]); // default coefficient orders
+    orders.write(opts.threads, &mut hf_global);
     hf_code.write_header(&mut hf_global);
 
     let pass_groups: Vec<BitWriter> = par_map(ng, opts.threads, |g| {
