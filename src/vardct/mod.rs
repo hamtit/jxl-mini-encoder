@@ -1056,8 +1056,9 @@ pub fn encode(
     }
 
     let mopts = ModularOptions::for_effort(opts.effort.min(4), bw * bh * 3).with_threads(opts.threads.div_ceil(nlf));
-    // The LF image does not depend on the EPF choice below: code it on a
-    // worker meanwhile (a single-thread encode stays on the calling thread).
+    // The LF image is coded on a worker while the HF tokens are reordered and
+    // their entropy code is built (not during the EPF choice, where the
+    // memory use peaks); a single-thread encode stays on the calling thread.
     let lf_images = || {
         par_map(nlf, opts.threads, |i| {
             let (x, y, lw, lh) = layout.lf_group_rect(i);
@@ -1068,62 +1069,52 @@ pub fn encode(
             b
         })
     };
-    let (epf_map, lf_images) = std::thread::scope(|sc| {
-        let lf_job = (opts.threads > 1).then(|| sc.spawn(lf_images));
-        let epf_map: Option<Vec<u8>> = dynamic_epf.then(|| {
-            // The decoded image is read straight from the group reconstructions,
-            // one row at a time, and the original XYB of each strip is
-            // recomputed from the input pixels, so neither is held as a
-            // full-size plane.
-            let recon_row = |c: usize, y: usize, dst: &mut [f32]| {
-                let gr = y / GROUP_DIM;
-                for gxi in 0..layout.groups_x {
-                    let g = gr * layout.groups_x + gxi;
-                    let (gx, gy, gw, _) = layout.group_rect(g);
-                    let rw = gw.div_ceil(8) * 8;
-                    let ly = y - gy;
-                    for (o, &v) in dst[gx..gx + rw].iter_mut().zip(&groups[g].recon[c][ly * rw..(ly + 1) * rw]) {
-                        *o = unpack_f16(v);
-                    }
+    let epf_map: Option<Vec<u8>> = dynamic_epf.then(|| {
+        // The decoded image is read straight from the group reconstructions,
+        // one row at a time, and the original XYB of each strip is
+        // recomputed from the input pixels, so neither is held as a
+        // full-size plane.
+        let recon_row = |c: usize, y: usize, dst: &mut [f32]| {
+            let gr = y / GROUP_DIM;
+            for gxi in 0..layout.groups_x {
+                let g = gr * layout.groups_x + gxi;
+                let (gx, gy, gw, _) = layout.group_rect(g);
+                let rw = gw.div_ceil(8) * 8;
+                let ly = y - gy;
+                for (o, &v) in dst[gx..gx + rw].iter_mut().zip(&groups[g].recon[c][ly * rw..(ly + 1) * rw]) {
+                    *o = unpack_f16(v);
                 }
-            };
-            let orig_rows = |by0: usize, by1: usize| -> [Vec<f32>; 3] {
-                let (y0, y1) = (by0 * 8, (by1 * 8).min(h));
-                let ch = img.channels();
-                let mut x =
-                    Xyb::from_srgb8(&img.data[y0 * w * ch..y1 * w * ch], ch, w, y1 - y0, xyb_w, (by1 - by0) * 8, 1);
-                if let Some(p) = &patches {
-                    p.subtract_rows(&mut x.planes, xyb_w, y0, (by1 - by0) * 8);
-                }
-                x.planes
-            };
-            let scale = quantizer.scale();
-            let quant: Vec<f32> = (0..bw * bh)
-                .map(|i| {
-                    let b = acs_map[i];
-                    let origin = b.oy as usize * bw + b.ox as usize;
-                    scale * (f32::from(quantizer.raw[origin]) + 1.0)
-                })
-                .collect();
-            let input = epf::Input {
-                orig: &orig_rows,
-                mask1x1: &mask1x1,
-                quant: &quant,
-                w: xyb_w,
-                h: xyb_h,
-                distance: d,
-                iters: params.epf_iters,
-                gaborish,
-            };
-            epf::choose(&input, &recon_row, opts.threads)
-        });
-        let lf_images = match lf_job {
-            Some(job) => job.join().expect("LF worker panicked"),
-            None => lf_images(),
+            }
         };
-        (epf_map, lf_images)
+        let orig_rows = |by0: usize, by1: usize| -> [Vec<f32>; 3] {
+            let (y0, y1) = (by0 * 8, (by1 * 8).min(h));
+            let ch = img.channels();
+            let mut x = Xyb::from_srgb8(&img.data[y0 * w * ch..y1 * w * ch], ch, w, y1 - y0, xyb_w, (by1 - by0) * 8, 1);
+            if let Some(p) = &patches {
+                p.subtract_rows(&mut x.planes, xyb_w, y0, (by1 - by0) * 8);
+            }
+            x.planes
+        };
+        let scale = quantizer.scale();
+        let quant: Vec<f32> = (0..bw * bh)
+            .map(|i| {
+                let b = acs_map[i];
+                let origin = b.oy as usize * bw + b.ox as usize;
+                scale * (f32::from(quantizer.raw[origin]) + 1.0)
+            })
+            .collect();
+        let input = epf::Input {
+            orig: &orig_rows,
+            mask1x1: &mask1x1,
+            quant: &quant,
+            w: xyb_w,
+            h: xyb_h,
+            distance: d,
+            iters: params.epf_iters,
+            gaborish,
+        };
+        epf::choose(&input, &recon_row, opts.threads)
     });
-    drop(lf);
     for g in &mut groups {
         g.recon = Default::default();
     }
@@ -1185,7 +1176,8 @@ pub fn encode(
             m
         })
     };
-    let (hf_meta, orders, hf_code) = std::thread::scope(|sc| {
+    let (lf_images, hf_meta, orders, hf_code) = std::thread::scope(|sc| {
+        let lf_job = (opts.threads > 1).then(|| sc.spawn(lf_images));
         let meta_job = (opts.threads > 1).then(|| sc.spawn(hf_meta));
         // Coefficient orders sorted by non-zero frequency (libjxl, effort >= 4).
         let orders = if opts.effort >= 4 && std::env::var_os("MINI_NO_COEFF_ORDER").is_none() {
@@ -1210,12 +1202,17 @@ pub fn encode(
             refine_rounds: 3,
         };
         let hf_code = EntropyCode::build(&streams, 495 * block_ctx.num as usize, code_opts);
+        let lf_images = match lf_job {
+            Some(job) => job.join().expect("LF worker panicked"),
+            None => lf_images(),
+        };
         let hf_meta = match meta_job {
             Some(job) => job.join().expect("HF metadata worker panicked"),
             None => hf_meta(),
         };
-        (hf_meta, orders, hf_code)
+        (lf_images, hf_meta, orders, hf_code)
     });
+    drop(lf);
     drop(acs_map);
     let lf_sections: Vec<BitWriter> = lf_images
         .iter()
