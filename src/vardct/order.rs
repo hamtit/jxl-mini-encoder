@@ -255,13 +255,14 @@ pub fn compute(
             let mut seen = 0usize;
             walk(tokens[g], group_blocks(layout, acs, bw, g), |a, c, nz_tok, coeffs| {
                 let o = a.order_id();
-                if c == 0 {
+                // One decision per varblock, made at its first channel.
+                if c == CHANNELS[0] {
                     seen += 1;
                 }
                 if !seen.is_multiple_of(block_stride) {
                     return;
                 }
-                if c == 0 {
+                if c == CHANNELS[0] {
                     sampled[o] += 1;
                 }
                 if coeffs.is_empty() {

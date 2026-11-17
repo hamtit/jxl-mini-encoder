@@ -1042,33 +1042,6 @@ pub fn encode(
             quantizer.raw[i] = r;
         }
     }
-    // LF image, quantised; B is predicted from the reconstructed Y.
-    let step = quantizer.lf_step();
-    let mut lf = [Channel::new(bw, bh), Channel::new(bw, bh), Channel::new(bw, bh)]; // Y, X, B
-    for g in &groups {
-        for &(x, y, [dx, dy, db]) in &g.dc {
-            let qy = (dy / step[1]).round() as i32;
-            let y_rec = qy as f32 * step[1];
-            lf[0].set(x, y, qy);
-            lf[1].set(x, y, (dx / step[0]).round() as i32);
-            lf[2].set(x, y, ((db - y_rec) / step[2]).round() as i32);
-        }
-    }
-
-    let mopts = ModularOptions::for_effort(opts.effort.min(4), bw * bh * 3).with_threads(opts.threads.div_ceil(nlf));
-    // The LF image is coded on a worker while the HF tokens are reordered and
-    // their entropy code is built (not during the EPF choice, where the
-    // memory use peaks); a single-thread encode stays on the calling thread.
-    let lf_images = || {
-        par_map(nlf, opts.threads, |i| {
-            let (x, y, lw, lh) = layout.lf_group_rect(i);
-            let crops: Vec<Channel> = lf.iter().map(|c| c.crop(x / 8, y / 8, lw.div_ceil(8), lh.div_ceil(8))).collect();
-            let refs: Vec<&Channel> = crops.iter().collect();
-            let mut b = BitWriter::new();
-            write_standalone(&mut b, &refs, (1 + i) as u32, &[], &mopts);
-            b
-        })
-    };
     let epf_map: Option<Vec<u8>> = dynamic_epf.then(|| {
         // The decoded image is read straight from the group reconstructions,
         // one row at a time, and the original XYB of each strip is
@@ -1133,11 +1106,43 @@ pub fn encode(
         }
     }
 
+    // LF image, quantised; B is predicted from the reconstructed Y.
+    let step = quantizer.lf_step();
+    let mut lf = [Channel::new(bw, bh), Channel::new(bw, bh), Channel::new(bw, bh)]; // Y, X, B
+    for g in &groups {
+        for &(x, y, [dx, dy, db]) in &g.dc {
+            let qy = (dy / step[1]).round() as i32;
+            let y_rec = qy as f32 * step[1];
+            lf[0].set(x, y, qy);
+            lf[1].set(x, y, (dx / step[0]).round() as i32);
+            lf[2].set(x, y, ((db - y_rec) / step[2]).round() as i32);
+        }
+    }
+
+    // The LF image and the HF metadata below are coded on a worker while the
+    // HF tokens are reordered and their entropy code is built (not during the
+    // EPF choice, where the memory use peaks). The worker gets one thread per
+    // LF group (the modular coding of one LF group is mostly serial) and at
+    // most half of the threads; the calling thread keeps the rest, so the
+    // total stays within the requested threads. A single-thread encode does
+    // everything on the calling thread.
+    let side_threads = nlf.min(opts.threads / 2).max(1);
+    let main_threads = if opts.threads > 1 { opts.threads - side_threads } else { 1 };
+    let mopts = ModularOptions::for_effort(opts.effort.min(4), bw * bh * 3).with_threads(side_threads.div_ceil(nlf));
+    let lf_images = || {
+        par_map(nlf, side_threads, |i| {
+            let (x, y, lw, lh) = layout.lf_group_rect(i);
+            let crops: Vec<Channel> = lf.iter().map(|c| c.crop(x / 8, y / 8, lw.div_ceil(8), lh.div_ceil(8))).collect();
+            let refs: Vec<&Channel> = crops.iter().collect();
+            let mut b = BitWriter::new();
+            write_standalone(&mut b, &refs, (1 + i) as u32, &[], &mopts);
+            b
+        })
+    };
     // HF metadata of each LF group: colour correlation maps, block types and
-    // quant field, EPF sharpness. Coded on a worker while the HF tokens are
-    // reordered and their entropy code is built.
+    // quant field, EPF sharpness.
     let hf_meta = || {
-        par_map(nlf, opts.threads, |i| {
+        par_map(nlf, side_threads, |i| {
             let (x, y, lw, lh) = layout.lf_group_rect(i);
             let (lbx, lby, lbw, lbh) = (x / 8, y / 8, lw.div_ceil(8), lh.div_ceil(8));
             let mut m = BitWriter::new();
@@ -1177,18 +1182,17 @@ pub fn encode(
         })
     };
     let (lf_images, hf_meta, orders, hf_code) = std::thread::scope(|sc| {
-        let lf_job = (opts.threads > 1).then(|| sc.spawn(lf_images));
-        let meta_job = (opts.threads > 1).then(|| sc.spawn(hf_meta));
+        let side_job = (opts.threads > 1).then(|| sc.spawn(|| (lf_images(), hf_meta())));
         // Coefficient orders sorted by non-zero frequency (libjxl, effort >= 4).
         let orders = if opts.effort >= 4 && std::env::var_os("MINI_NO_COEFF_ORDER").is_none() {
             let streams: Vec<&[Token]> = groups.iter().map(|g| g.tokens.as_slice()).collect();
-            order::compute(&streams, &layout, &acs_map, bw, block_ctx.num, opts.threads)
+            order::compute(&streams, &layout, &acs_map, bw, block_ctx.num, main_threads)
         } else {
             order::CoeffOrders::natural()
         };
         if !orders.is_natural() {
             // In place, so that only one extra group of tokens per thread is alive.
-            par_tasks(groups.iter_mut().enumerate().collect(), opts.threads, |(g, out)| {
+            par_tasks(groups.iter_mut().enumerate().collect(), main_threads, |(g, out)| {
                 out.tokens = order::retokenize(&out.tokens, &layout, &acs_map, bw, g, block_ctx.num, &orders);
             });
         }
@@ -1198,17 +1202,13 @@ pub fn encode(
         let code_opts = CodeOptions {
             max_clusters: if opts.effort >= 5 { 64 } else { 16 },
             tune_configs: opts.effort >= 3,
-            threads: opts.threads,
+            threads: main_threads,
             refine_rounds: 3,
         };
         let hf_code = EntropyCode::build(&streams, 495 * block_ctx.num as usize, code_opts);
-        let lf_images = match lf_job {
+        let (lf_images, hf_meta) = match side_job {
             Some(job) => job.join().expect("LF worker panicked"),
-            None => lf_images(),
-        };
-        let hf_meta = match meta_job {
-            Some(job) => job.join().expect("HF metadata worker panicked"),
-            None => hf_meta(),
+            None => (lf_images(), hf_meta()),
         };
         (lf_images, hf_meta, orders, hf_code)
     });

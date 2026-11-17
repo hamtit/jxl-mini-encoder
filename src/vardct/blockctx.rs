@@ -127,8 +127,21 @@ impl BlockCtxMap {
                 remap[i] = remap[remap[i]];
             }
         }
+        // Cluster roots (whose counts hold their totals) by population, so
+        // that X and B get separate contexts for the largest luma clusters
+        // (libjxl uses the labels, which follow the order of the classes).
+        let roots: Vec<usize> = {
+            let mut r: Vec<usize> = (0..remap.len()).filter(|&i| remap[i] == i).collect();
+            r.sort_by(|&a, &b| counts[b].cmp(&counts[a]));
+            r
+        };
+        let mut rank = vec![0usize; remap.len()];
+        for (k, &r) in roots.iter().enumerate() {
+            rank[r] = k;
+        }
         let mut relabel = vec![usize::MAX; remap.len()];
         let mut num = 0;
+        let root_of = remap.clone();
         for r in remap.iter_mut() {
             if relabel[*r] == usize::MAX {
                 relabel[*r] = num;
@@ -136,11 +149,11 @@ impl BlockCtxMap {
             }
             *r = relabel[*r];
         }
-        // X and B share the contexts of the largest luma clusters.
+        // X and B share the contexts of the most populated luma clusters.
         let n = remap.len();
         let mut map: Vec<u8> = remap.iter().map(|&r| r as u8).collect();
         for i in n..3 * n {
-            map.push((num + remap[i % n].min(nb_chroma - 1)) as u8);
+            map.push((num + rank[root_of[i % n]].min(nb_chroma - 1)) as u8);
         }
         let num = u32::from(*map.iter().max().unwrap()) + 1;
         BlockCtxMap { qft, map, num, default: false }
