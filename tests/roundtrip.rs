@@ -137,6 +137,16 @@ fn lossy_sizes() {
 }
 
 #[test]
+fn lossy_large_images() {
+    // Large enough for custom coefficient orders and a block context map
+    // split by the quantiser (several groups and transform sizes).
+    for (q, min) in [(95.0, 34.0), (60.0, 28.0)] {
+        let p = lossy(1100, 800, 3, q, 7);
+        assert!(p > min, "quality {q}: psnr {p}");
+    }
+}
+
+#[test]
 fn lossy_quality_range() {
     let mut prev = 0.0;
     for q in [0.0, 30.0, 60.0, 90.0, 99.0] {

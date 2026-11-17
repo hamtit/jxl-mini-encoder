@@ -146,3 +146,37 @@ impl BlockCtxMap {
         BlockCtxMap { qft, map, num, default: false }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vardct::acs::Acs;
+
+    #[test]
+    fn maps_stay_within_format_limits() {
+        for &(bw, bh, d) in
+            &[(16usize, 16usize, 1.0f32), (96, 64, 2.2), (250, 167, 1.0), (500, 340, 0.5), (500, 340, 6.0)]
+        {
+            let acs: Vec<BlockAcs> = (0..bw * bh)
+                .map(|i| {
+                    let a = [Acs::Dct8, Acs::Dct4x4, Acs::Identity][i % 3];
+                    BlockAcs { acs: a, ox: (i % bw) as u32, oy: (i / bw) as u32 }
+                })
+                .collect();
+            let raw: Vec<u8> = (0..bw * bh).map(|i| (i * 7 % 61) as u8).collect();
+            let m = BlockCtxMap::choose(&raw, &acs, bw, d);
+            let nqf = m.qft.len() + 1;
+            assert_eq!(m.map.len(), 3 * NUM_ORDS * nqf);
+            assert!(m.num as usize <= 16 && nqf <= 64);
+            assert_eq!(u32::from(*m.map.iter().max().unwrap()) + 1, m.num);
+            assert!(m.qft.windows(2).all(|w| w[0] < w[1]) && m.qft.iter().all(|&t| (1..256).contains(&t)));
+            for qf in 1..=256 {
+                for ci in 0..3 {
+                    assert!(m.ctx(ci, 0, qf) < m.num);
+                }
+            }
+            let mut w = BitWriter::new();
+            m.write(&mut w);
+        }
+    }
+}
