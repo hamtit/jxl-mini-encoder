@@ -73,24 +73,38 @@ impl Params {
 /// libjxl's pixel statistics for chromacity adjustment (effort >= 7): the
 /// largest neighbour differences in X and B raise the X/B quantisation
 /// multipliers on saturated, high-contrast content.
-fn chroma_scales(xyb: &Xyb, w: usize, h: usize) -> (u32, u32) {
+fn chroma_scales(xyb: &Xyb, w: usize, h: usize, threads: usize) -> (u32, u32) {
     let stride = xyb.w;
     let (px, py, pb) = (&xyb.planes[0], &xyb.planes[1], &xyb.planes[2]);
-    let (mut dx, mut db, mut exposed) = (0f32, 0f32, 0f32);
-    for y in 1..h {
-        for x in 1..w {
-            let i = y * stride + x;
-            dx = dx.max((px[i] - px[i - 1]).abs()).max((px[i] - px[i - stride]).abs());
-            let diff = pb[i] - py[i];
-            let diff_prev = pb[i - 1] - py[i - 1];
-            let diff_row = pb[i - stride] - py[i - stride];
-            db = db.max((diff - diff_prev).abs()).max((diff - diff_row).abs());
-            let exposed_b = pb[i] - py[i] * 1.2;
-            if exposed_b >= 0.0 {
-                let edge = (pb[i] - pb[i - 1]).abs() + (pb[i] - pb[i - stride]).abs();
-                exposed = exposed.max(exposed_b * edge);
+    // Maxima over bands of rows, in parallel (a maximum does not depend on
+    // the order of evaluation).
+    let rows = h.saturating_sub(1);
+    let bands = threads.clamp(1, rows.div_ceil(64).max(1));
+    let per = rows.div_ceil(bands).max(1);
+    let parts = par_map(bands, threads, |k| {
+        let (mut dx, mut db, mut exposed) = (0f32, 0f32, 0f32);
+        for y in 1 + k * per..(1 + (k + 1) * per).min(h) {
+            for x in 1..w {
+                let i = y * stride + x;
+                dx = dx.max((px[i] - px[i - 1]).abs()).max((px[i] - px[i - stride]).abs());
+                let diff = pb[i] - py[i];
+                let diff_prev = pb[i - 1] - py[i - 1];
+                let diff_row = pb[i - stride] - py[i - stride];
+                db = db.max((diff - diff_prev).abs()).max((diff - diff_row).abs());
+                let exposed_b = pb[i] - py[i] * 1.2;
+                if exposed_b >= 0.0 {
+                    let edge = (pb[i] - pb[i - 1]).abs() + (pb[i] - pb[i - stride]).abs();
+                    exposed = exposed.max(exposed_b * edge);
+                }
             }
         }
+        (dx, db, exposed)
+    });
+    let (mut dx, mut db, mut exposed) = (0f32, 0f32, 0f32);
+    for (a, b, c) in parts {
+        dx = dx.max(a);
+        db = db.max(b);
+        exposed = exposed.max(c);
     }
     let x_extra = match dx {
         v if v >= 0.026 => 3,
@@ -904,7 +918,7 @@ pub fn encode(
     });
     let xyb = Xyb::from_srgb8(img.data, img.channels(), w, h, bw * 8, bh * 8, opts.threads);
     if opts.effort >= 7 && std::env::var_os("MINI_NO_CHROMA_ADJUST").is_none() {
-        let (x, b) = chroma_scales(&xyb, w, h);
+        let (x, b) = chroma_scales(&xyb, w, h, opts.threads);
         params.x_qm_scale = params.x_qm_scale.max(x);
         params.b_qm_scale = b;
     }
@@ -1028,52 +1042,88 @@ pub fn encode(
             quantizer.raw[i] = r;
         }
     }
-    let epf_map: Option<Vec<u8>> = dynamic_epf.then(|| {
-        // The decoded image is read straight from the group reconstructions,
-        // one row at a time, and the original XYB of each strip is
-        // recomputed from the input pixels, so neither is held as a
-        // full-size plane.
-        let recon_row = |c: usize, y: usize, dst: &mut [f32]| {
-            let gr = y / GROUP_DIM;
-            for gxi in 0..layout.groups_x {
-                let g = gr * layout.groups_x + gxi;
-                let (gx, gy, gw, _) = layout.group_rect(g);
-                let rw = gw.div_ceil(8) * 8;
-                let ly = y - gy;
-                for (o, &v) in dst[gx..gx + rw].iter_mut().zip(&groups[g].recon[c][ly * rw..(ly + 1) * rw]) {
-                    *o = unpack_f16(v);
+    // LF image, quantised; B is predicted from the reconstructed Y.
+    let step = quantizer.lf_step();
+    let mut lf = [Channel::new(bw, bh), Channel::new(bw, bh), Channel::new(bw, bh)]; // Y, X, B
+    for g in &groups {
+        for &(x, y, [dx, dy, db]) in &g.dc {
+            let qy = (dy / step[1]).round() as i32;
+            let y_rec = qy as f32 * step[1];
+            lf[0].set(x, y, qy);
+            lf[1].set(x, y, (dx / step[0]).round() as i32);
+            lf[2].set(x, y, ((db - y_rec) / step[2]).round() as i32);
+        }
+    }
+
+    let mopts = ModularOptions::for_effort(opts.effort.min(4), bw * bh * 3).with_threads(opts.threads.div_ceil(nlf));
+    // The LF image does not depend on the EPF choice below: code it on a
+    // worker meanwhile (a single-thread encode stays on the calling thread).
+    let lf_images = || {
+        par_map(nlf, opts.threads, |i| {
+            let (x, y, lw, lh) = layout.lf_group_rect(i);
+            let crops: Vec<Channel> = lf.iter().map(|c| c.crop(x / 8, y / 8, lw.div_ceil(8), lh.div_ceil(8))).collect();
+            let refs: Vec<&Channel> = crops.iter().collect();
+            let mut b = BitWriter::new();
+            write_standalone(&mut b, &refs, (1 + i) as u32, &[], &mopts);
+            b
+        })
+    };
+    let (epf_map, lf_images) = std::thread::scope(|sc| {
+        let lf_job = (opts.threads > 1).then(|| sc.spawn(lf_images));
+        let epf_map: Option<Vec<u8>> = dynamic_epf.then(|| {
+            // The decoded image is read straight from the group reconstructions,
+            // one row at a time, and the original XYB of each strip is
+            // recomputed from the input pixels, so neither is held as a
+            // full-size plane.
+            let recon_row = |c: usize, y: usize, dst: &mut [f32]| {
+                let gr = y / GROUP_DIM;
+                for gxi in 0..layout.groups_x {
+                    let g = gr * layout.groups_x + gxi;
+                    let (gx, gy, gw, _) = layout.group_rect(g);
+                    let rw = gw.div_ceil(8) * 8;
+                    let ly = y - gy;
+                    for (o, &v) in dst[gx..gx + rw].iter_mut().zip(&groups[g].recon[c][ly * rw..(ly + 1) * rw]) {
+                        *o = unpack_f16(v);
+                    }
                 }
-            }
+            };
+            let orig_rows = |by0: usize, by1: usize| -> [Vec<f32>; 3] {
+                let (y0, y1) = (by0 * 8, (by1 * 8).min(h));
+                let ch = img.channels();
+                let mut x =
+                    Xyb::from_srgb8(&img.data[y0 * w * ch..y1 * w * ch], ch, w, y1 - y0, xyb_w, (by1 - by0) * 8, 1);
+                if let Some(p) = &patches {
+                    p.subtract_rows(&mut x.planes, xyb_w, y0, (by1 - by0) * 8);
+                }
+                x.planes
+            };
+            let scale = quantizer.scale();
+            let quant: Vec<f32> = (0..bw * bh)
+                .map(|i| {
+                    let b = acs_map[i];
+                    let origin = b.oy as usize * bw + b.ox as usize;
+                    scale * (f32::from(quantizer.raw[origin]) + 1.0)
+                })
+                .collect();
+            let input = epf::Input {
+                orig: &orig_rows,
+                mask1x1: &mask1x1,
+                quant: &quant,
+                w: xyb_w,
+                h: xyb_h,
+                distance: d,
+                iters: params.epf_iters,
+                gaborish,
+            };
+            epf::choose(&input, &recon_row, opts.threads)
+        });
+        let lf_images = match lf_job {
+            Some(job) => job.join().expect("LF worker panicked"),
+            None => lf_images(),
         };
-        let orig_rows = |by0: usize, by1: usize| -> [Vec<f32>; 3] {
-            let (y0, y1) = (by0 * 8, (by1 * 8).min(h));
-            let ch = img.channels();
-            let mut x = Xyb::from_srgb8(&img.data[y0 * w * ch..y1 * w * ch], ch, w, y1 - y0, xyb_w, (by1 - by0) * 8, 1);
-            if let Some(p) = &patches {
-                p.subtract_rows(&mut x.planes, xyb_w, y0, (by1 - by0) * 8);
-            }
-            x.planes
-        };
-        let scale = quantizer.scale();
-        let quant: Vec<f32> = (0..bw * bh)
-            .map(|i| {
-                let b = acs_map[i];
-                let origin = b.oy as usize * bw + b.ox as usize;
-                scale * (f32::from(quantizer.raw[origin]) + 1.0)
-            })
-            .collect();
-        let input = epf::Input {
-            orig: &orig_rows,
-            mask1x1: &mask1x1,
-            quant: &quant,
-            w: xyb_w,
-            h: xyb_h,
-            distance: d,
-            iters: params.epf_iters,
-            gaborish,
-        };
-        epf::choose(&input, &recon_row, opts.threads)
+        (epf_map, lf_images)
     });
+    drop(lf);
     for g in &mut groups {
         g.recon = Default::default();
     }
@@ -1092,39 +1142,14 @@ pub fn encode(
         }
     }
 
-    // LF image, quantised; B is predicted from the reconstructed Y.
-    let step = quantizer.lf_step();
-    let mut lf = [Channel::new(bw, bh), Channel::new(bw, bh), Channel::new(bw, bh)]; // Y, X, B
-    for g in &groups {
-        for &(x, y, [dx, dy, db]) in &g.dc {
-            let qy = (dy / step[1]).round() as i32;
-            let y_rec = qy as f32 * step[1];
-            lf[0].set(x, y, qy);
-            lf[1].set(x, y, (dx / step[0]).round() as i32);
-            lf[2].set(x, y, ((db - y_rec) / step[2]).round() as i32);
-        }
-    }
-
-    let mopts = ModularOptions::for_effort(opts.effort.min(4), bw * bh * 3).with_threads(opts.threads.div_ceil(nlf));
-    let lf_sections: Vec<BitWriter> = par_map(nlf, opts.threads, |i| {
-        let (x, y, lw, lh) = layout.lf_group_rect(i);
-        let (lbx, lby, lbw, lbh) = (x / 8, y / 8, lw.div_ceil(8), lh.div_ceil(8));
-        let mut s = BitWriter::new();
-        s.write(2, 0); // extra precision
-        let crops: Vec<Channel> = lf.iter().map(|c| c.crop(lbx, lby, lbw, lbh)).collect();
-        let refs: Vec<&Channel> = crops.iter().collect();
-        // The LF image and the HF metadata are independent streams: code the
-        // LF image on a worker and append both in order.
-        std::thread::scope(|sc| {
-            let lf_fn = || {
-                let mut b = BitWriter::new();
-                write_standalone(&mut b, &refs, (1 + i) as u32, &[], &mopts);
-                b
-            };
-            // A single-thread encode stays on the calling thread.
-            let lf_job = (opts.threads > 1).then(|| sc.spawn(lf_fn));
+    // HF metadata of each LF group: colour correlation maps, block types and
+    // quant field, EPF sharpness. Coded on a worker while the HF tokens are
+    // reordered and their entropy code is built.
+    let hf_meta = || {
+        par_map(nlf, opts.threads, |i| {
+            let (x, y, lw, lh) = layout.lf_group_rect(i);
+            let (lbx, lby, lbw, lbh) = (x / 8, y / 8, lw.div_ceil(8), lh.div_ceil(8));
             let mut m = BitWriter::new();
-            // HF metadata: colour correlation maps, block types and quant field, EPF sharpness.
             let mut blocks = Vec::new();
             for by in lby..lby + lbh {
                 for bx in lbx..lbx + lbw {
@@ -1157,42 +1182,52 @@ pub fn encode(
             let meta = [ytox.crop(x / 64, y / 64, cw, chh), ytob.crop(x / 64, y / 64, cw, chh), info, sharp];
             let refs: Vec<&Channel> = meta.iter().collect();
             write_standalone(&mut m, &refs, (1 + 2 * nlf + i) as u32, &[], &mopts);
-            let lf_bits = match lf_job {
-                Some(job) => job.join().expect("LF worker panicked"),
-                None => lf_fn(),
-            };
-            s.append(&lf_bits);
-            s.append(&m);
-        });
-        s
-    });
+            m
+        })
+    };
+    let (hf_meta, orders, hf_code) = std::thread::scope(|sc| {
+        let meta_job = (opts.threads > 1).then(|| sc.spawn(hf_meta));
+        // Coefficient orders sorted by non-zero frequency (libjxl, effort >= 4).
+        let orders = if opts.effort >= 4 && std::env::var_os("MINI_NO_COEFF_ORDER").is_none() {
+            let streams: Vec<&[Token]> = groups.iter().map(|g| g.tokens.as_slice()).collect();
+            order::compute(&streams, &layout, &acs_map, bw, block_ctx.num, opts.threads)
+        } else {
+            order::CoeffOrders::natural()
+        };
+        if !orders.is_natural() {
+            // In place, so that only one extra group of tokens per thread is alive.
+            par_tasks(groups.iter_mut().enumerate().collect(), opts.threads, |(g, out)| {
+                out.tokens = order::retokenize(&out.tokens, &layout, &acs_map, bw, g, block_ctx.num, &orders);
+            });
+        }
 
-    drop(lf);
-
-    // Coefficient orders sorted by non-zero frequency (libjxl, effort >= 4).
-    let orders = if opts.effort >= 4 && std::env::var_os("MINI_NO_COEFF_ORDER").is_none() {
+        // HF entropy code over all groups.
         let streams: Vec<&[Token]> = groups.iter().map(|g| g.tokens.as_slice()).collect();
-        order::compute(&streams, &layout, &acs_map, bw, block_ctx.num, opts.threads)
-    } else {
-        order::CoeffOrders::natural()
-    };
-    if !orders.is_natural() {
-        // In place, so that only one extra group of tokens per thread is alive.
-        par_tasks(groups.iter_mut().enumerate().collect(), opts.threads, |(g, out)| {
-            out.tokens = order::retokenize(&out.tokens, &layout, &acs_map, bw, g, block_ctx.num, &orders);
-        });
-    }
+        let code_opts = CodeOptions {
+            max_clusters: if opts.effort >= 5 { 64 } else { 16 },
+            tune_configs: opts.effort >= 3,
+            threads: opts.threads,
+            refine_rounds: 3,
+        };
+        let hf_code = EntropyCode::build(&streams, 495 * block_ctx.num as usize, code_opts);
+        let hf_meta = match meta_job {
+            Some(job) => job.join().expect("HF metadata worker panicked"),
+            None => hf_meta(),
+        };
+        (hf_meta, orders, hf_code)
+    });
     drop(acs_map);
-
-    // HF entropy code over all groups.
-    let streams: Vec<&[Token]> = groups.iter().map(|g| g.tokens.as_slice()).collect();
-    let code_opts = CodeOptions {
-        max_clusters: if opts.effort >= 5 { 64 } else { 16 },
-        tune_configs: opts.effort >= 3,
-        threads: opts.threads,
-        refine_rounds: 3,
-    };
-    let hf_code = EntropyCode::build(&streams, 495 * block_ctx.num as usize, code_opts);
+    let lf_sections: Vec<BitWriter> = lf_images
+        .iter()
+        .zip(&hf_meta)
+        .map(|(lf_bits, m)| {
+            let mut s = BitWriter::new();
+            s.write(2, 0); // extra precision
+            s.append(lf_bits);
+            s.append(m);
+            s
+        })
+        .collect();
 
     // Alpha as a modular extra channel (its tree was learned concurrently).
     let alpha = (img.has_alpha() && small).then(|| alpha_rect(0, 0, w, h));
