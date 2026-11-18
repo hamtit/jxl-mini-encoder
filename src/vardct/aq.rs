@@ -303,7 +303,6 @@ fn blur_mask1x1(m: Vec<f32>, w: usize, h: usize, threads: usize) -> Vec<f32> {
 /// 5x5 symmetric convolution with mirrored borders. Weights: centre, r
 /// (distance 1), R (distance 2), d (diagonal), D (2,2), L (1,2) knight moves.
 fn symmetric5(mut src: Vec<f32>, w: usize, h: usize, k: [f32; 6], threads: usize) -> Vec<f32> {
-    let [c, r, rr, d, dd, l] = k;
     let mirror = |v: isize, n: usize| -> usize {
         let n = n as isize;
         let mut v = v;
@@ -340,6 +339,7 @@ fn symmetric5(mut src: Vec<f32>, w: usize, h: usize, k: [f32; 6], threads: usize
         .collect();
     let columns: Vec<[usize; 5]> =
         (0..w).map(|x| std::array::from_fn(|i| mirror(x as isize + i as isize - 2, w))).collect();
+    let simd = has_simd();
     par_tasks(
         src.chunks_mut(w * band_rows).zip(halos).collect(),
         threads,
@@ -359,15 +359,7 @@ fn symmetric5(mut src: Vec<f32>, w: usize, h: usize, k: [f32; 6], threads: usize
             for y in 0..rows {
                 let orow = &mut chunk[y * w..(y + 1) * w];
                 let window: [&[f32]; 5] = std::array::from_fn(|dy| ring[(y + dy) % 5].as_slice());
-                for (x, cols) in columns.iter().enumerate() {
-                    let p = |dy: usize, dx: usize| window[dy][cols[dx]];
-                    orow[x] = c * p(2, 2)
-                        + r * (p(1, 2) + p(3, 2) + p(2, 1) + p(2, 3))
-                        + rr * (p(0, 2) + p(4, 2) + p(2, 0) + p(2, 4))
-                        + d * (p(1, 1) + p(1, 3) + p(3, 1) + p(3, 3))
-                        + dd * (p(0, 0) + p(0, 4) + p(4, 0) + p(4, 4))
-                        + l * (p(0, 1) + p(0, 3) + p(4, 1) + p(4, 3) + p(1, 0) + p(3, 0) + p(1, 4) + p(3, 4));
-                }
+                blur_row(simd, window, &columns, k, orow);
                 if y + 1 < rows {
                     let next = y + 3;
                     let row = if next < rows {
@@ -383,6 +375,66 @@ fn symmetric5(mut src: Vec<f32>, w: usize, h: usize, k: [f32; 6], threads: usize
         },
     );
     src
+}
+
+/// One output row of `symmetric5` from a window of five input rows.
+fn blur_row(simd: bool, window: [&[f32]; 5], columns: &[[usize; 5]], k: [f32; 6], out: &mut [f32]) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if simd {
+        // SAFETY: AVX2 support was detected at runtime.
+        return unsafe { blur_row_simd(window, columns, k, out) };
+    }
+    let _ = simd;
+    blur_row_impl(window, columns, k, out)
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+unsafe fn blur_row_simd(window: [&[f32]; 5], columns: &[[usize; 5]], k: [f32; 6], out: &mut [f32]) {
+    blur_row_impl(window, columns, k, out)
+}
+
+#[inline(always)]
+fn blur_row_impl(window: [&[f32]; 5], columns: &[[usize; 5]], k: [f32; 6], out: &mut [f32]) {
+    let [c, r, rr, d, dd, l] = k;
+    let w = out.len();
+    // Columns whose neighbours are mirrored go through the index table; the
+    // interior reads its neighbours directly so that the loop vectorises
+    // (same operations in the same order, so the same results).
+    let edge = |x: usize, o: &mut f32| {
+        let cols = &columns[x];
+        let p = |dy: usize, dx: usize| window[dy][cols[dx]];
+        *o = c * p(2, 2)
+            + r * (p(1, 2) + p(3, 2) + p(2, 1) + p(2, 3))
+            + rr * (p(0, 2) + p(4, 2) + p(2, 0) + p(2, 4))
+            + d * (p(1, 1) + p(1, 3) + p(3, 1) + p(3, 3))
+            + dd * (p(0, 0) + p(0, 4) + p(4, 0) + p(4, 4))
+            + l * (p(0, 1) + p(0, 3) + p(4, 1) + p(4, 3) + p(1, 0) + p(3, 0) + p(1, 4) + p(3, 4));
+    };
+    if w < 5 {
+        for (x, o) in out.iter_mut().enumerate() {
+            edge(x, o);
+        }
+        return;
+    }
+    for x in [0, 1, w - 2, w - 1] {
+        edge(x, &mut out[x]);
+    }
+    let n = w - 4;
+    let [w0, w1, w2, w3, w4] = window.map(|row| &row[..w]);
+    // q[dy][dx]: row dy shifted so that index i is column i + dx (i + 2 is the centre).
+    let q: [[&[f32]; 5]; 5] = [w0, w1, w2, w3, w4].map(|row| std::array::from_fn(|dx| &row[dx..dx + n]));
+    let o = &mut out[2..2 + n];
+    for i in 0..n {
+        let p = |dy: usize, dx: usize| q[dy][dx][i];
+        o[i] = c * p(2, 2)
+            + r * (p(1, 2) + p(3, 2) + p(2, 1) + p(2, 3))
+            + rr * (p(0, 2) + p(4, 2) + p(2, 0) + p(2, 4))
+            + d * (p(1, 1) + p(1, 3) + p(3, 1) + p(3, 3))
+            + dd * (p(0, 0) + p(0, 4) + p(4, 0) + p(4, 4))
+            + l * (p(0, 1) + p(0, 3) + p(4, 1) + p(4, 3) + p(1, 0) + p(3, 0) + p(1, 4) + p(3, 4));
+    }
 }
 
 fn symmetric5_out_of_place(src: &[f32], w: usize, h: usize, k: [f32; 6], threads: usize) -> Vec<f32> {
