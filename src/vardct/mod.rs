@@ -924,17 +924,6 @@ pub fn encode(
     }
     let d = params.distance;
     let noise_lut = noise::params(&xyb, w, h, d, opts.noise);
-    // Patches (effort >= 7): repeated glyph-like shapes are coded once in a
-    // reference frame and removed from the image.
-    let mut xyb = xyb;
-    let patches = if opts.effort >= 7 && std::env::var_os("MINI_NO_PATCHES").is_none() {
-        crate::patches::find(&xyb, w, h, d)
-    } else {
-        None
-    };
-    if let Some(p) = &patches {
-        p.subtract(&mut xyb);
-    }
     // Tuned for butteraugli (closer to libjxl there, worse on SSIMULACRA2);
     // MINI_NO_GABORISH=1 turns it off. Like libjxl, only above distance 0.5:
     // at higher fidelity the sharpening overshoots on hard edges (graphics,
@@ -944,15 +933,47 @@ pub fn encode(
         && std::env::var_os("MINI_NO_GABORISH").is_none()
         && !flat_graphics(img)
         && noise.unwrap_or_else(|| noise_level(img)) < NOISY_LEVEL;
-    let (mut field, mask1x1, q_median) = if params.adaptive_quant {
-        // Without Gaborish, scale the AQ target as libjxl does. Flat
-        // graphics avoid the sharpening overshoot and extra edge coefficients.
-        let d_iqf = if gaborish { d } else { d * 0.892 };
-        let maps = aq::initial_quant_field(d_iqf, &xyb, 0.4062 / d_iqf, opts.threads);
-        (maps.quant_field, maps.mask1x1, 0.39 / d)
+    // Without Gaborish, scale the AQ target as libjxl does. Flat graphics
+    // avoid the sharpening overshoot and extra edge coefficients.
+    let d_iqf = if gaborish { d } else { d * 0.892 };
+    let aq_maps = |xyb: &Xyb, threads: usize| {
+        params.adaptive_quant.then(|| aq::initial_quant_field(d_iqf, xyb, 0.4062 / d_iqf, threads))
+    };
+    // Patches (effort >= 7): repeated glyph-like shapes are coded once in a
+    // reference frame and removed from the image. The search is serial (a
+    // flood fill), and on photographs with flat areas it is one of the
+    // longest stages, while it rarely finds anything there. So with several
+    // threads the AQ maps are computed on the other threads meanwhile, as if
+    // there were no patches, and recomputed only if some are found.
+    let mut xyb = xyb;
+    let find_patches = opts.effort >= 7 && std::env::var_os("MINI_NO_PATCHES").is_none();
+    let (patches, speculative_maps) = if find_patches && opts.threads > 1 {
+        std::thread::scope(|sc| {
+            let job = sc.spawn(|| crate::patches::find(&xyb, w, h, d));
+            let maps = aq_maps(&xyb, opts.threads - 1);
+            (job.join().expect("patch search panicked"), Some(maps))
+        })
+    } else if find_patches {
+        (crate::patches::find(&xyb, w, h, d), None)
     } else {
-        let q = 0.79 / d;
-        (vec![q; bw * bh], Vec::new(), q)
+        (None, None)
+    };
+    let maps = match (&patches, speculative_maps) {
+        (None, Some(maps)) => maps,
+        (p, maps) => {
+            drop(maps);
+            if let Some(p) = p {
+                p.subtract(&mut xyb);
+            }
+            aq_maps(&xyb, opts.threads)
+        }
+    };
+    let (mut field, mask1x1, q_median) = match maps {
+        Some(maps) => (maps.quant_field, maps.mask1x1, 0.39 / d),
+        None => {
+            let q = 0.79 / d;
+            (vec![q; bw * bh], Vec::new(), q)
+        }
     };
     // libjxl (effort >= 6) picks the EPF strength of every block by decoding
     // under a few candidates; that needs the pre-Gaborish original.
