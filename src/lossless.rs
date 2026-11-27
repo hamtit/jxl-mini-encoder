@@ -63,28 +63,39 @@ fn choose_rct(img: &ImageRef, effort: u32) -> Option<Transform> {
     if effort < 4 {
         return Some(Transform::Rct { begin_c: 0, permutation: YCOCG.0, kind: YCOCG.1 });
     }
-    let candidates = &[YCOCG, (1, 3), (1, 5), (0, 0), (1, 2)];
+    const CANDIDATES: [(u32, u32); 5] = [YCOCG, (1, 3), (1, 5), (0, 0), (1, 2)];
     let (w, h) = (img.width as usize, img.height as usize);
     let step = ((h * w) / (1 << 18)).max(1);
-    let mut best: Option<(f64, (u32, u32))> = None;
-    for &(perm, kind) in candidates {
-        let mut acc = [GradientCost::new(), GradientCost::new(), GradientCost::new()];
-        for y in (1..h).step_by(step) {
-            // Two rows are enough: the predictor looks at y - 1 and y only.
-            let mut rows = load_rect(img, 3, 0, y - 1, w, 2);
-            if (perm, kind) != (0, 0) {
-                forward_rct(&mut rows, perm, kind);
+    let mut accs: [[GradientCost; 3]; 5] =
+        std::array::from_fn(|_| [GradientCost::new(), GradientCost::new(), GradientCost::new()]);
+    let mut work: Vec<Channel> = (0..3).map(|_| Channel::new(w, 2)).collect();
+    for y in (1..h).step_by(step) {
+        // Two rows are enough: the predictor looks at y - 1 and y only.
+        let base_rows = load_rect(img, 3, 0, y - 1, w, 2);
+        for (ci, &(perm, kind)) in CANDIDATES.iter().enumerate() {
+            if (perm, kind) == (0, 0) {
+                for (a, ch) in accs[ci].iter_mut().zip(&base_rows) {
+                    a.add_row(ch, 1);
+                }
+            } else {
+                for (dst, src) in work.iter_mut().zip(&base_rows) {
+                    dst.data.copy_from_slice(&src.data);
+                }
+                forward_rct(&mut work, perm, kind);
+                for (a, ch) in accs[ci].iter_mut().zip(&work) {
+                    a.add_row(ch, 1);
+                }
             }
-            for (a, ch) in acc.iter_mut().zip(&rows) {
-                a.add_row(ch, 1);
-            }
-        }
-        let cost: f64 = acc.iter().map(GradientCost::cost).sum();
-        if best.is_none_or(|b| cost < b.0) {
-            best = Some((cost, (perm, kind)));
         }
     }
-    let (_, (perm, kind)) = best?;
+    let (_, &(perm, kind)) = CANDIDATES
+        .iter()
+        .enumerate()
+        .min_by(|&(i, _), &(j, _)| {
+            let ci: f64 = accs[i].iter().map(GradientCost::cost).sum();
+            let cj: f64 = accs[j].iter().map(GradientCost::cost).sum();
+            ci.total_cmp(&cj)
+        })?;
     if (perm, kind) == (0, 0) {
         return None;
     }

@@ -115,15 +115,21 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
         return None;
     }
 
-    // Grow the background from the seeds over similar pixels. Pixel indices
-    // are u32 and the colour of a background pixel is looked up through the
-    // pixel it grew from, which keeps the memory use small on large images.
-    if w * h > u32::MAX as usize {
-        return None;
-    }
+    // Grow the background from the seeds over similar pixels. Because growth
+    // is bounded by DISTANCE_LIMIT = 50, storing the relative offset to the
+    // source pixel as [i8; 2] halves memory and avoids division on lookup.
+    // A single `flags` array (with a 1-pixel border) tracks both background
+    // and visited state across both flood fills.
     const DISTANCE_LIMIT: usize = 50;
-    let mut is_bg = vec![false; w * h];
-    let mut bg_src = vec![0u32; w * h];
+    const FLAG_BG: u8 = 1;
+    const FLAG_VISITED: u8 = 2;
+    let vw = w + 2;
+    let vi = |x: usize, y: usize| (y + 1) * vw + x + 1;
+    let mut flags = vec![FLAG_VISITED; vw * (h + 2)];
+    for y in 0..h {
+        flags[vi(0, y)..vi(0, y) + w].fill(0);
+    }
+    let mut bg_src = vec![[0i8; 2]; w * h];
     // Seed pixels are background by themselves; only those next to a pixel
     // that is not (yet) background can grow it, so only those are queued.
     // The queue is FIFO and consumed entries are dropped, so it holds only
@@ -145,8 +151,8 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
             }
             for y in py * SIDE..(py + 1) * SIDE {
                 for x in qx * SIDE..(qx + 1) * SIDE {
-                    is_bg[y * w + x] = true;
-                    bg_src[y * w + x] = (y * w + x) as u32;
+                    flags[vi(x, y)] = FLAG_BG | FLAG_VISITED;
+                    bg_src[y * w + x] = [0, 0];
                 }
             }
         }
@@ -164,7 +170,7 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
             for y in py * SIDE..(py + 1) * SIDE {
                 for x in qx * SIDE..(qx + 1) * SIDE {
                     let open = (y.saturating_sub(1)..(y + 2).min(h))
-                        .any(|ny| (x.saturating_sub(1)..(x + 2).min(w)).any(|nx| !is_bg[ny * w + nx]));
+                        .any(|ny| (x.saturating_sub(1)..(x + 2).min(w)).any(|nx| flags[vi(nx, ny)] & FLAG_BG == 0));
                     if open {
                         queue.push_back(Item { x: x as u32, y: y as u32, sx: x as u32, sy: y as u32, color: px(x, y) });
                     }
@@ -174,12 +180,12 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
     }
     while let Some(Item { x: cx, y: cy, sx, sy, color }) = queue.pop_front() {
         let (cx, cy) = (cx as usize, cy as usize);
-        bg_src[cy * w + cx] = sy * w as u32 + sx;
+        bg_src[cy * w + cx] = [(sx as isize - cx as isize) as i8, (sy as isize - cy as isize) as i8];
         let (x0, x1) = (cx.saturating_sub(1), (cx + 2).min(w));
         for ny in cy.saturating_sub(1)..(cy + 2).min(h) {
-            let row = ny * w;
             for nx in x0..x1 {
-                if is_bg[row + nx] {
+                let fi = vi(nx, ny);
+                if flags[fi] & FLAG_BG != 0 {
                     continue;
                 }
                 if nx.abs_diff(sx as usize) + ny.abs_diff(sy as usize) > DISTANCE_LIMIT {
@@ -187,38 +193,29 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
                 }
                 if similar(color, px(nx, ny), 0.8) {
                     queue.push_back(Item { x: nx as u32, y: ny as u32, sx, sy, color });
-                    is_bg[row + nx] = true;
+                    flags[fi] = FLAG_BG | FLAG_VISITED;
                 }
             }
         }
     }
     drop(queue);
     let background = |x: usize, y: usize| -> [f32; 3] {
-        let s = bg_src[y * w + x] as usize;
-        px(s % w, s / w)
+        let [dx, dy] = bg_src[y * w + x];
+        px((x as isize + isize::from(dx)) as usize, (y as isize + isize::from(dy)) as usize)
     };
 
     // Connected components outside the background are candidate patches.
     const MIN_PEAK: i32 = 2;
     const SIMILAR_RADIUS: usize = 2;
-    // Background pixels count as visited, so the fills below test one array.
-    // It has a one-pixel border (also "visited") so neighbours need no bounds
-    // checks: `vi` maps a pixel to its index.
-    let vw = w + 2;
-    let vi = |x: usize, y: usize| (y + 1) * vw + x + 1;
-    let mut visited = vec![true; vw * (h + 2)];
-    for y in 0..h {
-        visited[vi(0, y)..vi(0, y) + w].copy_from_slice(&is_bg[y * w..(y + 1) * w]);
-    }
     type Key = (usize, usize, [Vec<i8>; 3]);
-    type Found = (Key, [Vec<f32>; 3], Vec<(usize, usize)>);
+    type Found = (usize, usize, [Vec<f32>; 3], Vec<(usize, usize)>);
     let mut found: Vec<Found> = Vec::new();
     let mut index: std::collections::HashMap<Key, usize> = std::collections::HashMap::new();
     let mut stack: Vec<(usize, usize)> = Vec::new();
     let mut fill: Vec<u32> = Vec::new();
     for y in 0..h {
         for x in 0..w {
-            if visited[vi(x, y)] {
+            if flags[vi(x, y)] & FLAG_VISITED != 0 {
                 continue;
             }
             stack.clear();
@@ -228,10 +225,11 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
             let mut all_similar = true;
             let mut oversize = None;
             while let Some(cur) = stack.pop() {
-                if visited[vi(cur.0, cur.1)] {
+                let fi = vi(cur.0, cur.1);
+                if flags[fi] & FLAG_VISITED != 0 {
                     continue;
                 }
-                visited[vi(cur.0, cur.1)] = true;
+                flags[fi] |= FLAG_VISITED;
                 min_x = min_x.min(cur.0);
                 max_x = max_x.max(cur.0);
                 min_y = min_y.min(cur.1);
@@ -252,7 +250,7 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
                             continue;
                         }
                         let next = (nx as usize, ny as usize);
-                        if !is_bg[next.1 * w + next.0] {
+                        if flags[vi(next.0, next.1)] & FLAG_BG == 0 {
                             stack.push(next);
                         } else if let Some(r) = reference {
                             if !similar(background(next.0, next.1), background(r.0, r.1), 0.03) {
@@ -272,8 +270,8 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
                 fill.push(vi(cutoff.0, cutoff.1) as u32);
                 for &(sx, sy) in &stack {
                     let i = vi(sx, sy);
-                    if !visited[i] {
-                        visited[i] = true;
+                    if flags[i] & FLAG_VISITED == 0 {
+                        flags[i] |= FLAG_VISITED;
                         fill.push(i as u32);
                     }
                 }
@@ -290,8 +288,8 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
                 while let Some(cur) = fill.pop() {
                     for off in around {
                         let i = (cur as isize + off) as usize;
-                        if !visited[i] {
-                            visited[i] = true;
+                        if flags[i] & FLAG_VISITED == 0 {
+                            flags[i] |= FLAG_VISITED;
                             fill.push(i as u32);
                         }
                     }
@@ -333,10 +331,11 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
             }
             let key = (pxs, pys, qpix);
             match index.get(&key) {
-                Some(&i) => found[i].2.push((min_x, min_y)),
+                Some(&i) => found[i].3.push((min_x, min_y)),
                 None => {
-                    index.insert(key.clone(), found.len());
-                    found.push((key, fpix, vec![(min_x, min_y)]));
+                    let id = found.len();
+                    found.push((pxs, pys, fpix, vec![(min_x, min_y)]));
+                    index.insert(key, id);
                 }
             }
         }
@@ -347,8 +346,8 @@ pub fn find(xyb: &Xyb, w: usize, h: usize, distance: f32) -> Option<Patches> {
     const MIN_MAX_PATCH_PIXELS: usize = 20;
     let mut patches: Vec<Patch> = found
         .into_iter()
-        .filter(|(_, _, pos)| pos.len() >= MIN_OCCURRENCES)
-        .map(|((pxs, pys, _), pixels, positions)| Patch { w: pxs, h: pys, rx: 0, ry: 0, pixels, positions })
+        .filter(|(_, _, _, pos)| pos.len() >= MIN_OCCURRENCES)
+        .map(|(pxs, pys, pixels, positions)| Patch { w: pxs, h: pys, rx: 0, ry: 0, pixels, positions })
         .collect();
     if patches.iter().map(|p| p.w * p.h).max().unwrap_or(0) < MIN_MAX_PATCH_PIXELS {
         return None;

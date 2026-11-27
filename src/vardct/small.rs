@@ -5,79 +5,175 @@
 //! The DCT scaling is the same as in `dct.rs` (DC is the mean, AC basis
 //! functions carry a factor of sqrt(2)).
 
-use std::sync::OnceLock;
+/// `0.5 / cos(pi * (2i + 1) / (2N))` for Lee's 4-point and 8-point butterflies.
+const IC4: [f32; 2] = [0.541_196_1, 1.306_563];
+const IC8: [f32; 4] = [0.509_795_6, 0.601_344_9, 0.899_976_2, 2.562_915_6];
 
-/// `K[k][i]`: forward 1-D DCT matrix of size N (N = 4 or 8), and `J[i][k]`:
-/// its inverse.
-struct Basis {
-    fwd: [[f32; 8]; 8],
-    inv: [[f32; 8]; 8],
+#[inline(always)]
+fn dct4_raw(x: [f32; 4]) -> [f32; 4] {
+    const S: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    let e0 = x[0] + x[3];
+    let e1 = x[1] + x[2];
+    let o0 = (x[0] - x[3]) * IC4[0];
+    let o1 = (x[1] - x[2]) * IC4[1];
+    let ee0 = e0 + e1;
+    let ee1 = (e0 - e1) * S;
+    let oo0 = o0 + o1;
+    let oo1 = (o0 - o1) * S;
+    [ee0, oo0 + oo1, ee1, oo1]
 }
 
-fn basis(n: usize) -> &'static Basis {
-    static B4: OnceLock<Basis> = OnceLock::new();
-    static B8: OnceLock<Basis> = OnceLock::new();
-    let cell = if n == 4 { &B4 } else { &B8 };
-    cell.get_or_init(|| {
-        let mut b = Basis { fwd: [[0.0; 8]; 8], inv: [[0.0; 8]; 8] };
-        for k in 0..n {
-            let s = if k == 0 { 1.0 } else { std::f64::consts::SQRT_2 };
-            for i in 0..n {
-                let c = (std::f64::consts::PI * k as f64 * (2 * i + 1) as f64 / (2 * n) as f64).cos();
-                b.fwd[k][i] = (s * c / n as f64) as f32;
-                b.inv[i][k] = (s * c) as f32;
-            }
-        }
-        b
-    })
+#[inline(always)]
+fn dct4_1d(x: [f32; 4]) -> [f32; 4] {
+    const D: f32 = 0.25;
+    const S: f32 = std::f32::consts::SQRT_2 * 0.25;
+    let r = dct4_raw(x);
+    [r[0] * D, r[1] * S, r[2] * S, r[3] * S]
 }
 
-/// Forward 2-D DCT of an `rows` x `cols` pixel rectangle into natural layout
-/// `out[v * cols + u]` (v vertical, u horizontal frequency).
+#[inline(always)]
+fn dct8_1d(x: [f32; 8]) -> [f32; 8] {
+    const D: f32 = 0.125;
+    const S: f32 = std::f32::consts::SQRT_2 * 0.125;
+    let e = dct4_raw([x[0] + x[7], x[1] + x[6], x[2] + x[5], x[3] + x[4]]);
+    let o = dct4_raw([
+        (x[0] - x[7]) * IC8[0],
+        (x[1] - x[6]) * IC8[1],
+        (x[2] - x[5]) * IC8[2],
+        (x[3] - x[4]) * IC8[3],
+    ]);
+    [
+        e[0] * D,
+        (o[0] + o[1]) * S,
+        e[1] * S,
+        (o[1] + o[2]) * S,
+        e[2] * S,
+        (o[2] + o[3]) * S,
+        e[3] * S,
+        o[3] * S,
+    ]
+}
+
+#[inline(always)]
+fn idct4_raw(x: [f32; 4]) -> [f32; 4] {
+    const S: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    let e0 = x[0];
+    let e1 = x[2] * S;
+    let o0 = x[1];
+    let o1 = (x[3] + x[1]) * S;
+    let ee0 = e0 + e1;
+    let ee1 = e0 - e1;
+    let oo0 = (o0 + o1) * IC4[0];
+    let oo1 = (o0 - o1) * IC4[1];
+    [ee0 + oo0, ee1 + oo1, ee1 - oo1, ee0 - oo0]
+}
+
+#[inline(always)]
+fn idct4_1d(x: [f32; 4]) -> [f32; 4] {
+    const S: f32 = std::f32::consts::SQRT_2;
+    idct4_raw([x[0], x[1] * S, x[2] * S, x[3] * S])
+}
+
+#[inline(always)]
+fn idct8_1d(x: [f32; 8]) -> [f32; 8] {
+    const S: f32 = std::f32::consts::SQRT_2;
+    let x = [x[0], x[1] * S, x[2] * S, x[3] * S, x[4] * S, x[5] * S, x[6] * S, x[7] * S];
+    let e = idct4_raw([x[0], x[2], x[4], x[6]]);
+    let o = idct4_raw([x[1], x[3] + x[1], x[5] + x[3], x[7] + x[5]]);
+    let v0 = o[0] * IC8[0];
+    let v1 = o[1] * IC8[1];
+    let v2 = o[2] * IC8[2];
+    let v3 = o[3] * IC8[3];
+    [e[0] + v0, e[1] + v1, e[2] + v2, e[3] + v3, e[3] - v3, e[2] - v2, e[1] - v1, e[0] - v0]
+}
+
+/// Forward 2-D DCT of an `rows` x `cols` pixel rectangle (rows, cols in {4, 8})
+/// into natural layout `out[v * cols + u]` (v vertical, u horizontal frequency).
+#[inline(always)]
 fn dct2d(src: &[f32], stride: usize, rows: usize, cols: usize, out: &mut [f32]) {
-    let (br, bc) = (basis(rows), basis(cols));
     let mut tmp = [0f32; 64];
-    // Horizontal pass: tmp[y][u].
-    for y in 0..rows {
-        for u in 0..cols {
-            let mut s = 0.0;
-            for x in 0..cols {
-                s += src[y * stride + x] * bc.fwd[u][x];
-            }
-            tmp[y * cols + u] = s;
+    // Horizontal pass: tmp[y * cols + u].
+    if cols == 4 {
+        for y in 0..rows {
+            let r = &src[y * stride..];
+            let o = dct4_1d([r[0], r[1], r[2], r[3]]);
+            tmp[y * 4..y * 4 + 4].copy_from_slice(&o);
+        }
+    } else {
+        for y in 0..rows {
+            let r = &src[y * stride..];
+            let o = dct8_1d([r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]]);
+            tmp[y * 8..y * 8 + 8].copy_from_slice(&o);
         }
     }
-    for v in 0..rows {
+    // Vertical pass: out[v * cols + u].
+    if rows == 4 {
         for u in 0..cols {
-            let mut s = 0.0;
-            for y in 0..rows {
-                s += tmp[y * cols + u] * br.fwd[v][y];
+            let o = dct4_1d([tmp[u], tmp[cols + u], tmp[2 * cols + u], tmp[3 * cols + u]]);
+            for v in 0..4 {
+                out[v * cols + u] = o[v];
             }
-            out[v * cols + u] = s;
+        }
+    } else {
+        for u in 0..cols {
+            let o = dct8_1d([
+                tmp[u],
+                tmp[cols + u],
+                tmp[2 * cols + u],
+                tmp[3 * cols + u],
+                tmp[4 * cols + u],
+                tmp[5 * cols + u],
+                tmp[6 * cols + u],
+                tmp[7 * cols + u],
+            ]);
+            for v in 0..8 {
+                out[v * cols + u] = o[v];
+            }
         }
     }
 }
 
 /// Inverse of `dct2d`; writes an `rows` x `cols` pixel rectangle.
+#[inline(always)]
 fn idct2d(coef: &[f32], rows: usize, cols: usize, out: &mut [f32], stride: usize) {
-    let (br, bc) = (basis(rows), basis(cols));
     let mut tmp = [0f32; 64];
-    for y in 0..rows {
+    // Vertical pass: tmp[y * cols + u].
+    if rows == 4 {
         for u in 0..cols {
-            let mut s = 0.0;
-            for v in 0..rows {
-                s += coef[v * cols + u] * br.inv[y][v];
+            let o = idct4_1d([coef[u], coef[cols + u], coef[2 * cols + u], coef[3 * cols + u]]);
+            for y in 0..4 {
+                tmp[y * cols + u] = o[y];
             }
-            tmp[y * cols + u] = s;
+        }
+    } else {
+        for u in 0..cols {
+            let o = idct8_1d([
+                coef[u],
+                coef[cols + u],
+                coef[2 * cols + u],
+                coef[3 * cols + u],
+                coef[4 * cols + u],
+                coef[5 * cols + u],
+                coef[6 * cols + u],
+                coef[7 * cols + u],
+            ]);
+            for y in 0..8 {
+                tmp[y * cols + u] = o[y];
+            }
         }
     }
-    for y in 0..rows {
-        for x in 0..cols {
-            let mut s = 0.0;
-            for u in 0..cols {
-                s += tmp[y * cols + u] * bc.inv[x][u];
-            }
-            out[y * stride + x] = s;
+    // Horizontal pass: out[y * stride + x].
+    if cols == 4 {
+        for y in 0..rows {
+            let t = &tmp[y * 4..];
+            let o = idct4_1d([t[0], t[1], t[2], t[3]]);
+            out[y * stride..y * stride + 4].copy_from_slice(&o);
+        }
+    } else {
+        for y in 0..rows {
+            let t = &tmp[y * 8..];
+            let o = idct8_1d([t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]]);
+            out[y * stride..y * stride + 8].copy_from_slice(&o);
         }
     }
 }

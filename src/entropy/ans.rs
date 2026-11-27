@@ -12,6 +12,9 @@ pub const TAB: u32 = 1 << LOG_TAB;
 #[derive(Debug, Clone)]
 pub struct AnsDist {
     pub freq: Vec<u16>,
+    /// Precomputed Barrett reciprocal `ceil(2^63 / freq[s])` for branchless
+    /// exact division `state / freq[s]` via `(u128(state) * u128(rcp)) >> 63`.
+    rcp_freq: Vec<u64>,
     /// `slots[start[s] + r]` is the ANS slot of the r-th occurrence of symbol s.
     slots: Vec<u16>,
     start: Vec<u32>,
@@ -42,18 +45,21 @@ impl AnsDist {
             (f, DistEncoding::Single(s))
         } else {
             let total: u64 = counts.iter().map(|&c| u64::from(c)).sum();
-            let mut best: Option<(f64, Vec<u16>, u32)> = None;
+            let mut best: Option<(f64, [u16; 256], usize, u32)> = None;
+            let mut buf = [0u16; 256];
             for shift in 0..=LOG_TAB {
-                let Some(f) = normalize(counts, shift) else {
+                let Some(len) = normalize(counts, shift, &mut buf) else {
                     continue;
                 };
-                let cost = header_bits(&f, shift) as f64 + data_bits(counts, &f, total);
+                let f = &buf[..len];
+                let cost = header_bits(f, shift) as f64 + data_bits(counts, f, total);
                 if best.as_ref().is_none_or(|b| cost < b.0) {
-                    best = Some((cost, f, shift));
+                    best = Some((cost, buf, len, shift));
                 }
             }
-            let (cost, mut f, shift) = best.expect("no valid ANS normalisation");
-            f.resize(table_size, 0);
+            let (cost, best_buf, best_len, shift) = best.expect("no valid ANS normalisation");
+            let mut f = vec![0u16; table_size];
+            f[..best_len].copy_from_slice(&best_buf[..best_len]);
             let mut encoding = DistEncoding::General(shift);
             if let [a, b] = used[..] {
                 let mut binary = vec![0u16; table_size];
@@ -68,8 +74,22 @@ impl AnsDist {
             }
             (f, encoding)
         };
+        let rcp_freq: Vec<u64> =
+            freq.iter().map(|&f| if f == 0 { 0 } else { (1u64 << 63).div_ceil(u64::from(f)) }).collect();
         let (slots, start) = reverse_alias_table(&freq, log_alpha);
-        AnsDist { freq, slots, start, encoding }
+        AnsDist { freq, rcp_freq, slots, start, encoding }
+    }
+
+    /// Exact `(state / freq[s], state % freq[s])` using precomputed reciprocal
+    /// multiplication (valid for all `state: u32` and `1 <= freq[s] <= 4096`).
+    #[inline]
+    pub fn div_mod(&self, s: usize, state: u32) -> (u32, u32) {
+        let freq = u32::from(self.freq[s]);
+        let q = ((u128::from(state) * u128::from(self.rcp_freq[s])) >> 63) as u32;
+        let r = state - q * freq;
+        debug_assert_eq!(q, state / freq);
+        debug_assert_eq!(r, state % freq);
+        (q, r)
     }
 
     /// ANS slot for the `r`-th (0-based, `r < freq[s]`) state of symbol `s`.
@@ -115,14 +135,19 @@ pub fn estimate_removed_cost(a: &[u32], b: &[u32]) -> f64 {
     estimate_cost_counts((0..a.len()).map(|i| a[i] - b.get(i).copied().unwrap_or(0)))
 }
 
+const XLOGX_N: usize = 4096;
+
 /// Histogram clustering repeatedly evaluates small integer counts. Tabulating
 /// c*log2(c) avoids a transcendental call per occupied bin, and the entropy is
 /// then xlogx(total) - sum(xlogx(count)). Use f64 to keep tie decisions stable.
-fn xlogx(count: u64) -> f64 {
-    const N: usize = 4096;
-    static TABLE: std::sync::OnceLock<[f64; N]> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| std::array::from_fn(|i| if i == 0 { 0.0 } else { i as f64 * (i as f64).log2() }));
-    if count < N as u64 { table[count as usize] } else { count as f64 * (count as f64).log2() }
+fn xlogx_table() -> &'static [f64; XLOGX_N] {
+    static TABLE: std::sync::OnceLock<[f64; XLOGX_N]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|i| if i == 0 { 0.0 } else { i as f64 * (i as f64).log2() }))
+}
+
+#[inline]
+fn xlogx_with(table: &[f64; XLOGX_N], count: u64) -> f64 {
+    if count < XLOGX_N as u64 { table[count as usize] } else { count as f64 * (count as f64).log2() }
 }
 
 fn estimate_cost_counts(counts: impl ExactSizeIterator<Item = u32> + Clone) -> f64 {
@@ -131,12 +156,13 @@ fn estimate_cost_counts(counts: impl ExactSizeIterator<Item = u32> + Clone) -> f
     if total == 0 {
         return 0.0;
     }
-    let mut bits = xlogx(total);
+    let table = xlogx_table();
+    let mut bits = xlogx_with(table, total);
     let mut nonzero = 0;
     for c in counts {
         if c > 0 {
             nonzero += 1;
-            bits -= xlogx(u64::from(c));
+            bits -= xlogx_with(table, u64::from(c));
         }
     }
     if nonzero <= 1 {
@@ -188,17 +214,19 @@ fn code_of(f: u16) -> u32 {
     if f == 0 { 0 } else { 32 - u32::from(f).leading_zeros() }
 }
 
-/// Normalise counts to 4096 for a given shift. The most frequent symbol (the
-/// first one with the largest log-count after rounding) absorbs the rounding
-/// error; it must stay the strict first maximum or the decoder would pick a
-/// different one, so on failure the others are scaled down and retried.
-fn normalize(counts: &[u32], shift: u32) -> Option<Vec<u16>> {
+/// Normalise counts to 4096 for a given shift into `buf`. The most frequent
+/// symbol (the first one with the largest log-count after rounding) absorbs
+/// the rounding error; it must stay the strict first maximum or the decoder
+/// would pick a different one, so on failure the others are scaled down and
+/// retried. Returns the active length `alphabet.max(3)`.
+fn normalize(counts: &[u32], shift: u32, buf: &mut [u16; 256]) -> Option<usize> {
     let total: u64 = counts.iter().map(|&c| u64::from(c)).sum();
     let alphabet = counts.iter().rposition(|&c| c > 0)? + 1;
+    let out_len = alphabet.max(3);
     let omit = (0..alphabet).max_by_key(|&i| (counts[i], std::cmp::Reverse(i)))?;
     let mut scale = 1.0f64;
     for _ in 0..64 {
-        let mut f = vec![0u16; alphabet.max(3)];
+        buf[..out_len].fill(0);
         let mut sum = 0u32;
         for i in 0..alphabet {
             if counts[i] == 0 || i == omit {
@@ -206,19 +234,19 @@ fn normalize(counts: &[u32], shift: u32) -> Option<Vec<u16>> {
             }
             let target = (f64::from(counts[i]) * f64::from(TAB) / total as f64 * scale).round().max(1.0) as u32;
             let v = representable(target, shift).min(TAB - 1);
-            f[i] = v as u16;
+            buf[i] = v as u16;
             sum += v;
         }
         if sum < TAB {
             let rest = TAB - sum;
-            f[omit] = rest as u16;
-            let oc = code_of(f[omit]);
+            buf[omit] = rest as u16;
+            let oc = code_of(buf[omit]);
             let ok = (0..alphabet).all(|i| {
-                let c = code_of(f[i]);
+                let c = code_of(buf[i]);
                 i == omit || (i < omit && c < oc) || (i > omit && c <= oc)
             });
             if ok && oc <= 12 {
-                return Some(f);
+                return Some(out_len);
             }
         }
         scale *= 0.97;
@@ -226,16 +254,19 @@ fn normalize(counts: &[u32], shift: u32) -> Option<Vec<u16>> {
     None
 }
 
-fn data_bits(counts: &[u32], f: &[u16], _total: u64) -> f64 {
-    counts
-        .iter()
-        .zip(f)
-        .filter(|(c, _)| **c > 0)
-        .map(|(&c, &f)| f64::from(c) * (f64::from(TAB) / f64::from(f)).log2())
-        .sum()
+fn bits_per_symbol_table() -> &'static [f64; TAB as usize + 1] {
+    static TABLE: std::sync::OnceLock<[f64; TAB as usize + 1]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        std::array::from_fn(|f| if f == 0 { 0.0 } else { f64::from(LOG_TAB) - (f as f64).log2() })
+    })
 }
 
-/// Prefix code for the log-counts 0..=12 (13 is the unused RLE escape):
+fn data_bits(counts: &[u32], f: &[u16], _total: u64) -> f64 {
+    let lut = bits_per_symbol_table();
+    counts.iter().zip(f).filter(|(c, _)| **c > 0).map(|(&c, &f)| f64::from(c) * lut[f as usize]).sum()
+}
+
+/// Prefix code for the log-counts 0..=12 and 13 (repeat previous symbol RLE):
 /// (3-bit value, extra bits, number of extra bits).
 fn logcount_code(code: u32) -> (u64, u64, u32) {
     match code {
@@ -263,17 +294,40 @@ fn shift_bits(shift: u32) -> u32 {
     len + (len < 3) as u32 + len
 }
 
+/// Check if a zero-run RLE (code 13) can be emitted starting at `i`, returning
+/// the run length (>= 4) if so. Code 13 repeats `prev` (which is 0 at `i == 0`
+/// or whenever `f[i - 1] == 0`), and is disallowed at `omit + 1`.
+#[inline]
+fn zero_rle_run(f: &[u16], i: usize, alphabet: usize, omit: usize) -> Option<usize> {
+    if f[i] != 0 || i == omit + 1 || (i > 0 && f[i - 1] != 0) {
+        return None;
+    }
+    let mut run = 1;
+    while i + run < alphabet && f[i + run] == 0 {
+        run += 1;
+    }
+    (run >= 4).then_some(run)
+}
+
 fn header_bits(f: &[u16], shift: u32) -> usize {
     let alphabet = (f.iter().rposition(|&v| v > 0).unwrap_or(0) + 1).max(3);
     let omit = omit_pos(f, alphabet);
     let mut bits = 2 + shift_bits(shift) + u8_bits(alphabet as u32 - 3);
-    for (i, &v) in f[..alphabet].iter().enumerate() {
-        let code = code_of(v);
+    let mut i = 0;
+    while i < alphabet {
+        if let Some(run) = zero_rle_run(f, i, alphabet, omit) {
+            let (_, _, n) = logcount_code(13);
+            bits += 3 + n + u8_bits((run - 4) as u32);
+            i += run;
+            continue;
+        }
+        let code = code_of(f[i]);
         let (_, _, n) = logcount_code(code);
         bits += 3 + n;
         if code > 1 && i != omit {
             bits += bitcount(shift, code - 1);
         }
+        i += 1;
     }
     bits as usize
 }
@@ -302,10 +356,20 @@ fn write_general(w: &mut BitWriter, f: &[u16], shift: u32) {
     w.write(len, u64::from(shift + 1 - (1 << len)));
     write_u8(w, alphabet as u32 - 3);
     let omit = omit_pos(f, alphabet);
-    for &v in &f[..alphabet] {
-        let (v3, extra, n) = logcount_code(code_of(v));
+    let mut i = 0;
+    while i < alphabet {
+        if let Some(run) = zero_rle_run(f, i, alphabet, omit) {
+            let (v3, extra, n) = logcount_code(13);
+            w.write(3, v3);
+            w.write(n, extra);
+            write_u8(w, (run - 4) as u32);
+            i += run;
+            continue;
+        }
+        let (v3, extra, n) = logcount_code(code_of(f[i]));
         w.write(3, v3);
         w.write(n, extra);
+        i += 1;
     }
     for (i, &v) in f[..alphabet].iter().enumerate() {
         let code = code_of(v);

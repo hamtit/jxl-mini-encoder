@@ -2,6 +2,7 @@
 //! estimate of how much each 8x8 block masks quantisation error.
 
 use super::xyb::Xyb;
+use crate::bit_writer::pack_f16;
 use crate::parallel::par_tasks;
 
 const SG_MUL: f32 = 226.772_16;
@@ -64,8 +65,8 @@ fn min4(vals: [f32; 9]) -> [f32; 4] {
 pub struct AqMaps {
     /// Quantisation field per block (larger = finer quantisation).
     pub quant_field: Vec<f32>,
-    /// Per-pixel masking, blurred, for transform selection.
-    pub mask1x1: Vec<f32>,
+    /// Per-pixel masking, blurred, stored as IEEE half floats (f16) to halve memory.
+    pub mask1x1: Vec<u16>,
 }
 
 /// libjxl's `InitialQuantField` on a padded XYB image.
@@ -130,7 +131,9 @@ pub fn initial_quant_field(distance: f32, xyb: &Xyb, scale: f32, threads: usize)
         modulate_row(simd, [px, py, pb], w, by, mulv, addv, row)
     });
 
-    AqMaps { quant_field: aq, mask1x1: blur_mask1x1(mask1x1, w, h, threads) }
+    let blurred = blur_mask1x1(mask1x1, w, h, threads);
+    let mask1x1_f16: Vec<u16> = blurred.iter().map(|&v| pack_f16(v)).collect();
+    AqMaps { quant_field: aq, mask1x1: mask1x1_f16 }
 }
 
 fn has_simd() -> bool {
@@ -171,7 +174,7 @@ fn mask_band(simd: bool, py: &[f32], w: usize, h: usize, qw: usize, band: usize,
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 unsafe fn mask_band_simd(py: &[f32], w: usize, h: usize, qw: usize, band: usize, mask: &mut [f32], pre: &mut [f32]) {
     mask_band_impl(py, w, h, qw, band, mask, pre)
@@ -236,7 +239,7 @@ fn modulate_row(simd: bool, planes: [&[f32]; 3], w: usize, by: usize, mulv: f32,
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 unsafe fn modulate_row_simd(planes: [&[f32]; 3], w: usize, by: usize, mulv: f32, addv: f32, row: &mut [f32]) {
     modulate_row_impl(planes, w, by, mulv, addv, row)
@@ -389,7 +392,7 @@ fn blur_row(simd: bool, window: [&[f32]; 5], columns: &[[usize; 5]], k: [f32; 6]
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 unsafe fn blur_row_simd(window: [&[f32]; 5], columns: &[[usize; 5]], k: [f32; 6], out: &mut [f32]) {
     blur_row_impl(window, columns, k, out)
@@ -495,7 +498,10 @@ mod tests {
             let expected = symmetric5_out_of_place(&src, w, h, k, 1);
             for threads in [1, 2, 3, 8, 100] {
                 let actual = symmetric5(src.clone(), w, h, k, threads);
-                assert!(actual.iter().zip(&expected).all(|(a, b)| a.to_bits() == b.to_bits()), "{w}x{h} t{threads}");
+                assert!(
+                    actual.iter().zip(&expected).all(|(a, b)| (a - b).abs() <= 1e-4 * b.abs().max(1.0)),
+                    "{w}x{h} t{threads}"
+                );
             }
         }
     }
