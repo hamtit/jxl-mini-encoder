@@ -2,7 +2,10 @@
 //! tree serialisation and a greedy entropy-driven tree learner.
 
 use super::Channel;
-use super::predict::{MAX_PREV_CHANNELS, NUM_PROPS, Neighbors, Predictor, Weighted, base_props, prev_channel_props};
+use super::predict::{
+    MAX_PREV_CHANNELS, NUM_PROPS, Neighbors, Predictor, Weighted, base_props_masked, prev_channel_props,
+    prev_channel_props_inner,
+};
 use crate::bit_writer::BitWriter;
 use crate::entropy::{CodeOptions, HybridUint, Token, pack_signed, write_stream};
 use crate::parallel::{par_map, par_tasks};
@@ -31,6 +34,7 @@ pub struct Tree {
     num_leaves: u32,
     uses_wp: bool,
     max_prev: usize,
+    used_props: u32,
 }
 
 /// Recursive form used while building.
@@ -58,11 +62,13 @@ impl Tree {
         let mut num_leaves = 0;
         let mut uses_wp = false;
         let mut max_prev = 0;
+        let mut used_props = 0u32;
         while let Some(b) = queue.pop_front() {
             match b {
                 Build::Split { prop, val, left, right, .. } => {
                     nodes.push(Node::Split { prop, val, left: next_child, right: next_child + 1 });
                     next_child += 2;
+                    used_props |= 1u32 << prop;
                     uses_wp |= prop == 15;
                     if prop as usize >= 16 {
                         max_prev = max_prev.max((prop as usize - 16) / 4 + 1);
@@ -77,7 +83,7 @@ impl Tree {
                 }
             }
         }
-        Tree { nodes, num_leaves, uses_wp, max_prev }
+        Tree { nodes, num_leaves, uses_wp, max_prev, used_props }
     }
 
     pub fn num_leaves(&self) -> usize {
@@ -124,18 +130,24 @@ impl Tree {
         }
         let mut nodes = Vec::new();
         copy(self, 0, channel, stream, &mut nodes);
-        let uses_wp = nodes
-            .iter()
-            .any(|n| matches!(n, Node::Split { prop: 15, .. } | Node::Leaf { pred: Predictor::Weighted, .. }));
-        let max_prev = nodes
-            .iter()
-            .filter_map(|n| match n {
-                Node::Split { prop, .. } if *prop >= 16 => Some((*prop as usize - 16) / 4 + 1),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0);
-        std::borrow::Cow::Owned(Self { nodes, num_leaves: self.num_leaves, uses_wp, max_prev })
+        let mut uses_wp = false;
+        let mut max_prev = 0usize;
+        let mut used_props = 0u32;
+        for n in &nodes {
+            match *n {
+                Node::Split { prop, .. } => {
+                    used_props |= 1u32 << prop;
+                    uses_wp |= prop == 15;
+                    if prop as usize >= 16 {
+                        max_prev = max_prev.max((prop as usize - 16) / 4 + 1);
+                    }
+                }
+                Node::Leaf { pred, .. } => {
+                    uses_wp |= pred == Predictor::Weighted;
+                }
+            }
+        }
+        std::borrow::Cow::Owned(Self { nodes, num_leaves: self.num_leaves, uses_wp, max_prev, used_props })
     }
 
     /// Serialise the tree with its own entropy code.
@@ -191,7 +203,7 @@ impl Tree {
         }
         let tree = self.specialize(i as i32, stream as i32);
         let prev = previous_same_size(channels, i, tree.max_prev);
-        visit(ch, i as i32, stream as i32, &prev, tree.uses_wp, |props, nb, wp, v| {
+        visit(ch, i as i32, stream as i32, &prev, tree.uses_wp, tree.used_props, |props, nb, wp, v| {
             let (pred, ctx) = tree.leaf(props);
             let p = pred.predict(nb, wp);
             out.push(Token::new(ctx, pack_signed(v.wrapping_sub(p))));
@@ -205,36 +217,88 @@ fn previous_same_size<'a>(channels: &[&'a Channel], i: usize, max_prev: usize) -
     channels[..i].iter().rev().filter(|c| c.w == ch.w && c.h == ch.h).take(max_prev).copied().collect()
 }
 
-/// Walk a channel in raster order, computing properties and (optionally) the
-/// weighted prediction for every sample.
+/// Walk a channel in raster order, computing only properties present in
+/// `used_props` and (optionally) the weighted prediction for every sample.
 fn visit(
     ch: &Channel,
     index: i32,
     stream: i32,
     prev: &[&Channel],
     use_wp: bool,
+    used_props: u32,
     mut f: impl FnMut(&[i32; NUM_PROPS], &Neighbors, i64, i32),
 ) {
     let w = ch.w;
     let mut wp = use_wp.then(|| Weighted::new(w));
     let mut props = [0i32; NUM_PROPS];
+    props[0] = index;
+    props[1] = stream;
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn step_border<F: FnMut(&[i32; NUM_PROPS], &Neighbors, i64, i32)>(
+        x: usize,
+        y: usize,
+        w: usize,
+        cur: &[i32],
+        above: Option<&[i32]>,
+        above2: Option<&[i32]>,
+        prev: &[&Channel],
+        used_props: u32,
+        prev_grad: &mut i32,
+        wp: &mut Option<Weighted>,
+        props: &mut [i32; NUM_PROPS],
+        f: &mut F,
+    ) {
+        let nb = Neighbors::at(x, cur, above, above2, w);
+        let wpp = wp.as_ref().map(|wp| wp.predict(&nb));
+        let max_err = wpp.as_ref().map_or(0, |p| p.max_error);
+        *prev_grad = base_props_masked(props, x, &nb, *prev_grad, max_err, used_props);
+        for (k, p) in prev.iter().enumerate() {
+            if (used_props >> (16 + 4 * k)) & 0xF != 0 {
+                prev_channel_props(props, k, &p.data, w, x, y);
+            }
+        }
+        let v = cur[x];
+        f(props, &nb, wpp.as_ref().map_or(0, |p| p.prediction), v);
+        if let (Some(wp), Some(p)) = (wp.as_mut(), wpp.as_ref()) {
+            wp.record(p, v);
+        }
+    }
     for y in 0..ch.h {
+        props[2] = y as i32;
         let cur = &ch.data[y * w..(y + 1) * w];
         let above = (y > 0).then(|| &ch.data[(y - 1) * w..y * w]);
         let above2 = (y > 1).then(|| &ch.data[(y - 2) * w..(y - 1) * w]);
         let mut prev_grad = 0;
-        for x in 0..w {
-            let nb = Neighbors::at(x, cur, above, above2, w);
-            let wpp = wp.as_ref().map(|wp| wp.predict(&nb));
-            let max_err = wpp.as_ref().map_or(0, |p| p.max_error);
-            prev_grad = base_props(&mut props, index, stream, x, y, &nb, prev_grad, max_err);
-            for (k, p) in prev.iter().enumerate() {
-                prev_channel_props(&mut props, k, &p.data, w, x, y);
+        if y < 2 || w < 5 {
+            for x in 0..w {
+                step_border(x, y, w, cur, above, above2, prev, used_props, &mut prev_grad, &mut wp, &mut props, &mut f);
             }
-            let v = cur[x];
-            f(&props, &nb, wpp.as_ref().map_or(0, |p| p.prediction), v);
-            if let (Some(wp), Some(p)) = (wp.as_mut(), wpp.as_ref()) {
-                wp.record(p, v);
+        } else {
+            let (ab, ab2) = (above.unwrap(), above2.unwrap());
+            for x in 0..2 {
+                step_border(x, y, w, cur, above, above2, prev, used_props, &mut prev_grad, &mut wp, &mut props, &mut f);
+            }
+            for x in 2..w - 2 {
+                let nb = Neighbors::inner(x, cur, ab, ab2);
+                let wpp = wp.as_ref().map(|wp| wp.predict(&nb));
+                let max_err = wpp.as_ref().map_or(0, |p| p.max_error);
+                prev_grad = base_props_masked(&mut props, x, &nb, prev_grad, max_err, used_props);
+                for (k, p) in prev.iter().enumerate() {
+                    if (used_props >> (16 + 4 * k)) & 0xF != 0 {
+                        let pcur = &p.data[y * w..(y + 1) * w];
+                        let pab = &p.data[(y - 1) * w..y * w];
+                        prev_channel_props_inner(&mut props, k, pcur, pab, x);
+                    }
+                }
+                let v = cur[x];
+                f(&props, &nb, wpp.as_ref().map_or(0, |p| p.prediction), v);
+                if let (Some(wp), Some(p)) = (wp.as_mut(), wpp.as_ref()) {
+                    wp.record(p, v);
+                }
+            }
+            for x in w - 2..w {
+                step_border(x, y, w, cur, above, above2, prev, used_props, &mut prev_grad, &mut wp, &mut props, &mut f);
             }
         }
     }
@@ -278,7 +342,7 @@ mod tests {
                 let mut expected = Vec::new();
                 for (i, ch) in channels.iter().enumerate() {
                     let prev = previous_same_size(&refs, i, tree.max_prev);
-                    visit(ch, i as i32, stream as i32, &prev, tree.uses_wp, |props, nb, wp, v| {
+                    visit(ch, i as i32, stream as i32, &prev, tree.uses_wp, u32::MAX, |props, nb, wp, v| {
                         let (pred, ctx) = tree.leaf(props);
                         expected.push(Token::new(ctx, pack_signed(v.wrapping_sub(pred.predict(nb, wp)))));
                     });
@@ -456,6 +520,7 @@ fn learn_sized<const N: usize>(streams: &[(u32, Vec<&Channel>)], opts: &LearnOpt
     let stride = total_px.div_ceil(opts.max_samples.max(1)).max(1);
     let need_wp = opts.predictors.contains(&Predictor::Weighted) || opts.props.contains(&15);
     let uses_prev = opts.props.iter().any(|&p| p >= 16);
+    let used_props: u32 = opts.props.iter().fold(0u32, |m, &p| m | (1u32 << p));
     // One unit per (stream, channel); `offset` is the number of pixels
     // before it, so every unit samples exactly the pixels a sequential walk
     // would have.
@@ -493,7 +558,7 @@ fn learn_sized<const N: usize>(streams: &[(u32, Vec<&Channel>)], opts: &LearnOpt
         let mut counter = start;
         let mut k = 0;
         let prev = previous_same_size(chans, i, if uses_prev { MAX_PREV_CHANNELS } else { 0 });
-        visit(ch, i as i32, *stream as i32, &prev, need_wp, |props, nb, wp, v| {
+        visit(ch, i as i32, *stream as i32, &prev, need_wp, used_props, |props, nb, wp, v| {
             counter += 1;
             if !counter.is_multiple_of(stride) {
                 return;
@@ -754,9 +819,9 @@ impl<const N: usize> Learner<'_, N> {
         let bextra = &st.bextra[lay.ext[prop_index]..];
         let mut best: Option<(f64, u8, i32)> = None;
         // right = buckets[..=t], left = buckets[t+1..]
-        let mut rcounts = vec![0u32; np * ntok];
+        let mut rcounts = [0u32; 4 * MAX_TOK];
         let mut rtotal = 0u32;
-        let mut rextra = vec![0u64; np];
+        let mut rextra = [0u64; 4];
         let all = hists[0].total;
         let table = xlogx_table();
         for (t, &val) in th.iter().enumerate() {

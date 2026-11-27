@@ -61,6 +61,20 @@ impl Neighbors {
         let ww = if x >= 2 { cur[x - 2] } else { w };
         Neighbors { n, w, nw, ne, nn, ww, nee }
     }
+
+    /// Branchless neighbour lookup for interior pixels (`y >= 2`, `2 <= x < width - 2`).
+    #[inline(always)]
+    pub fn inner(x: usize, cur: &[i32], prev: &[i32], prev2: &[i32]) -> Self {
+        Neighbors {
+            n: prev[x],
+            w: cur[x - 1],
+            nw: prev[x - 1],
+            ne: prev[x + 1],
+            nn: prev2[x],
+            ww: cur[x - 2],
+            nee: prev[x + 2],
+        }
+    }
 }
 
 #[inline(always)]
@@ -262,37 +276,67 @@ impl Weighted {
     }
 }
 
-/// Fill the 16 base properties. `prev_grad` is property 9 of the previous
-/// sample in the row (0 at the row start); returns this sample's property 9.
+/// Fill only the base properties (3..16) whose bits are set in `used_props`.
+/// Properties 0, 1, 2 (channel, stream, y) are set once per channel/row by the caller.
+/// `prev_grad` is property 9 of the previous sample in the row; returns this sample's property 9.
 #[inline(always)]
-pub fn base_props(
+pub fn base_props_masked(
     props: &mut [i32; NUM_PROPS],
-    channel: i32,
-    stream: i32,
     x: usize,
-    y: usize,
     nb: &Neighbors,
     prev_grad: i32,
     wp_max_error: i32,
+    used_props: u32,
 ) -> i32 {
-    let w_nw = nb.w.wrapping_sub(nb.nw);
-    let p9 = w_nw.wrapping_add(nb.n);
-    props[0] = channel;
-    props[1] = stream;
-    props[2] = y as i32;
-    props[3] = x as i32;
-    props[4] = nb.n.unsigned_abs() as i32;
-    props[5] = nb.w.unsigned_abs() as i32;
-    props[6] = nb.n;
-    props[7] = nb.w;
-    props[8] = nb.w.wrapping_sub(prev_grad);
-    props[9] = p9;
-    props[10] = w_nw;
-    props[11] = nb.nw.wrapping_sub(nb.n);
-    props[12] = nb.n.wrapping_sub(nb.ne);
-    props[13] = nb.n.wrapping_sub(nb.nn);
-    props[14] = nb.w.wrapping_sub(nb.ww);
-    props[15] = wp_max_error;
+    if (used_props & 0xFFF8) == 0 {
+        return 0;
+    }
+    if used_props & (1 << 3) != 0 {
+        props[3] = x as i32;
+    }
+    if used_props & (1 << 4) != 0 {
+        props[4] = nb.n.unsigned_abs() as i32;
+    }
+    if used_props & (1 << 5) != 0 {
+        props[5] = nb.w.unsigned_abs() as i32;
+    }
+    if used_props & (1 << 6) != 0 {
+        props[6] = nb.n;
+    }
+    if used_props & (1 << 7) != 0 {
+        props[7] = nb.w;
+    }
+    let p9 = if used_props & ((1 << 8) | (1 << 9) | (1 << 10)) != 0 {
+        let w_nw = nb.w.wrapping_sub(nb.nw);
+        let p9 = w_nw.wrapping_add(nb.n);
+        if used_props & (1 << 8) != 0 {
+            props[8] = nb.w.wrapping_sub(prev_grad);
+        }
+        if used_props & (1 << 9) != 0 {
+            props[9] = p9;
+        }
+        if used_props & (1 << 10) != 0 {
+            props[10] = w_nw;
+        }
+        p9
+    } else {
+        0
+    };
+    if used_props & (1 << 11) != 0 {
+        props[11] = nb.nw.wrapping_sub(nb.n);
+    }
+    if used_props & (1 << 12) != 0 {
+        props[12] = nb.n.wrapping_sub(nb.ne);
+    }
+    if used_props & (1 << 13) != 0 {
+        props[13] = nb.n.wrapping_sub(nb.nn);
+    }
+    if used_props & (1 << 14) != 0 {
+        props[14] = nb.w.wrapping_sub(nb.ww);
+    }
+    if used_props & (1 << 15) != 0 {
+        props[15] = wp_max_error;
+    }
     p9
 }
 
@@ -307,6 +351,18 @@ pub fn prev_channel_props(props: &mut [i32; NUM_PROPS], k: usize, ch: &[i32], wi
         (_, 0) => ch[x - 1],
         _ => grad_clamped(ch[(y - 1) * width + x], ch[y * width + x - 1], ch[(y - 1) * width + x - 1]),
     };
+    let base = NUM_BASE_PROPS + 4 * k;
+    props[base] = c.wrapping_abs();
+    props[base + 1] = c;
+    props[base + 2] = c.abs_diff(g) as i32;
+    props[base + 3] = c.wrapping_sub(g);
+}
+
+/// Branchless interior version of `prev_channel_props` (`x >= 1`, `y >= 1`).
+#[inline(always)]
+pub fn prev_channel_props_inner(props: &mut [i32; NUM_PROPS], k: usize, cur: &[i32], above: &[i32], x: usize) {
+    let c = cur[x];
+    let g = grad_clamped(above[x], cur[x - 1], above[x - 1]);
     let base = NUM_BASE_PROPS + 4 * k;
     props[base] = c.wrapping_abs();
     props[base + 1] = c;

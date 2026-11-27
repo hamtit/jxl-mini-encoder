@@ -27,6 +27,10 @@ impl BitWriter {
         Self { buf: Vec::with_capacity(bytes), ..Self::default() }
     }
 
+    pub fn reserve_exact(&mut self, additional: usize) {
+        self.buf.reserve_exact(additional);
+    }
+
     /// Write the low `n` bits of `v` (n <= 32).
     #[inline]
     pub fn write(&mut self, n: u32, v: u64) {
@@ -34,10 +38,10 @@ impl BitWriter {
         debug_assert!(n == 32 || v < (1u64 << n), "value {v} does not fit in {n} bits");
         self.acc |= v << self.nbits;
         self.nbits += n;
-        while self.nbits >= 8 {
-            self.buf.push(self.acc as u8);
-            self.acc >>= 8;
-            self.nbits -= 8;
+        if self.nbits >= 32 {
+            self.buf.extend_from_slice(&(self.acc as u32).to_le_bytes());
+            self.acc >>= 32;
+            self.nbits -= 32;
         }
     }
 
@@ -50,14 +54,27 @@ impl BitWriter {
         self.buf.len() * 8 + self.nbits as usize
     }
 
+    #[inline]
+    fn flush_bytes(&mut self) {
+        while self.nbits >= 8 {
+            self.buf.push(self.acc as u8);
+            self.acc >>= 8;
+            self.nbits -= 8;
+        }
+    }
+
     pub fn zero_pad_to_byte(&mut self) {
+        self.flush_bytes();
         if self.nbits > 0 {
-            self.write(8 - self.nbits, 0);
+            self.buf.push(self.acc as u8);
+            self.acc = 0;
+            self.nbits = 0;
         }
     }
 
     /// Append another writer's bits.
     pub fn append(&mut self, other: &BitWriter) {
+        self.flush_bytes();
         if self.nbits == 0 {
             self.buf.extend_from_slice(&other.buf);
         } else {
@@ -72,6 +89,7 @@ impl BitWriter {
 
     /// Append whole bytes; the writer must be byte aligned.
     pub fn append_bytes(&mut self, bytes: &[u8]) {
+        self.flush_bytes();
         assert_eq!(self.nbits, 0, "append_bytes on an unaligned writer");
         self.buf.extend_from_slice(bytes);
     }

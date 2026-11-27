@@ -25,7 +25,7 @@
 pub(crate) fn simd_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        std::arch::is_x86_feature_detected!("avx2")
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -295,7 +295,7 @@ pub fn encode_animation(
     // Sparse lossless frames are blended: unchanged pixels are transparent,
     // which needs an alpha channel even if the input has none.
     let blending = plan.iter().any(|p| p.blend);
-    let mut w = BitWriter::with_capacity(first.image.data.len() * frames.len() / 8);
+    let mut w = BitWriter::new();
     let info = ImageInfo {
         width: first.image.width,
         height: first.image.height,
@@ -366,6 +366,8 @@ pub fn encode_animation(
         encode_frame(&part, &inner_opts, placement, noise, &mut fw);
         fw.finish()
     });
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+    w.reserve_exact(total);
     for part in parts {
         w.append_bytes(&part);
     }

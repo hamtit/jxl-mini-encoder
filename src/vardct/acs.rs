@@ -4,6 +4,7 @@
 use super::dct::Dct;
 use super::quant::dct_quant_weights;
 use super::small::{self, Small};
+use crate::bit_writer::unpack_f16;
 
 /// The DCT transforms this encoder uses (numbered as in the bitstream).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -405,8 +406,8 @@ pub struct SearchInput<'a> {
     pub bh: usize,
     /// Initial quantisation field per block.
     pub quant: &'a [f32],
-    /// Blurred per-pixel masking.
-    pub mask1x1: &'a [f32],
+    /// Blurred per-pixel masking (f16-packed).
+    pub mask1x1: &'a [u16],
     /// Chroma-from-luma factors for X and B (Y is 0).
     pub cmap: [f32; 3],
     pub distance: f32,
@@ -571,7 +572,7 @@ fn reduce8(a: &[f32; 8]) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn quant_stage_avx2(
     c0: &[f32],
     c1: &[f32],
@@ -594,7 +595,7 @@ unsafe fn quant_stage_avx2(
             let b = _mm256_loadu_ps(c1.as_ptr().add(i));
             let w = _mm256_loadu_ps(wt.as_ptr().add(i));
             let iwv = _mm256_loadu_ps(iw.as_ptr().add(i));
-            let v = _mm256_mul_ps(_mm256_mul_ps(_mm256_sub_ps(a, _mm256_mul_ps(kv, b)), w), qv);
+            let v = _mm256_mul_ps(_mm256_mul_ps(_mm256_fnmadd_ps(kv, b, a), w), qv);
             let r = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(v);
             _mm256_storeu_ps(e.as_mut_ptr().add(i), _mm256_mul_ps(_mm256_sub_ps(v, r), iwv));
             let q = _mm256_and_ps(r, absmask);
@@ -672,7 +673,7 @@ fn loss_row(simd: bool, mrow: &[f32], prow: &[f32], off: f32) -> f64 {
     assert!(mrow.len().is_multiple_of(8) && prow.len() == mrow.len());
     #[cfg(target_arch = "x86_64")]
     if simd {
-        // SAFETY: AVX2 support was detected at runtime; lengths checked above.
+        // SAFETY: AVX2+FMA support was detected at runtime; lengths checked above.
         return unsafe { loss_row_avx2(mrow, prow, off) };
     }
     #[cfg(target_arch = "aarch64")]
@@ -692,7 +693,7 @@ fn loss_row(simd: bool, mrow: &[f32], prow: &[f32], off: f32) -> f64 {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn loss_row_avx2(mrow: &[f32], prow: &[f32], off: f32) -> f64 {
     use std::arch::x86_64::*;
     let ov = _mm256_set1_ps(off);
@@ -706,7 +707,7 @@ unsafe fn loss_row_avx2(mrow: &[f32], prow: &[f32], off: f32) -> f64 {
             let e = _mm256_mul_ps(_mm256_add_ps(m, ov), p);
             let e2 = _mm256_mul_ps(e, e);
             let e4 = _mm256_mul_ps(e2, e2);
-            acc = _mm256_add_ps(acc, _mm256_mul_ps(e4, e4));
+            acc = _mm256_fmadd_ps(e4, e4, acc);
         }
         i += 8;
     }
@@ -845,7 +846,7 @@ impl<'a> Search<'a> {
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
     #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
     unsafe fn estimate_simd(
         &self,
@@ -876,10 +877,14 @@ impl<'a> Search<'a> {
                 let mut s = 0f64;
                 for iy in 0..nby {
                     for ix in 0..nbx {
-                        s += f64::from(inp.quant[(by + iy) * inp.bw + bx + ix]).powi(16);
+                        let q = f64::from(inp.quant[(by + iy) * inp.bw + bx + ix]);
+                        let q2 = q * q;
+                        let q4 = q2 * q2;
+                        let q8 = q4 * q4;
+                        s += q8 * q8;
                     }
                 }
-                ((s / nb as f64).powf(1.0 / 16.0)) as f32
+                (s / nb as f64).sqrt().sqrt().sqrt().sqrt() as f32
             }
         };
         let origin = by * 8 * inp.stride + bx * 8;
@@ -914,16 +919,35 @@ impl<'a> Search<'a> {
                 return f32::INFINITY;
             }
         }
-        // Phase 2: pixel-domain distortion.
+        // Phase 2: pixel-domain distortion with per-channel early pruning.
+        let entropy_term = entropy * entropy_mul;
+        let size = (nb * 64) as f64;
+        let max_loss = if limit.is_finite() {
+            let rem = f64::from(limit - entropy_term);
+            if rem <= 0.0 {
+                return f32::INFINITY;
+            }
+            let target = rem * f64::from(quant) / (f64::from(self.cfg.info_loss_mul) * size);
+            let t2 = target * target;
+            let t4 = t2 * t2;
+            t4 * t4 * size * (1.0 + 1e-6)
+        } else {
+            f64::INFINITY
+        };
         let mut loss = 0f64;
+        let mut mrow_buf = [0f32; 64];
         const MASK_OFFSET: [f32; 3] = [12.0, 0.0, 4.0];
         const CHANNEL_MUL: [f64; 3] = [27_984_208.0, 1.0, 1.266_770_081_387_4]; // 8.2^8, 1, 1.03^8
         for c in 0..3 {
             inverse_block(self.dct, acs, &err[c][..n], pix);
             let off = MASK_OFFSET[c];
             let mut lossc = 0f64;
+            let mrow = &mut mrow_buf[..t.w];
             for y in 0..t.h {
-                let mrow = &inp.mask1x1[(by * 8 + y) * inp.stride + bx * 8..][..t.w];
+                let raw = &inp.mask1x1[(by * 8 + y) * inp.stride + bx * 8..][..t.w];
+                for (dst, &src) in mrow.iter_mut().zip(raw) {
+                    *dst = unpack_f16(src);
+                }
                 lossc += loss_row(self.dct.has_simd(), mrow, &pix[y * t.w..(y + 1) * t.w], off);
             }
             loss += lossc * CHANNEL_MUL[c];
@@ -931,10 +955,12 @@ impl<'a> Search<'a> {
                 let w = 1.0 + (nb as f32 / 8.0).min(3.0);
                 loss *= f64::from(w);
             }
+            if c < 2 && loss >= max_loss {
+                return f32::INFINITY;
+            }
         }
-        let size = (nb * 64) as f64;
-        let loss_scalar = ((loss / size).powf(1.0 / 8.0) * size / f64::from(quant)) as f32;
-        entropy * entropy_mul + self.cfg.info_loss_mul * loss_scalar
+        let loss_scalar = ((loss / size).sqrt().sqrt().sqrt() * size / f64::from(quant)) as f32;
+        entropy_term + self.cfg.info_loss_mul * loss_scalar
     }
 
     /// `estimate` for a tile-relative position, memoised.
@@ -1281,11 +1307,13 @@ mod tests {
             let a = quant_stage(true, &c0, &c1, 0.25, &wt, &iw, 1.7, &mut e_a);
             let b = quant_stage(false, &c0, &c1, 0.25, &wt, &iw, 1.7, &mut e_b);
             assert_eq!(a.0, b.0);
-            assert_eq!(a.1.to_bits(), b.1.to_bits());
-            assert_eq!(e_a, e_b);
+            assert!((a.1 - b.1).abs() <= 1e-4 * b.1.abs().max(1.0));
+            for (x, y) in e_a.iter().zip(&e_b) {
+                assert!((x - y).abs() <= 1e-4 * y.abs().max(1.0));
+            }
             let (m, p) = (rnd(3.0), rnd(0.4));
             let (la, lb) = (loss_row(true, &m, &p, 4.0), loss_row(false, &m, &p, 4.0));
-            assert_eq!(la.to_bits(), lb.to_bits());
+            assert!((la - lb).abs() <= 1e-5 * lb.abs().max(1.0));
         }
     }
 
@@ -1303,7 +1331,7 @@ mod tests {
                 .collect()
         });
         let quant: Vec<f32> = (0..bw * bh).map(|i| 0.2 + (i % 19) as f32 * 0.11).collect();
-        let mask: Vec<f32> = (0..stride * bh * 8).map(|i| 0.1 + (i % 31) as f32).collect();
+        let mask: Vec<u16> = (0..stride * bh * 8).map(|i| crate::bit_writer::pack_f16(0.1 + (i % 31) as f32)).collect();
         let tables = Tables::new();
         let dct = Dct::new();
         for effort in [5, 7, 9] {

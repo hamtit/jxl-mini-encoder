@@ -4,10 +4,13 @@ use crate::parallel::par_tasks;
 const M: [[f32; 3]; 3] = [[0.30, 0.622, 0.078], [0.23, 0.692, 0.078], [0.243_422_69, 0.204_767_44, 0.551_809_87]];
 const BIAS: f32 = 0.003_793_073_3;
 
-fn srgb_to_linear_lut() -> [f32; 256] {
-    std::array::from_fn(|i| {
-        let v = i as f64 / 255.0;
-        (if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }) as f32
+fn srgb_to_linear_lut() -> &'static [f32; 256] {
+    static LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        std::array::from_fn(|i| {
+            let v = i as f64 / 255.0;
+            (if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }) as f32
+        })
     })
 }
 
@@ -118,7 +121,7 @@ impl Xyb {
             for (ry, ((ra, rb), rc)) in a.chunks_mut(pw).zip(b.chunks_mut(pw)).zip(c.chunks_mut(pw)).enumerate() {
                 let sy = (i * 8 + ry).min(h - 1);
                 let row = &data[sy * w * channels..(sy + 1) * w * channels];
-                row_to_xyb(&lut, row, channels, w, bias_cbrt, &mut mix, ra, rb, rc);
+                row_to_xyb(lut, row, channels, w, bias_cbrt, &mut mix, ra, rb, rc);
             }
         });
         Xyb { w: pw, h: ph, planes }

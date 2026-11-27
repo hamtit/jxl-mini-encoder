@@ -59,3 +59,44 @@ fn sparse_binary_histograms_use_simple_header() {
         }
     }
 }
+
+#[test]
+fn barrett_div_mod_exact() {
+    for d in 1..=TAB {
+        let rcp = (1u64 << 63).div_ceil(u64::from(d));
+        let limit = if d == TAB { u32::MAX } else { (d << 20) - 1 };
+        for state in [0u32, 1, d - 1, d, d + 1, (d << 16).wrapping_sub(1), limit, u32::MAX] {
+            let q = ((u128::from(state) * u128::from(rcp)) >> 63) as u32;
+            let r = state - q * d;
+            assert_eq!(q, state / d, "d={d} state={state}");
+            assert_eq!(r, state % d, "d={d} state={state}");
+        }
+    }
+}
+
+#[test]
+fn zero_rle_header_bits_match_write_general() {
+    // Test leading zeros, middle zeros, and zeros immediately after omit.
+    let cases: &[&[(usize, u32)]] = &[
+        &[(10, 500), (11, 200), (20, 100), (40, 50)],
+        &[(0, 800), (1, 10), (12, 100), (30, 50)],
+        &[(0, 900), (8, 50), (9, 40), (25, 10)],
+        &[(5, 100), (6, 900), (15, 50), (31, 10)],
+    ];
+    for &entries in cases {
+        let mut counts = vec![0u32; 64];
+        for &(sym, cnt) in entries {
+            counts[sym] = cnt;
+        }
+        for shift in 0..=LOG_TAB {
+            let mut buf = [0u16; 256];
+            let Some(len) = normalize(&counts, shift, &mut buf) else {
+                continue;
+            };
+            let f = &buf[..len];
+            let mut w = BitWriter::new();
+            write_general(&mut w, f, shift);
+            assert_eq!(w.bits_written(), header_bits(f, shift), "shift={shift} entries={entries:?}");
+        }
+    }
+}

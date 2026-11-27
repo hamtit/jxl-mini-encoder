@@ -343,6 +343,106 @@ fn idct_rows_n<const W: usize>(n: usize, x: &mut [f32], tmp: &mut [f32], ic: &[V
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn transpose8_avx2(a: &V8x8) -> V8x8 {
+    use std::arch::x86_64::*;
+    let mut out = [[0f32; 8]; 8];
+    // SAFETY: `a` and `out` are 8x8 arrays of contiguous f32 rows.
+    unsafe {
+        let r0 = _mm256_loadu_ps(a[0].as_ptr());
+        let r1 = _mm256_loadu_ps(a[1].as_ptr());
+        let r2 = _mm256_loadu_ps(a[2].as_ptr());
+        let r3 = _mm256_loadu_ps(a[3].as_ptr());
+        let r4 = _mm256_loadu_ps(a[4].as_ptr());
+        let r5 = _mm256_loadu_ps(a[5].as_ptr());
+        let r6 = _mm256_loadu_ps(a[6].as_ptr());
+        let r7 = _mm256_loadu_ps(a[7].as_ptr());
+
+        let t0 = _mm256_unpacklo_ps(r0, r1);
+        let t1 = _mm256_unpackhi_ps(r0, r1);
+        let t2 = _mm256_unpacklo_ps(r2, r3);
+        let t3 = _mm256_unpackhi_ps(r2, r3);
+        let t4 = _mm256_unpacklo_ps(r4, r5);
+        let t5 = _mm256_unpackhi_ps(r4, r5);
+        let t6 = _mm256_unpacklo_ps(r6, r7);
+        let t7 = _mm256_unpackhi_ps(r6, r7);
+
+        let s0 = _mm256_shuffle_ps::<0x44>(t0, t2);
+        let s1 = _mm256_shuffle_ps::<0xEE>(t0, t2);
+        let s2 = _mm256_shuffle_ps::<0x44>(t1, t3);
+        let s3 = _mm256_shuffle_ps::<0xEE>(t1, t3);
+        let s4 = _mm256_shuffle_ps::<0x44>(t4, t6);
+        let s5 = _mm256_shuffle_ps::<0xEE>(t4, t6);
+        let s6 = _mm256_shuffle_ps::<0x44>(t5, t7);
+        let s7 = _mm256_shuffle_ps::<0xEE>(t5, t7);
+
+        _mm256_storeu_ps(out[0].as_mut_ptr(), _mm256_permute2f128_ps::<0x20>(s0, s4));
+        _mm256_storeu_ps(out[1].as_mut_ptr(), _mm256_permute2f128_ps::<0x20>(s1, s5));
+        _mm256_storeu_ps(out[2].as_mut_ptr(), _mm256_permute2f128_ps::<0x20>(s2, s6));
+        _mm256_storeu_ps(out[3].as_mut_ptr(), _mm256_permute2f128_ps::<0x20>(s3, s7));
+        _mm256_storeu_ps(out[4].as_mut_ptr(), _mm256_permute2f128_ps::<0x31>(s0, s4));
+        _mm256_storeu_ps(out[5].as_mut_ptr(), _mm256_permute2f128_ps::<0x31>(s1, s5));
+        _mm256_storeu_ps(out[6].as_mut_ptr(), _mm256_permute2f128_ps::<0x31>(s2, s6));
+        _mm256_storeu_ps(out[7].as_mut_ptr(), _mm256_permute2f128_ps::<0x31>(s3, s7));
+    }
+    out
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn transpose_simd<const W: usize, const H: usize>(src: &[f32], dst: &mut [f32]) {
+    use std::arch::x86_64::*;
+    debug_assert!(W.is_multiple_of(8) && H.is_multiple_of(8));
+    debug_assert!(src.len() >= W * H && dst.len() >= W * H);
+    for by in (0..H).step_by(8) {
+        for bx in (0..W).step_by(8) {
+            // SAFETY: bx + 8 <= W, by + 8 <= H, and src/dst have at least W * H elements.
+            unsafe {
+                let sp = src.as_ptr().add(by * W + bx);
+                let r0 = _mm256_loadu_ps(sp);
+                let r1 = _mm256_loadu_ps(sp.add(W));
+                let r2 = _mm256_loadu_ps(sp.add(2 * W));
+                let r3 = _mm256_loadu_ps(sp.add(3 * W));
+                let r4 = _mm256_loadu_ps(sp.add(4 * W));
+                let r5 = _mm256_loadu_ps(sp.add(5 * W));
+                let r6 = _mm256_loadu_ps(sp.add(6 * W));
+                let r7 = _mm256_loadu_ps(sp.add(7 * W));
+
+                let t0 = _mm256_unpacklo_ps(r0, r1);
+                let t1 = _mm256_unpackhi_ps(r0, r1);
+                let t2 = _mm256_unpacklo_ps(r2, r3);
+                let t3 = _mm256_unpackhi_ps(r2, r3);
+                let t4 = _mm256_unpacklo_ps(r4, r5);
+                let t5 = _mm256_unpackhi_ps(r4, r5);
+                let t6 = _mm256_unpacklo_ps(r6, r7);
+                let t7 = _mm256_unpackhi_ps(r6, r7);
+
+                let s0 = _mm256_shuffle_ps::<0x44>(t0, t2);
+                let s1 = _mm256_shuffle_ps::<0xEE>(t0, t2);
+                let s2 = _mm256_shuffle_ps::<0x44>(t1, t3);
+                let s3 = _mm256_shuffle_ps::<0xEE>(t1, t3);
+                let s4 = _mm256_shuffle_ps::<0x44>(t4, t6);
+                let s5 = _mm256_shuffle_ps::<0xEE>(t4, t6);
+                let s6 = _mm256_shuffle_ps::<0x44>(t5, t7);
+                let s7 = _mm256_shuffle_ps::<0xEE>(t5, t7);
+
+                let dp = dst.as_mut_ptr().add(bx * H + by);
+                _mm256_storeu_ps(dp, _mm256_permute2f128_ps::<0x20>(s0, s4));
+                _mm256_storeu_ps(dp.add(H), _mm256_permute2f128_ps::<0x20>(s1, s5));
+                _mm256_storeu_ps(dp.add(2 * H), _mm256_permute2f128_ps::<0x20>(s2, s6));
+                _mm256_storeu_ps(dp.add(3 * H), _mm256_permute2f128_ps::<0x20>(s3, s7));
+                _mm256_storeu_ps(dp.add(4 * H), _mm256_permute2f128_ps::<0x31>(s0, s4));
+                _mm256_storeu_ps(dp.add(5 * H), _mm256_permute2f128_ps::<0x31>(s1, s5));
+                _mm256_storeu_ps(dp.add(6 * H), _mm256_permute2f128_ps::<0x31>(s2, s6));
+                _mm256_storeu_ps(dp.add(7 * H), _mm256_permute2f128_ps::<0x31>(s3, s7));
+            }
+        }
+    }
+}
+
 #[inline(always)]
 fn transpose_c<const W: usize, const H: usize>(src: &[f32], dst: &mut [f32]) {
     for y in 0..H {
@@ -360,6 +460,8 @@ fn forward_wh<const W: usize, const H: usize, const N: usize>(
     src: &[f32],
     stride: usize,
     out: &mut [f32],
+    tr_wh: impl Fn(&[f32], &mut [f32]),
+    tr_hw: impl Fn(&[f32], &mut [f32]),
 ) {
     let mut a = [0f32; N];
     let mut tmp = [0f32; N];
@@ -367,9 +469,9 @@ fn forward_wh<const W: usize, const H: usize, const N: usize>(
         a[y * W..(y + 1) * W].copy_from_slice(&src[y * stride..y * stride + W]);
     }
     dct_rows_n::<W>(H, &mut a, &mut tmp, inv_cos);
-    transpose_c::<W, H>(&a, &mut out[..N]);
+    tr_wh(&a, &mut out[..N]);
     dct_rows_n::<H>(W, &mut out[..N], &mut tmp, inv_cos);
-    transpose_c::<H, W>(&out[..N], &mut a);
+    tr_hw(&out[..N], &mut a);
     let (sw, sh) = (std::f32::consts::SQRT_2 / W as f32, std::f32::consts::SQRT_2 / H as f32);
     let (dw, dh) = (1.0 / W as f32, 1.0 / H as f32);
     for v in 0..H {
@@ -383,7 +485,13 @@ fn forward_wh<const W: usize, const H: usize, const N: usize>(
 
 /// `inverse_sized` for a `W` x `H` block.
 #[inline(always)]
-fn inverse_wh<const W: usize, const H: usize, const N: usize>(inv_cos: &[Vec<f32>], coeffs: &[f32], out: &mut [f32]) {
+fn inverse_wh<const W: usize, const H: usize, const N: usize>(
+    inv_cos: &[Vec<f32>],
+    coeffs: &[f32],
+    out: &mut [f32],
+    tr_wh: impl Fn(&[f32], &mut [f32]),
+    tr_hw: impl Fn(&[f32], &mut [f32]),
+) {
     let mut a = [0f32; N];
     let mut tmp = [0f32; N];
     let s = std::f32::consts::SQRT_2;
@@ -395,19 +503,19 @@ fn inverse_wh<const W: usize, const H: usize, const N: usize>(inv_cos: &[Vec<f32
         }
     }
     idct_rows_n::<W>(H, &mut a, &mut tmp, inv_cos);
-    transpose_c::<W, H>(&a, &mut out[..N]);
+    tr_wh(&a, &mut out[..N]);
     idct_rows_n::<H>(W, &mut out[..N], &mut tmp, inv_cos);
-    transpose_c::<H, W>(&out[..N], &mut a);
+    tr_hw(&out[..N], &mut a);
     out[..N].copy_from_slice(&a);
 }
 
-/// Instantiates the kernels for one size, as a plain and an AVX2 version.
+/// Instantiates the kernels for one size, as a plain and an AVX2+FMA version.
 macro_rules! sized_kernels {
     ($(($w:literal, $h:literal)),*) => {
         #[inline(never)]
         fn forward_plain(ic: &[Vec<f32>], src: &[f32], stride: usize, w: usize, h: usize, out: &mut [f32]) -> bool {
             match (w, h) {
-                $(($w, $h) => forward_wh::<$w, $h, { $w * $h }>(ic, src, stride, out),)*
+                $(($w, $h) => forward_wh::<$w, $h, { $w * $h }>(ic, src, stride, out, transpose_c::<$w, $h>, transpose_c::<$h, $w>),)*
                 _ => return false,
             }
             true
@@ -415,27 +523,55 @@ macro_rules! sized_kernels {
         #[inline(never)]
         fn inverse_plain(ic: &[Vec<f32>], c: &[f32], w: usize, h: usize, out: &mut [f32]) -> bool {
             match (w, h) {
-                $(($w, $h) => inverse_wh::<$w, $h, { $w * $h }>(ic, c, out),)*
+                $(($w, $h) => inverse_wh::<$w, $h, { $w * $h }>(ic, c, out, transpose_c::<$w, $h>, transpose_c::<$h, $w>),)*
                 _ => return false,
             }
             true
         }
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
-        #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = "avx2,fma")]
         unsafe fn forward_simd(ic: &[Vec<f32>], src: &[f32], stride: usize, w: usize, h: usize, out: &mut [f32]) -> bool {
             match (w, h) {
-                $(($w, $h) => forward_wh::<$w, $h, { $w * $h }>(ic, src, stride, out),)*
+                $(($w, $h) => forward_wh::<$w, $h, { $w * $h }>(
+                    ic, src, stride, out,
+                    // SAFETY: forward_simd requires avx2,fma.
+                    |s, d| unsafe { transpose_simd::<$w, $h>(s, d) },
+                    // SAFETY: forward_simd requires avx2,fma.
+                    |s, d| unsafe { transpose_simd::<$h, $w>(s, d) },
+                ),)*
                 _ => return false,
             }
             true
         }
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
-        #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = "avx2,fma")]
         unsafe fn inverse_simd(ic: &[Vec<f32>], c: &[f32], w: usize, h: usize, out: &mut [f32]) -> bool {
             match (w, h) {
-                $(($w, $h) => inverse_wh::<$w, $h, { $w * $h }>(ic, c, out),)*
+                $(($w, $h) => inverse_wh::<$w, $h, { $w * $h }>(
+                    ic, c, out,
+                    // SAFETY: inverse_simd requires avx2,fma.
+                    |s, d| unsafe { transpose_simd::<$w, $h>(s, d) },
+                    // SAFETY: inverse_simd requires avx2,fma.
+                    |s, d| unsafe { transpose_simd::<$h, $w>(s, d) },
+                ),)*
+                _ => return false,
+            }
+            true
+        }
+        #[cfg(target_arch = "aarch64")]
+        #[target_feature(enable = "neon")]
+        unsafe fn forward_simd(ic: &[Vec<f32>], src: &[f32], stride: usize, w: usize, h: usize, out: &mut [f32]) -> bool {
+            match (w, h) {
+                $(($w, $h) => forward_wh::<$w, $h, { $w * $h }>(ic, src, stride, out, transpose_c::<$w, $h>, transpose_c::<$h, $w>),)*
+                _ => return false,
+            }
+            true
+        }
+        #[cfg(target_arch = "aarch64")]
+        #[target_feature(enable = "neon")]
+        unsafe fn inverse_simd(ic: &[Vec<f32>], c: &[f32], w: usize, h: usize, out: &mut [f32]) -> bool {
+            match (w, h) {
+                $(($w, $h) => inverse_wh::<$w, $h, { $w * $h }>(ic, c, out, transpose_c::<$w, $h>, transpose_c::<$h, $w>),)*
                 _ => return false,
             }
             true
@@ -508,44 +644,56 @@ impl Dct {
     fn forward8(&self, src: &[f32], stride: usize, out: &mut [f32]) {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         if self.simd {
-            // SAFETY: `self.simd` is only set when AVX2 was detected at runtime.
+            // SAFETY: `self.simd` is only set when AVX2+FMA (or NEON) was detected at runtime.
             return unsafe { self.forward8_simd(src, stride, out) };
         }
-        self.forward8_impl(src, stride, out)
+        self.forward8_impl(src, stride, out, transpose8)
     }
 
     fn inverse8(&self, coeffs: &[f32], out: &mut [f32]) {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         if self.simd {
-            // SAFETY: `self.simd` is only set when AVX2 was detected at runtime.
+            // SAFETY: `self.simd` is only set when AVX2+FMA (or NEON) was detected at runtime.
             return unsafe { self.inverse8_simd(coeffs, out) };
         }
-        self.inverse8_impl(coeffs, out)
+        self.inverse8_impl(coeffs, out, transpose8)
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
-    #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
     unsafe fn forward8_simd(&self, src: &[f32], stride: usize, out: &mut [f32]) {
-        self.forward8_impl(src, stride, out)
+        // SAFETY: forward8_simd requires avx2,fma.
+        self.forward8_impl(src, stride, out, |a| unsafe { transpose8_avx2(a) })
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
-    #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
     unsafe fn inverse8_simd(&self, coeffs: &[f32], out: &mut [f32]) {
-        self.inverse8_impl(coeffs, out)
+        // SAFETY: inverse8_simd requires avx2,fma.
+        self.inverse8_impl(coeffs, out, |a| unsafe { transpose8_avx2(a) })
     }
 
-    /// 8x8 forward DCT, unrolled; identical results to `forward_sized`.
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn forward8_simd(&self, src: &[f32], stride: usize, out: &mut [f32]) {
+        self.forward8_impl(src, stride, out, transpose8)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn inverse8_simd(&self, coeffs: &[f32], out: &mut [f32]) {
+        self.inverse8_impl(coeffs, out, transpose8)
+    }
+
+    /// 8x8 forward DCT, unrolled; matches `forward_sized`.
     #[inline(always)]
-    fn forward8_impl(&self, src: &[f32], stride: usize, out: &mut [f32]) {
+    fn forward8_impl(&self, src: &[f32], stride: usize, out: &mut [f32], tr: impl Fn(&V8x8) -> V8x8) {
         let (ic8, ic4) = (&self.inv_cos[3][..], &self.inv_cos[2][..]);
         let mut a: V8x8 = std::array::from_fn(|y| std::array::from_fn(|x| src[y * stride + x]));
         dct8_rows(&mut a, ic8, ic4);
-        let mut t = transpose8(&a);
+        let mut t = tr(&a);
         dct8_rows(&mut t, ic8, ic4);
-        let a = transpose8(&t);
+        let a = tr(&t);
         let (sw, dw) = (std::f32::consts::SQRT_2 / 8.0, 1.0 / 8.0f32);
         for v in 0..8 {
             let fv = if v == 0 { dw } else { sw };
@@ -556,9 +704,9 @@ impl Dct {
         }
     }
 
-    /// 8x8 inverse DCT, unrolled; identical results to `inverse_sized`.
+    /// 8x8 inverse DCT, unrolled; matches `inverse_sized`.
     #[inline(always)]
-    fn inverse8_impl(&self, coeffs: &[f32], out: &mut [f32]) {
+    fn inverse8_impl(&self, coeffs: &[f32], out: &mut [f32], tr: impl Fn(&V8x8) -> V8x8) {
         let (ic8, ic4) = (&self.inv_cos[3][..], &self.inv_cos[2][..]);
         let s = std::f32::consts::SQRT_2;
         let mut a: V8x8 = std::array::from_fn(|v| {
@@ -569,9 +717,9 @@ impl Dct {
             })
         });
         idct8_rows(&mut a, ic8, ic4);
-        let mut t = transpose8(&a);
+        let mut t = tr(&a);
         idct8_rows(&mut t, ic8, ic4);
-        let a = transpose8(&t);
+        let a = tr(&t);
         for v in 0..8 {
             out[v * 8..v * 8 + 8].copy_from_slice(&a[v]);
         }
@@ -670,7 +818,14 @@ mod tests {
         }
     }
 
-    /// The width-specialised SIMD kernels must be bit-identical to the plain ones.
+    fn assert_close(a: &[f32], b: &[f32], label: &str) {
+        assert_eq!(a.len(), b.len(), "{label}");
+        for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
+            assert!((x - y).abs() <= 1e-4 * y.abs().max(1.0), "{label} [{i}]: {x} vs {y}");
+        }
+    }
+
+    /// The width-specialised SIMD kernels must match the plain ones within FMA rounding.
     #[test]
     fn simd_kernels_match_plain() {
         let d = Dct::new();
@@ -683,11 +838,11 @@ mod tests {
             let (mut a, mut b) = (vec![0f32; n], vec![0f32; n]);
             d.forward(&src, w, w, h, &mut a);
             assert!(forward_plain(&d.inv_cos, &src, w, w, h, &mut b));
-            assert_eq!(a, b, "forward {w}x{h}");
+            assert_close(&a, &b, &format!("forward {w}x{h}"));
             let (mut c, mut e) = (vec![0f32; n], vec![0f32; n]);
             d.inverse(&a, w, h, &mut c);
             assert!(inverse_plain(&d.inv_cos, &a, w, h, &mut e));
-            assert_eq!(c, e, "inverse {w}x{h}");
+            assert_close(&c, &e, &format!("inverse {w}x{h}"));
         }
     }
 
@@ -698,11 +853,11 @@ mod tests {
         let (mut a, mut b) = (vec![0f32; 64], vec![0f32; 64]);
         d.forward8(&src, 8, &mut a);
         d.forward_sized::<64>(&src, 8, 8, 8, &mut b);
-        assert_eq!(a, b);
+        assert_close(&a, &b, "forward8");
         let (mut c, mut e) = (vec![0f32; 64], vec![0f32; 64]);
         d.inverse8(&a, &mut c);
         d.inverse_sized::<64>(&a, 8, 8, &mut e);
-        assert_eq!(c, e);
+        assert_close(&c, &e, "inverse8");
     }
 
     #[test]
@@ -713,11 +868,11 @@ mod tests {
             let (mut a, mut b) = (vec![0f32; 4096], vec![0f32; 4096]);
             d.forward(&src, w, w, h, &mut a);
             d.forward_sized::<4096>(&src, w, w, h, &mut b);
-            assert_eq!(a[..w * h], b[..w * h], "forward {w}x{h}");
+            assert_close(&a[..w * h], &b[..w * h], &format!("forward {w}x{h}"));
             let (mut c, mut e) = (vec![0f32; 4096], vec![0f32; 4096]);
             d.inverse(&a, w, h, &mut c);
             d.inverse_sized::<4096>(&a, w, h, &mut e);
-            assert_eq!(c[..w * h], e[..w * h], "inverse {w}x{h}");
+            assert_close(&c[..w * h], &e[..w * h], &format!("inverse {w}x{h}"));
         }
     }
 

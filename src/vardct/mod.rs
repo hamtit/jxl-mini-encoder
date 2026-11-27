@@ -189,7 +189,7 @@ fn correlation_cost(simd: bool, s: &[f32], y: &[f32], wm: &[f32], r: f32) -> f32
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 unsafe fn correlation_cost_simd(s: &[f32], y: &[f32], wm: &[f32], r: f32) -> f32 {
     correlation_cost_impl(s, y, wm, r)
@@ -241,6 +241,8 @@ struct Ctx<'a> {
     dct: &'a Dct,
     /// libjxl's per-block quantiser adjustment (effort >= 5).
     adjust: bool,
+    /// Lightweight trailing-zero trimming RDOQ (effort >= 6).
+    rdoq: bool,
     /// Also reconstruct the decoded image (for the EPF strength choice).
     recon: bool,
     block_ctx: &'a BlockCtxMap,
@@ -416,6 +418,7 @@ impl Ctx<'_> {
                 }
             }
         }
+        tokens.shrink_to_fit();
         GroupOut { tokens, dc, cmap, raw_updates, recon }
     }
 
@@ -432,14 +435,14 @@ impl Ctx<'_> {
     ) {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         if self.dct.has_simd() {
-            // SAFETY: AVX2 support was detected at runtime.
+            // SAFETY: AVX2+FMA (or NEON) support was detected at runtime.
             return unsafe { self.adjust_quant_simd(block, t, c, acs, thres, quant) };
         }
         self.adjust_quant_impl(block, t, c, acs, thres, quant)
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
     #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
     unsafe fn adjust_quant_simd(
         &self,
@@ -635,7 +638,7 @@ impl Ctx<'_> {
                 }
             }
         }
-        for step in [4, 1] {
+        for step in [8, 4, 2, 1] {
             let centre = best.1;
             for k in [centre - step, centre + step] {
                 let k = k.clamp(-127, 127);
@@ -667,10 +670,16 @@ impl Ctx<'_> {
         let m = qac * self.qm_mult[c];
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         if self.dct.has_simd() {
-            // SAFETY: AVX2 support was detected at runtime.
-            return unsafe { quantize_simd(coeffs, &t.weights[c], t.w, t.h, m, thres, out) };
+            // SAFETY: AVX2+FMA (or NEON) support was detected at runtime.
+            unsafe { quantize_simd(coeffs, &t.weights[c], t.w, t.h, m, thres, out) };
+        } else {
+            quantize_impl(coeffs, &t.weights[c], t.w, t.h, m, thres, out);
         }
-        quantize_impl(coeffs, &t.weights[c], t.w, t.h, m, thres, out)
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        quantize_impl(coeffs, &t.weights[c], t.w, t.h, m, thres, out);
+        if self.rdoq {
+            trim_trailing_zeros(coeffs, &t.weights[c], &t.order[nb..], m, out);
+        }
     }
 
     fn tokenize(
@@ -751,6 +760,43 @@ fn emit_coeffs(base: u32, nz: u32, log: u32, len: usize, value: impl Fn(usize) -
     }
 }
 
+/// Lightweight RDOQ: trim marginal trailing ±1 coefficients in scan order
+/// when the preceding run of zeros makes coding them cost more in rate than
+/// the squared-error distortion they save.
+#[inline]
+fn trim_trailing_zeros(coeffs: &[f32], weights: &[f32], order: &[u16], m: f32, out: &mut [i32]) {
+    const LAMBDA: f32 = 0.08;
+    let Some(mut last) = order.iter().rposition(|&p| out[p as usize] != 0) else {
+        return;
+    };
+    loop {
+        let pos = order[last] as usize;
+        if out[pos].unsigned_abs() != 1 {
+            break;
+        }
+        let av = (coeffs[pos] * weights[pos] * m).abs();
+        if av >= 0.85 {
+            break;
+        }
+        let prev_nz = order[..last].iter().rposition(|&p| out[p as usize] != 0);
+        let run = match prev_nz {
+            Some(p) => last - 1 - p,
+            None => last,
+        };
+        let delta_d = (2.0 * av - 1.0).max(0.0);
+        let delta_r = 2.0 + 0.5 * (run.min(16) as f32);
+        if delta_d < LAMBDA * delta_r {
+            out[pos] = 0;
+            match prev_nz {
+                Some(p) => last = p,
+                None => break,
+            }
+        } else {
+            break;
+        }
+    }
+}
+
 #[inline(always)]
 fn quantize_impl(coeffs: &[f32], weights: &[f32], w: usize, h: usize, m: f32, thres: [f32; 4], out: &mut [i32]) {
     for y in 0..h {
@@ -767,7 +813,7 @@ fn quantize_impl(coeffs: &[f32], weights: &[f32], w: usize, h: usize, m: f32, th
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 unsafe fn quantize_simd(coeffs: &[f32], weights: &[f32], w: usize, h: usize, m: f32, thres: [f32; 4], out: &mut [i32]) {
     quantize_impl(coeffs, weights, w, h, m, thres, out)
@@ -887,8 +933,10 @@ pub fn encode(
     let (w, h) = (img.width as usize, img.height as usize);
     let (bw, bh) = (w.div_ceil(8), h.div_ceil(8));
     let mut params = Params::new(opts.distance, opts.effort);
-    // The alpha channel does not depend on the colour pipeline: learn its
-    // tree and tokenise it on a worker while the colour channels are coded.
+    // The alpha channel does not depend on the colour pipeline. With several
+    // threads its tree is learned on a worker while the colour channels are
+    // coded; a single-thread encode defers it until the colour pipeline's peak
+    // buffers (`xyb`, `mask1x1`) are dropped.
     let alpha_mopts = ModularOptions::for_effort(opts.effort, w * h).with_threads(opts.threads);
     let small = w <= GROUP_DIM && h <= GROUP_DIM;
     let alpha_rect = |x: usize, y: usize, rw: usize, rh: usize| {
@@ -899,22 +947,19 @@ pub fn encode(
         }
         Channel { w: rw, h: rh, data }
     };
-    let alpha_job = (img.has_alpha() && !small).then(|| {
-        let alpha_layout = Layout::new(w, h);
-        let (ng, nlf) = (alpha_layout.num_groups(), alpha_layout.num_lf_groups());
-        let streams: Vec<(u32, Vec<Channel>)> = (0..ng)
+    let alpha_streams = |layout: &Layout| -> Vec<(u32, Vec<Channel>)> {
+        let (ng, nlf) = (layout.num_groups(), layout.num_lf_groups());
+        (0..ng)
             .map(|g| {
-                let (x, y, gw, gh) = alpha_layout.group_rect(g);
+                let (x, y, gw, gh) = layout.group_rect(g);
                 ((1 + 3 * nlf + 17 + g) as u32, vec![alpha_rect(x, y, gw, gh)])
             })
-            .collect();
+            .collect()
+    };
+    let alpha_job = (img.has_alpha() && !small && opts.threads > 1).then(|| {
+        let streams = alpha_streams(&Layout::new(w, h));
         let mopts = alpha_mopts.clone();
-        if opts.threads > 1 {
-            AlphaJob::Worker(std::thread::spawn(move || GlobalTree::build_owned(streams, &mopts)))
-        } else {
-            // A single-thread encode stays on the calling thread.
-            AlphaJob::Inline(streams, mopts)
-        }
+        AlphaJob::Worker(std::thread::spawn(move || GlobalTree::build_owned(streams, &mopts)))
     });
     let xyb = Xyb::from_srgb8(img.data, img.channels(), w, h, bw * 8, bh * 8, opts.threads);
     if opts.effort >= 7 && std::env::var_os("MINI_NO_CHROMA_ADJUST").is_none() {
@@ -1050,6 +1095,7 @@ pub fn encode(
             qm_mult: [1.25f32.powi(params.x_qm_scale as i32 - 2), 1.0, 1.25f32.powi(params.b_qm_scale as i32 - 2)],
             dct: &dct,
             adjust: params.adaptive_quant && std::env::var_os("MINI_NO_ADJUST_QUANT").is_none(),
+            rdoq: opts.effort >= 6,
             recon: dynamic_epf,
             block_ctx: &block_ctx,
         };
@@ -1113,6 +1159,14 @@ pub fn encode(
         g.recon = Default::default();
     }
     drop(mask1x1);
+
+    // A single-thread encode builds the alpha tree inline after the colour
+    // pipeline's peak buffers are gone. With more threads the worker was
+    // started up front so it overlaps the colour pipeline.
+    let alpha_job = alpha_job.or_else(|| {
+        (img.has_alpha() && !small && opts.threads <= 1)
+            .then(|| AlphaJob::Inline(alpha_streams(&layout), alpha_mopts.clone()))
+    });
 
     // Colour-correlation maps, one entry per 64x64 tile.
     let (ctw, cth) = (w.div_ceil(64), h.div_ceil(64));

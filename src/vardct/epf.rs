@@ -7,6 +7,7 @@
 //! module reproduces that: Gaborish, the three EPF stages and the selection
 //! rule, working on whole planes padded to a multiple of 8.
 
+use crate::bit_writer::unpack_f16;
 use crate::parallel::{par_map, par_tasks};
 
 /// Inverse sigma below which a block is left unfiltered.
@@ -23,10 +24,52 @@ const TILE: usize = 64;
 const GAB_W1: f32 = 1.1 * 0.104_699_57;
 const GAB_W2: f32 = 1.1 * 0.055_680_54;
 
+/// Three XYB planes stored with `PAD` mirrored border pixels on every side,
+/// so Gaborish and all EPF stages read neighbours directly without copying.
 pub struct Planes {
     pub w: usize,
     pub h: usize,
+    pub pw: usize,
     pub p: [Vec<f32>; 3],
+}
+
+impl Planes {
+    fn new(w: usize, h: usize) -> Self {
+        let pw = w + 2 * PAD;
+        let len = pw * (h + 2 * PAD);
+        Planes { w, h, pw, p: std::array::from_fn(|_| vec![0f32; len]) }
+    }
+
+    #[inline]
+    fn row_mut(&mut self, c: usize, y: usize) -> &mut [f32] {
+        let start = (y + PAD) * self.pw + PAD;
+        &mut self.p[c][start..start + self.w]
+    }
+
+    /// Mirror `PAD` pixels on the left, right, top, and bottom borders in place.
+    fn fill_borders(&mut self) {
+        let (w, h, pw) = (self.w, self.h, self.pw);
+        for plane in &mut self.p {
+            // Left and right borders of the interior rows.
+            for y in 0..h {
+                let row = &mut plane[(y + PAD) * pw..(y + PAD + 1) * pw];
+                for i in 0..PAD {
+                    row[PAD - 1 - i] = row[PAD + mirror(i as isize, w)];
+                    row[PAD + w + i] = row[PAD + mirror((w + i) as isize, w)];
+                }
+            }
+            // Top and bottom border rows (mirror interior rows).
+            for i in 0..PAD {
+                let sy = PAD + mirror(-(i as isize) - 1, h);
+                let dy = PAD - 1 - i;
+                plane.copy_within(sy * pw..(sy + 1) * pw, dy * pw);
+
+                let sy = PAD + mirror((h + i) as isize, h);
+                let dy = PAD + h + i;
+                plane.copy_within(sy * pw..(sy + 1) * pw, dy * pw);
+            }
+        }
+    }
 }
 
 fn mirror(v: isize, len: usize) -> usize {
@@ -35,48 +78,63 @@ fn mirror(v: isize, len: usize) -> usize {
     (if v >= len { 2 * len - 1 - v } else { v }) as usize
 }
 
-/// Copy of `src` with `PAD` mirrored pixels on every side.
-fn padded(src: &[f32], w: usize, h: usize) -> Vec<f32> {
-    let pw = w + 2 * PAD;
-    let mut out = vec![0f32; pw * (h + 2 * PAD)];
-    for y in 0..h + 2 * PAD {
-        let sy = mirror(y as isize - PAD as isize, h);
-        let (row, dst) = (&src[sy * w..(sy + 1) * w], &mut out[y * pw..(y + 1) * pw]);
-        dst[PAD..PAD + w].copy_from_slice(row);
-        for i in 0..PAD {
-            dst[PAD - 1 - i] = row[mirror(i as isize, w)];
-            dst[PAD + w + i] = row[mirror((w + i) as isize, w)];
-        }
+#[inline(always)]
+fn gaborish_row_impl(up: &[f32], mid: &[f32], down: &[f32], row: &mut [f32], wc: f32, we: f32, wd: f32) {
+    let w = row.len();
+    let (up, mid, down) = (&up[..w + 2], &mid[..w + 2], &down[..w + 2]);
+    for x in 0..w {
+        let edges = mid[x] + mid[x + 2] + up[x + 1] + down[x + 1];
+        let diags = up[x] + up[x + 2] + down[x] + down[x + 2];
+        row[x] = wc * mid[x + 1] + we * edges + wd * diags;
     }
-    out
 }
 
-/// The decoder's Gaborish smoothing, in place.
-pub fn gaborish(planes: &mut Planes, threads: usize) {
-    let (w, h) = (planes.w, planes.h);
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+unsafe fn gaborish_row_simd(up: &[f32], mid: &[f32], down: &[f32], row: &mut [f32], wc: f32, we: f32, wd: f32) {
+    gaborish_row_impl(up, mid, down, row, wc, we, wd);
+}
+
+#[inline]
+fn gaborish_row(simd: bool, up: &[f32], mid: &[f32], down: &[f32], row: &mut [f32], wc: f32, we: f32, wd: f32) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if simd {
+        // SAFETY: AVX2+FMA (or NEON) support was detected at runtime.
+        return unsafe { gaborish_row_simd(up, mid, down, row, wc, we, wd) };
+    }
+    let _ = simd;
+    gaborish_row_impl(up, mid, down, row, wc, we, wd);
+}
+
+/// The decoder's Gaborish smoothing from padded `src` into padded `dst`.
+pub fn gaborish(src: &Planes, dst: &mut Planes, threads: usize) {
+    let (w, h, pw) = (src.w, src.h, src.pw);
     let n = 1.0 / (1.0 + 4.0 * (GAB_W1 + GAB_W2));
     let (wc, we, wd) = (n, n * GAB_W1, n * GAB_W2);
-    let pw = w + 2 * PAD;
-    for plane in &mut planes.p {
-        let src = padded(plane, w, h);
-        let tasks: Vec<_> = plane.chunks_mut(w).enumerate().collect();
-        par_tasks(tasks, threads, |(y, row)| {
-            let base = (y + PAD) * pw + PAD;
-            // Rows y-1, y, y+1 of the padded source, each with one pixel of
-            // margin on both sides.
-            let up = &src[base - pw - 1..base - pw + w + 1];
-            let mid = &src[base - 1..base + w + 1];
-            let down = &src[base + pw - 1..base + pw + w + 1];
-            let (up, mid, down) = (&up[..w + 2], &mid[..w + 2], &down[..w + 2]);
-            let row = &mut row[..w];
-            for x in 0..w {
-                let out = &mut row[x];
-                let edges = mid[x] + mid[x + 2] + up[x + 1] + down[x + 1];
-                let diags = up[x] + up[x + 2] + down[x] + down[x + 2];
-                *out = wc * mid[x + 1] + we * edges + wd * diags;
+    let simd = crate::simd_available();
+    for (sp, dp) in src.p.iter().zip(&mut dst.p) {
+        let interior = &mut dp[PAD * pw..(PAD + h) * pw];
+        if threads <= 1 {
+            for (y, drow) in interior.chunks_mut(pw).enumerate() {
+                let base = (y + PAD) * pw + PAD;
+                let up = &sp[base - pw - 1..base - pw + w + 1];
+                let mid = &sp[base - 1..base + w + 1];
+                let down = &sp[base + pw - 1..base + pw + w + 1];
+                gaborish_row(simd, up, mid, down, &mut drow[PAD..PAD + w], wc, we, wd);
             }
-        });
+        } else {
+            let tasks: Vec<_> = interior.chunks_mut(pw).enumerate().collect();
+            par_tasks(tasks, threads, |(y, drow)| {
+                let base = (y + PAD) * pw + PAD;
+                let up = &sp[base - pw - 1..base - pw + w + 1];
+                let mid = &sp[base - 1..base + w + 1];
+                let down = &sp[base + pw - 1..base + pw + w + 1];
+                gaborish_row(simd, up, mid, down, &mut drow[PAD..PAD + w], wc, we, wd);
+            });
+        }
     }
+    dst.fill_borders();
 }
 
 #[derive(Clone, Copy)]
@@ -90,16 +148,30 @@ const OFF_0: [(isize, isize); 12] =
     [(-2, 0), (-1, -1), (-1, 0), (-1, 1), (0, -2), (0, -1), (0, 1), (0, 2), (1, -1), (1, 0), (1, 1), (2, 0)];
 const OFF_1: [(isize, isize); 4] = [(-1, 0), (0, -1), (0, 1), (1, 0)];
 
-/// One EPF pass. `inv_sigma` holds one value per 8x8 block.
+/// Reusable per-band scratch buffers, allocated once per strip instead of per band.
+#[derive(Default)]
+struct BandScratch {
+    runs: Vec<(usize, usize)>,
+    diff: Vec<f32>,
+    isig_px: Vec<f32>,
+    active: Vec<f32>,
+}
+
+/// One EPF pass from padded `src` into padded `dst`. `inv_sigma` holds one value per 8x8 block.
 ///
 /// Works on bands of one block row. For stages 0 and 1 the SAD of a candidate
 /// offset is the plus-shaped sum of per-pixel channel differences, so those
 /// differences are computed once per band and offset.
-fn run_stage(src: &Planes, dst: &mut Planes, inv_sigma: &[f32], stage: Stage, threads: usize) {
-    let (w, h) = (src.w, src.h);
+fn run_stage(
+    src: &Planes,
+    dst: &mut Planes,
+    inv_sigma: &[f32],
+    stage: Stage,
+    threads: usize,
+    scratch: &mut BandScratch,
+) {
+    let (w, h, pw) = (src.w, src.h, src.pw);
     let bw = w / 8;
-    let pw = w + 2 * PAD;
-    let padded_src: [Vec<f32>; 3] = std::array::from_fn(|c| padded(&src.p[c], w, h));
     let sigma_scale = match stage {
         Stage::Zero => 0.9,
         Stage::One => 1.0,
@@ -112,13 +184,25 @@ fn run_stage(src: &Planes, dst: &mut Planes, inv_sigma: &[f32], stage: Stage, th
         _ => &OFF_1,
     };
     let [d0, d1, d2] = &mut dst.p;
-    let tasks: Vec<_> = d0.chunks_mut(w * 8).zip(d1.chunks_mut(w * 8)).zip(d2.chunks_mut(w * 8)).enumerate().collect();
-    let ctx = StageCtx { w, bw, pw, padded_src: &padded_src, inv_sigma, stage, offs, sm, bsm };
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    let (i0, i1, i2) =
+        (&mut d0[PAD * pw..(PAD + h) * pw], &mut d1[PAD * pw..(PAD + h) * pw], &mut d2[PAD * pw..(PAD + h) * pw]);
+    let ctx = StageCtx { w, bw, pw, padded_src: &src.p, inv_sigma, stage, offs, sm, bsm };
     let simd = crate::simd_available();
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    let simd = false;
-    par_tasks(tasks, threads, |(band, ((o0, o1), o2))| run_band(&ctx, band, o0, o1, o2, simd));
+    if threads <= 1 {
+        for (band, ((o0, o1), o2)) in
+            i0.chunks_mut(pw * 8).zip(i1.chunks_mut(pw * 8)).zip(i2.chunks_mut(pw * 8)).enumerate()
+        {
+            run_band(&ctx, band, o0, o1, o2, simd, scratch);
+        }
+    } else {
+        let tasks: Vec<_> =
+            i0.chunks_mut(pw * 8).zip(i1.chunks_mut(pw * 8)).zip(i2.chunks_mut(pw * 8)).enumerate().collect();
+        par_tasks(tasks, threads, |(band, ((o0, o1), o2))| {
+            let mut local = BandScratch::default();
+            run_band(&ctx, band, o0, o1, o2, simd, &mut local);
+        });
+    }
+    dst.fill_borders();
 }
 
 /// Everything `run_band` reads besides its output band.
@@ -134,34 +218,57 @@ struct StageCtx<'a> {
     bsm: f32,
 }
 
-fn run_band(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2: &mut [f32], simd: bool) {
+fn run_band(
+    ctx: &StageCtx,
+    band: usize,
+    o0: &mut [f32],
+    o1: &mut [f32],
+    o2: &mut [f32],
+    simd: bool,
+    scratch: &mut BandScratch,
+) {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if simd {
-        // SAFETY: AVX2 support was detected at runtime.
-        return unsafe { run_band_simd(ctx, band, o0, o1, o2) };
+        // SAFETY: AVX2+FMA (or NEON) support was detected at runtime.
+        return unsafe { run_band_simd(ctx, band, o0, o1, o2, scratch) };
     }
     let _ = simd;
-    run_band_impl(ctx, band, o0, o1, o2)
+    run_band_impl(ctx, band, o0, o1, o2, scratch)
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-unsafe fn run_band_simd(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2: &mut [f32]) {
-    run_band_impl(ctx, band, o0, o1, o2)
+unsafe fn run_band_simd(
+    ctx: &StageCtx,
+    band: usize,
+    o0: &mut [f32],
+    o1: &mut [f32],
+    o2: &mut [f32],
+    scratch: &mut BandScratch,
+) {
+    run_band_impl(ctx, band, o0, o1, o2, scratch)
 }
 
 #[inline(always)]
-fn run_band_impl(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2: &mut [f32]) {
+fn run_band_impl(
+    ctx: &StageCtx,
+    band: usize,
+    o0: &mut [f32],
+    o1: &mut [f32],
+    o2: &mut [f32],
+    scratch: &mut BandScratch,
+) {
     let StageCtx { w, bw, pw, padded_src, inv_sigma, stage, offs, sm, bsm } = *ctx;
     let y0 = band * 8;
-    let rows = o0.len() / w;
+    let rows = o0.len() / pw;
     let sigmas = &inv_sigma[band * bw..(band + 1) * bw];
     if sigmas.iter().all(|&v| v < MIN_SIGMA) {
         for (c, out) in [&mut *o0, &mut *o1, &mut *o2].into_iter().enumerate() {
             for r in 0..rows {
                 let from = (y0 + r + PAD) * pw + PAD;
-                out[r * w..(r + 1) * w].copy_from_slice(&padded_src[c][from..from + w]);
+                let dst = r * pw + PAD;
+                out[dst..dst + w].copy_from_slice(&padded_src[c][from..from + w]);
             }
         }
         return;
@@ -171,28 +278,36 @@ fn run_band_impl(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2
     for (c, out) in [&mut *o0, &mut *o1, &mut *o2].into_iter().enumerate() {
         for r in 0..rows {
             let from = (y0 + r + PAD) * pw + PAD;
-            out[r * w..(r + 1) * w].copy_from_slice(&padded_src[c][from..from + w]);
+            let dst = r * pw + PAD;
+            out[dst..dst + w].copy_from_slice(&padded_src[c][from..from + w]);
         }
     }
-    let mut runs: Vec<(usize, usize)> = Vec::new();
+    scratch.runs.clear();
     for (bx, &v) in sigmas.iter().enumerate() {
         if v < MIN_SIGMA {
             continue;
         }
-        match runs.last_mut() {
+        match scratch.runs.last_mut() {
             Some(last) if last.1 == bx => last.1 = bx + 1,
-            _ => runs.push((bx, bx + 1)),
+            _ => scratch.runs.push((bx, bx + 1)),
         }
     }
     // Per-offset channel differences for rows y0-1..=y0+8, x -1..=w.
     let (dw, drows) = (w + 2, rows + 2);
-    let mut diff: Vec<f32> = Vec::new();
     if !matches!(stage, Stage::Two) {
-        diff = vec![0f32; offs.len() * drows * dw];
+        let need = offs.len() * drows * dw;
+        if scratch.diff.len() < need {
+            scratch.diff.resize(need, 0.0);
+        }
     }
-    let mut isig_px = vec![0f32; w];
-    let mut active = vec![0f32; w];
-    for &(rb0, rb1) in &runs {
+    if scratch.isig_px.len() < w {
+        scratch.isig_px.resize(w, 0.0);
+        scratch.active.resize(w, 0.0);
+    }
+    let diff = &mut scratch.diff;
+    let isig_px = &mut scratch.isig_px[..w];
+    let active = &mut scratch.active[..w];
+    for &(rb0, rb1) in &scratch.runs {
         let (xs, xe) = (rb0 * 8, rb1 * 8);
         if !matches!(stage, Stage::Two) {
             for (k, &(dy, dx)) in offs.iter().enumerate() {
@@ -285,15 +400,13 @@ fn run_band_impl(ctx: &StageCtx, band: usize, o0: &mut [f32], o1: &mut [f32], o2
                         }
                     }
                 }
-                let (o0, o1, o2) = (
-                    &mut o0[r * w + x0..r * w + x0 + tw],
-                    &mut o1[r * w + x0..r * w + x0 + tw],
-                    &mut o2[r * w + x0..r * w + x0 + tw],
-                );
+                let dst = r * pw + PAD + x0;
+                let (o0, o1, o2) = (&mut o0[dst..dst + tw], &mut o1[dst..dst + tw], &mut o2[dst..dst + tw]);
                 for x in 0..tw {
-                    o0[x] = a0[x] / ws[x];
-                    o1[x] = a1[x] / ws[x];
-                    o2[x] = a2[x] / ws[x];
+                    let inv_w = 1.0 / ws[x];
+                    o0[x] = a0[x] * inv_w;
+                    o1[x] = a1[x] * inv_w;
+                    o2[x] = a2[x] * inv_w;
                 }
             }
         }
@@ -310,8 +423,8 @@ pub struct Input<'a> {
     /// Original (pre-Gaborish) XYB of the block rows `by0..by1`, as three
     /// planes of stride `w` (so that no full-size copy has to be kept).
     pub orig: &'a OrigRows<'a>,
-    /// Perceptual masking per pixel.
-    pub mask1x1: &'a [f32],
+    /// Perceptual masking per pixel (f16-packed).
+    pub mask1x1: &'a [u16],
     /// Per-block `quant_scale * hf_mul` (as in the decoder's sigma).
     pub quant: &'a [f32],
     pub w: usize,
@@ -319,6 +432,63 @@ pub struct Input<'a> {
     pub distance: f32,
     pub iters: u32,
     pub gaborish: bool,
+}
+
+#[inline(always)]
+fn block_errors_impl(
+    inp: &Input,
+    rec: &Planes,
+    orig: &[Vec<f32>; 3],
+    y_off: isize,
+    orig_y0: usize,
+    rows: std::ops::Range<usize>,
+) -> Vec<f32> {
+    const KW: [f32; 3] = [12.339_445, 1.0, 0.2];
+    let (w, bw, pw) = (inp.w, inp.w / 8, rec.pw);
+    let mut out = Vec::with_capacity(rows.len() * bw);
+    let mut err: Vec<[f32; 3]> = vec![[0f32; 3]; bw];
+    for br in rows {
+        err.fill([0f32; 3]);
+        for ly in br * 8..br * 8 + 8 {
+            let gy = (y_off + ly as isize) as usize;
+            let mask = &inp.mask1x1[gy * w..(gy + 1) * w];
+            let oy = gy - orig_y0;
+            let o: [&[f32]; 3] = std::array::from_fn(|c| &orig[c][oy * w..(oy + 1) * w]);
+            let rbase = (ly + PAD) * pw + PAD;
+            let r: [&[f32]; 3] = std::array::from_fn(|c| &rec.p[c][rbase..rbase + w]);
+            // Each block keeps its own running sums, added in raster order, so
+            // the blocks of a row are independent and can overlap.
+            for (bx, e) in err.iter_mut().enumerate() {
+                let x0 = bx * 8;
+                for x in x0..x0 + 8 {
+                    let m = unpack_f16(mask[x]);
+                    let m2 = m * m;
+                    let d0 = o[0][x] - r[0][x];
+                    let d1 = o[1][x] - r[1][x];
+                    let d2 = o[2][x] - r[2][x];
+                    e[0] += m2 * d0 * d0;
+                    e[1] += m2 * d1 * d1;
+                    e[2] += m2 * d2 * d2;
+                }
+            }
+        }
+        out.extend(err.iter().map(|e| KW[0] * e[0] + KW[1] * e[1] + KW[2] * e[2]));
+    }
+    out
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2,fma"))]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+unsafe fn block_errors_simd(
+    inp: &Input,
+    rec: &Planes,
+    orig: &[Vec<f32>; 3],
+    y_off: isize,
+    orig_y0: usize,
+    rows: std::ops::Range<usize>,
+) -> Vec<f32> {
+    block_errors_impl(inp, rec, orig, y_off, orig_y0, rows)
 }
 
 /// Masked error of the block rows `rows` (local to `rec`, which starts at
@@ -331,34 +501,12 @@ fn block_errors(
     orig_y0: usize,
     rows: std::ops::Range<usize>,
 ) -> Vec<f32> {
-    const KW: [f32; 3] = [12.339_445, 1.0, 0.2];
-    let (w, bw) = (inp.w, inp.w / 8);
-    let mut out = Vec::with_capacity(rows.len() * bw);
-    let mut err: Vec<[f32; 3]> = vec![[0f32; 3]; bw];
-    for br in rows {
-        err.fill([0f32; 3]);
-        for ly in br * 8..br * 8 + 8 {
-            let gy = (y_off + ly as isize) as usize;
-            let mask = &inp.mask1x1[gy * w..(gy + 1) * w];
-            let oy = gy - orig_y0;
-            let o: [&[f32]; 3] = std::array::from_fn(|c| &orig[c][oy * w..(oy + 1) * w]);
-            let r: [&[f32]; 3] = std::array::from_fn(|c| &rec.p[c][ly * w..(ly + 1) * w]);
-            // Each block keeps its own running sums, added in raster order, so
-            // the blocks of a row are independent and can overlap.
-            for (bx, e) in err.iter_mut().enumerate() {
-                let x0 = bx * 8;
-                for x in x0..x0 + 8 {
-                    let m2 = mask[x] * mask[x];
-                    for c in 0..3 {
-                        let d = o[c][x] - r[c][x];
-                        e[c] += m2 * d * d;
-                    }
-                }
-            }
-        }
-        out.extend(err.iter().map(|e| KW[0] * e[0] + KW[1] * e[1] + KW[2] * e[2]));
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if crate::simd_available() {
+        // SAFETY: AVX2+FMA (or NEON) support was detected at runtime.
+        return unsafe { block_errors_simd(inp, rec, orig, y_off, orig_y0, rows) };
     }
-    out
+    block_errors_impl(inp, rec, orig, y_off, orig_y0, rows)
 }
 
 /// Block rows per strip. Each strip is decoded on its own with a halo of one
@@ -375,15 +523,19 @@ fn strip_errors(inp: &Input, rec: &RecRows, steps: &[usize], by0: usize, by1: us
     // Local rows cover block rows by0-1 .. by1+1, mirrored at the image edges.
     let lo = by0 as isize - 1;
     let local_bh = by1 - by0 + 2;
-    let mut strip = Planes { w, h: local_bh * 8, p: std::array::from_fn(|_| vec![0f32; w * local_bh * 8]) };
+    let mut strip = Planes::new(w, local_bh * 8);
     for c in 0..3 {
         for ly in 0..local_bh * 8 {
             let gy = mirror(lo * 8 + ly as isize, h);
-            rec(c, gy, &mut strip.p[c][ly * w..(ly + 1) * w]);
+            rec(c, gy, strip.row_mut(c, ly));
         }
     }
+    strip.fill_borders();
+    let mut cur = Planes::new(w, strip.h);
+    let mut tmp = Planes::new(w, strip.h);
     if inp.gaborish {
-        gaborish(&mut strip, 1);
+        gaborish(&strip, &mut tmp, 1);
+        std::mem::swap(&mut strip, &mut tmp);
     }
     let interior = 1..local_bh - 1;
     let orig = (inp.orig)(by0, by1);
@@ -406,8 +558,7 @@ fn strip_errors(inp: &Input, rec: &RecRows, steps: &[usize], by0: usize, by1: us
     if inp.iters >= 2 {
         stages.push(Stage::Two);
     }
-    let mut cur = Planes { w, h: strip.h, p: std::array::from_fn(|_| vec![0f32; w * strip.h]) };
-    let mut tmp = Planes { w, h: strip.h, p: std::array::from_fn(|_| vec![0f32; w * strip.h]) };
+    let mut scratch = BandScratch::default();
     let mut result = Vec::with_capacity(steps.len());
     for &val in steps {
         if val == 0 {
@@ -429,7 +580,7 @@ fn strip_errors(inp: &Input, rec: &RecRows, steps: &[usize], by0: usize, by1: us
             .collect();
         for (i, &st) in stages.iter().enumerate() {
             let src = if i == 0 { &strip } else { &cur };
-            run_stage(src, &mut tmp, &inv_sigma, st, 1);
+            run_stage(src, &mut tmp, &inv_sigma, st, 1, &mut scratch);
             std::mem::swap(&mut cur, &mut tmp);
         }
         let decoded = if stages.is_empty() { &strip } else { &cur };
@@ -452,17 +603,18 @@ fn strip_errors(inp: &Input, rec: &RecRows, steps: &[usize], by0: usize, by1: us
 /// change it. Edge block rows are never flagged.
 fn flat_neighbourhoods(strip: &Planes, bh: usize, bw: usize) -> Vec<bool> {
     const EPS: f32 = 1e-5;
-    let w = strip.w;
+    let pw = strip.pw;
     let mut colour: Vec<Option<[f32; 3]>> = vec![None; bw * bh];
     for by in 0..bh {
         for bx in 0..bw {
             let mut c = [0f32; 3];
             let mut flat = true;
             for (ch, cv) in c.iter_mut().enumerate() {
-                let first = strip.p[ch][by * 8 * w + bx * 8];
+                let first = strip.p[ch][(by * 8 + PAD) * pw + bx * 8 + PAD];
                 *cv = first;
                 for y in by * 8..by * 8 + 8 {
-                    let row = &strip.p[ch][y * w + bx * 8..y * w + bx * 8 + 8];
+                    let base = (y + PAD) * pw + bx * 8 + PAD;
+                    let row = &strip.p[ch][base..base + 8];
                     flat &= row.iter().all(|&v| (v - first).abs() <= EPS);
                 }
             }
@@ -555,8 +707,7 @@ pub fn choose(inp: &Input, rec: &RecRows, threads: usize) -> Vec<u8> {
             for &v in steps {
                 let ctx = lut[t] * 3 + lut[l];
                 let i = lut[v] + 3 * ctx;
-                // libjxl divides two integers here, so the ratio is zero.
-                let ratio = (histo[ctx][v] / totals[ctx]) as f32;
+                let ratio = histo[ctx][v] as f32 / totals[ctx] as f32;
                 mul[i] = 1.0 / (1.0 + c5 * ratio.ln_1p() / clamped);
                 if v == 0 {
                     mul[i] *= c3;
@@ -586,21 +737,28 @@ pub fn choose(inp: &Input, rec: &RecRows, threads: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bit_writer::pack_f16;
 
     fn flat(w: usize, h: usize, v: [f32; 3]) -> Planes {
-        Planes { w, h, p: v.map(|x| vec![x; w * h]) }
+        let mut pl = Planes::new(w, h);
+        for c in 0..3 {
+            pl.p[c].fill(v[c]);
+        }
+        pl
     }
 
     #[test]
     fn filters_keep_flat_images_unchanged() {
-        let mut a = flat(24, 16, [0.01, 0.4, 0.3]);
-        gaborish(&mut a, 2);
+        let a = flat(24, 16, [0.01, 0.4, 0.3]);
+        let mut g = flat(24, 16, [0.0; 3]);
+        gaborish(&a, &mut g, 2);
         let mut b = flat(24, 16, [0.0; 3]);
         let inv_sigma = vec![-1.0f32; 3 * 2];
+        let mut scratch = BandScratch::default();
         for stage in [Stage::Zero, Stage::One, Stage::Two] {
-            run_stage(&a, &mut b, &inv_sigma, stage, 2);
+            run_stage(&g, &mut b, &inv_sigma, stage, 2, &mut scratch);
             for c in 0..3 {
-                for (x, y) in b.p[c].iter().zip(&a.p[c]) {
+                for (x, y) in b.p[c].iter().zip(&g.p[c]) {
                     assert!((x - y).abs() < 1e-5, "{x} vs {y}");
                 }
             }
@@ -610,23 +768,23 @@ mod tests {
     #[test]
     fn choice_is_deterministic_and_in_range() {
         let (w, h) = (40, 24);
-        let mut rec = flat(w, h, [0.0, 0.3, 0.2]);
-        let mut orig = flat(w, h, [0.0, 0.3, 0.2]);
+        let mut rec = [vec![0.0f32; w * h], vec![0.3f32; w * h], vec![0.2f32; w * h]];
+        let mut orig = [vec![0.0f32; w * h], vec![0.3f32; w * h], vec![0.2f32; w * h]];
         for i in 0..w * h {
             let n = ((i * 2654435761usize) >> 7) % 13;
-            rec.p[1][i] += n as f32 * 0.002;
-            orig.p[1][i] += (n % 5) as f32 * 0.002;
+            rec[1][i] += n as f32 * 0.002;
+            orig[1][i] += (n % 5) as f32 * 0.002;
         }
-        let mask = vec![1.0f32; w * h];
+        let mask = vec![pack_f16(1.0f32); w * h];
         let quant = vec![0.5f32; (w / 8) * (h / 8)];
         for (distance, iters, steps) in [(2.0f32, 2u32, &[0u8, 2, 7][..]), (6.0, 3, &[0, 4][..])] {
             let orig_rows = |by0: usize, by1: usize| -> [Vec<f32>; 3] {
-                std::array::from_fn(|c| orig.p[c][by0 * 8 * w..by1 * 8 * w].to_vec())
+                std::array::from_fn(|c| orig[c][by0 * 8 * w..by1 * 8 * w].to_vec())
             };
             let input =
                 Input { orig: &orig_rows, mask1x1: &mask, quant: &quant, w, h, distance, iters, gaborish: true };
             let rec_rows = |c: usize, y: usize, dst: &mut [f32]| {
-                dst.copy_from_slice(&rec.p[c][y * w..(y + 1) * w]);
+                dst.copy_from_slice(&rec[c][y * w..(y + 1) * w]);
             };
             let a = choose(&input, &rec_rows, 1);
             let b = choose(&input, &rec_rows, 3);

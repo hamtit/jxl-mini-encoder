@@ -405,7 +405,7 @@ impl EntropyCode {
             if num_ctx == 1 { (vec![0], 1) } else { cluster(&hists, opts.max_clusters, opts.refine_rounds) };
         // Pick a hybrid-uint config per cluster.
         let mut configs = vec![HybridUint::DEFAULT; num_clusters];
-        if opts.tune_configs {
+        let values = if opts.tune_configs {
             let values = value_histograms(&pieces, &context_map, num_clusters);
             // Integer histogram counts and raw-bit totals remain exact, so
             // aggregating repeated values preserves configuration selection.
@@ -447,22 +447,49 @@ impl EntropyCode {
                 }
                 configs[c] = best.1;
             }
-        }
+            values
+        } else {
+            None
+        };
         // Final histograms.
         let mut chists: Vec<Vec<u32>> = vec![Vec::new(); num_clusters];
-        for part in par_map(groups.len(), opts.threads, |g| {
-            let mut chists: Vec<Vec<u32>> = vec![Vec::new(); num_clusters];
-            for piece in groups[g] {
-                for t in piece.iter() {
-                    let c = context_map[t.ctx() as usize] as usize;
-                    let (tok, _, _) = configs[c].encode(t.value());
-                    histogram(std::iter::once(tok), &mut chists[c]);
+        if !opts.tune_configs {
+            // Configs are all HybridUint::DEFAULT, so merge the pass-1 histograms.
+            for (ctx, h) in hists.iter().enumerate() {
+                add_into(&mut chists[context_map[ctx] as usize], h);
+            }
+        } else if let Some(values) = values {
+            // Derive final histograms from the aggregated value counts without
+            // scanning every token a third time.
+            for (c, hist) in values.iter().enumerate() {
+                let cfg = configs[c];
+                let ch = &mut chists[c];
+                for (value, &count) in hist.iter().enumerate() {
+                    if count != 0 {
+                        let (tok, _, _) = cfg.encode(value as u32);
+                        let tok = tok as usize;
+                        if tok >= ch.len() {
+                            ch.resize(tok + 1, 0);
+                        }
+                        ch[tok] += count;
+                    }
                 }
             }
-            chists
-        }) {
-            for (d, s) in chists.iter_mut().zip(&part) {
-                add_into(d, s);
+        } else {
+            for part in par_map(groups.len(), opts.threads, |g| {
+                let mut chists: Vec<Vec<u32>> = vec![Vec::new(); num_clusters];
+                for piece in groups[g] {
+                    for t in piece.iter() {
+                        let c = context_map[t.ctx() as usize] as usize;
+                        let (tok, _, _) = configs[c].encode(t.value());
+                        histogram(std::iter::once(tok), &mut chists[c]);
+                    }
+                }
+                chists
+            }) {
+                for (d, s) in chists.iter_mut().zip(&part) {
+                    add_into(d, s);
+                }
             }
         }
         let max_tok = chists.iter().map(|h| h.len()).max().unwrap_or(1);
@@ -498,9 +525,10 @@ impl EntropyCode {
     /// renormalisation words and raw bits).
     pub fn write_tokens(&self, tokens: &[Token], w: &mut BitWriter) {
         // The reverse pass only needs the symbol, and the forward pass only
-        // needs the raw bits. Compute each directly instead of retaining a
-        // intermediate tuple for every token.
-        let mut refill: Vec<Option<u16>> = vec![None; tokens.len()];
+        // needs the raw bits. Store refill flags as a bitset and push refill
+        // words LIFO so the forward pass simply pops them.
+        let mut refill_mask = vec![0u64; tokens.len().div_ceil(64)];
+        let mut refill_words: Vec<u16> = Vec::new();
         let mut state: u32 = 0x130000;
         for (i, &t) in tokens.iter().enumerate().rev() {
             let c = &self.clusters[self.context_map[t.ctx() as usize] as usize];
@@ -509,20 +537,24 @@ impl EntropyCode {
             let freq = u32::from(dist.freq[s as usize]);
             debug_assert!(freq > 0, "symbol {s} has zero frequency");
             if (state >> 20) >= freq {
-                refill[i] = Some(state as u16);
+                refill_mask[i >> 6] |= 1u64 << (i & 63);
+                refill_words.push(state as u16);
                 state >>= 16;
             }
-            state = ((state / freq) << 12) + dist.slot(s as usize, state % freq);
+            let (q, r) = dist.div_mod(s as usize, state);
+            state = (q << 12) + dist.slot(s as usize, r);
         }
         w.write(32, u64::from(state));
-        for (&t, r) in tokens.iter().zip(&refill) {
+        for (i, &t) in tokens.iter().enumerate() {
             let c = &self.clusters[self.context_map[t.ctx() as usize] as usize];
             let (_, n, b) = c.config.encode(t.value());
-            if let Some(r) = r {
-                w.write(16, u64::from(*r));
+            if (refill_mask[i >> 6] >> (i & 63)) & 1 != 0 {
+                let r = refill_words.pop().expect("refill word missing");
+                w.write(16, u64::from(r));
             }
             w.write(n, u64::from(b));
         }
+        debug_assert!(refill_words.is_empty());
     }
 }
 
