@@ -933,9 +933,10 @@ pub fn encode(
     let (w, h) = (img.width as usize, img.height as usize);
     let (bw, bh) = (w.div_ceil(8), h.div_ceil(8));
     let mut params = Params::new(opts.distance, opts.effort);
-    // Alpha setup is deferred until after `xyb` and `mask1x1` are dropped so
-    // that alpha channels and tree learning do not overlap with peak colour
-    // pipeline memory.
+    // The alpha channel does not depend on the colour pipeline. With several
+    // threads its tree is learned on a worker while the colour channels are
+    // coded; a single-thread encode defers it until the colour pipeline's peak
+    // buffers (`xyb`, `mask1x1`) are dropped.
     let alpha_mopts = ModularOptions::for_effort(opts.effort, w * h).with_threads(opts.threads);
     let small = w <= GROUP_DIM && h <= GROUP_DIM;
     let alpha_rect = |x: usize, y: usize, rw: usize, rh: usize| {
@@ -946,6 +947,20 @@ pub fn encode(
         }
         Channel { w: rw, h: rh, data }
     };
+    let alpha_streams = |layout: &Layout| -> Vec<(u32, Vec<Channel>)> {
+        let (ng, nlf) = (layout.num_groups(), layout.num_lf_groups());
+        (0..ng)
+            .map(|g| {
+                let (x, y, gw, gh) = layout.group_rect(g);
+                ((1 + 3 * nlf + 17 + g) as u32, vec![alpha_rect(x, y, gw, gh)])
+            })
+            .collect()
+    };
+    let alpha_job = (img.has_alpha() && !small && opts.threads > 1).then(|| {
+        let streams = alpha_streams(&Layout::new(w, h));
+        let mopts = alpha_mopts.clone();
+        AlphaJob::Worker(std::thread::spawn(move || GlobalTree::build_owned(streams, &mopts)))
+    });
     let xyb = Xyb::from_srgb8(img.data, img.channels(), w, h, bw * 8, bh * 8, opts.threads);
     if opts.effort >= 7 && std::env::var_os("MINI_NO_CHROMA_ADJUST").is_none() {
         let (x, b) = chroma_scales(&xyb, w, h, opts.threads);
@@ -1145,20 +1160,12 @@ pub fn encode(
     }
     drop(mask1x1);
 
-    let alpha_job = (img.has_alpha() && !small).then(|| {
-        let streams: Vec<(u32, Vec<Channel>)> = (0..ng)
-            .map(|g| {
-                let (x, y, gw, gh) = layout.group_rect(g);
-                ((1 + 3 * nlf + 17 + g) as u32, vec![alpha_rect(x, y, gw, gh)])
-            })
-            .collect();
-        let mopts = alpha_mopts.clone();
-        if opts.threads > 1 {
-            AlphaJob::Worker(std::thread::spawn(move || GlobalTree::build_owned(streams, &mopts)))
-        } else {
-            // A single-thread encode stays on the calling thread.
-            AlphaJob::Inline(streams, mopts)
-        }
+    // A single-thread encode builds the alpha tree inline after the colour
+    // pipeline's peak buffers are gone. With more threads the worker was
+    // started up front so it overlaps the colour pipeline.
+    let alpha_job = alpha_job.or_else(|| {
+        (img.has_alpha() && !small && opts.threads <= 1)
+            .then(|| AlphaJob::Inline(alpha_streams(&layout), alpha_mopts.clone()))
     });
 
     // Colour-correlation maps, one entry per 64x64 tile.
