@@ -256,9 +256,7 @@ fn normalize(counts: &[u32], shift: u32, buf: &mut [u16; 256]) -> Option<usize> 
 
 fn bits_per_symbol_table() -> &'static [f64; TAB as usize + 1] {
     static TABLE: std::sync::OnceLock<[f64; TAB as usize + 1]> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| {
-        std::array::from_fn(|f| if f == 0 { 0.0 } else { f64::from(LOG_TAB) - (f as f64).log2() })
-    })
+    TABLE.get_or_init(|| std::array::from_fn(|f| if f == 0 { 0.0 } else { f64::from(LOG_TAB) - (f as f64).log2() }))
 }
 
 fn data_bits(counts: &[u32], f: &[u16], _total: u64) -> f64 {
@@ -296,7 +294,9 @@ fn shift_bits(shift: u32) -> u32 {
 
 /// Check if a zero-run RLE (code 13) can be emitted starting at `i`, returning
 /// the run length (>= 4) if so. Code 13 repeats `prev` (which is 0 at `i == 0`
-/// or whenever `f[i - 1] == 0`), and is disallowed at `omit + 1`.
+/// or whenever `f[i - 1] == 0`), and is disallowed at `omit + 1`. A run at
+/// `i == 0` is well defined: libjxl and jxl-oxide both start `prev` at 0, and
+/// the roundtrip tests exercise it.
 #[inline]
 fn zero_rle_run(f: &[u16], i: usize, alphabet: usize, omit: usize) -> Option<usize> {
     if f[i] != 0 || i == omit + 1 || (i > 0 && f[i - 1] != 0) {

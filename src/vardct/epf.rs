@@ -184,11 +184,8 @@ fn run_stage(
         _ => &OFF_1,
     };
     let [d0, d1, d2] = &mut dst.p;
-    let (i0, i1, i2) = (
-        &mut d0[PAD * pw..(PAD + h) * pw],
-        &mut d1[PAD * pw..(PAD + h) * pw],
-        &mut d2[PAD * pw..(PAD + h) * pw],
-    );
+    let (i0, i1, i2) =
+        (&mut d0[PAD * pw..(PAD + h) * pw], &mut d1[PAD * pw..(PAD + h) * pw], &mut d2[PAD * pw..(PAD + h) * pw]);
     let ctx = StageCtx { w, bw, pw, padded_src: &src.p, inv_sigma, stage, offs, sm, bsm };
     let simd = crate::simd_available();
     if threads <= 1 {

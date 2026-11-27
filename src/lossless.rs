@@ -88,14 +88,11 @@ fn choose_rct(img: &ImageRef, effort: u32) -> Option<Transform> {
             }
         }
     }
-    let (_, &(perm, kind)) = CANDIDATES
-        .iter()
-        .enumerate()
-        .min_by(|&(i, _), &(j, _)| {
-            let ci: f64 = accs[i].iter().map(GradientCost::cost).sum();
-            let cj: f64 = accs[j].iter().map(GradientCost::cost).sum();
-            ci.total_cmp(&cj)
-        })?;
+    let (_, &(perm, kind)) = CANDIDATES.iter().enumerate().min_by(|&(i, _), &(j, _)| {
+        let ci: f64 = accs[i].iter().map(GradientCost::cost).sum();
+        let cj: f64 = accs[j].iter().map(GradientCost::cost).sum();
+        ci.total_cmp(&cj)
+    })?;
     if (perm, kind) == (0, 0) {
         return None;
     }

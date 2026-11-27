@@ -360,13 +360,7 @@ pub fn prev_channel_props(props: &mut [i32; NUM_PROPS], k: usize, ch: &[i32], wi
 
 /// Branchless interior version of `prev_channel_props` (`x >= 1`, `y >= 1`).
 #[inline(always)]
-pub fn prev_channel_props_inner(
-    props: &mut [i32; NUM_PROPS],
-    k: usize,
-    cur: &[i32],
-    above: &[i32],
-    x: usize,
-) {
+pub fn prev_channel_props_inner(props: &mut [i32; NUM_PROPS], k: usize, cur: &[i32], above: &[i32], x: usize) {
     let c = cur[x];
     let g = grad_clamped(above[x], cur[x - 1], above[x - 1]);
     let base = NUM_BASE_PROPS + 4 * k;
